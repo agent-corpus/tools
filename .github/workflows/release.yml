@@ -23,7 +23,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run verify
-      - uses: changesets/action@v1
+      - uses: changesets/action@v2
         with:
           version: npm run version-packages
           publish: npm run release
