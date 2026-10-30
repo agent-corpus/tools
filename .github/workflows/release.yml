@@ -1,35 +1,47 @@
 name: Release
 
+# Publishes every package whose version is not yet on npm, then tags it.
+# Versions are bumped in a normal PR (`npm run version-packages`), so this job is a
+# no-op on pushes that don't change a package version.
+
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write # npm provenance
+  contents: write # push release tags
+  id-token: write # npm trusted publishing (OIDC) and provenance
 
 jobs:
-  release:
+  publish:
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      # Node 24 ships npm >= 11.5, which is required for trusted publishing.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
-          registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run verify
-      - uses: changesets/action@v1
-        with:
-          version: npm run version-packages
-          publish: npm run release
-          commit: "chore: version packages"
-          title: "chore: version packages"
+
+      # Fallback auth. Skipped when no token is configured, in which case npm uses
+      # trusted publishing: configure it once per package on npmjs.com (see docs/releasing.md).
+      - name: Configure npm token
+        if: env.NPM_TOKEN != ''
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> "$HOME/.npmrc"
+
+      - name: Publish unpublished versions
+        run: npm run release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
+
+      - name: Push release tags
+        run: git push origin --tags

@@ -1,34 +1,58 @@
 # Releasing
 
 Releases are automated with [Changesets](https://github.com/changesets/changesets) and GitHub
-Actions (`.github/workflows/release.yml`).
+Actions (`.github/workflows/release.yml`). `main` is protected: every change, including release
+version bumps, lands through a pull request.
 
 ## Flow
 
-1. Contributors add changesets to PRs (`npm run changeset`).
-2. On every push to `main`, the release workflow:
-   - if changesets are pending → opens/updates a **"Version Packages"** PR (bumps versions,
-     updates changelogs);
-   - if that PR was merged (no pending changesets) → runs `changeset publish`, which publishes
-     every package whose version is not yet on npm, with provenance, and tags the release.
-3. Merge the "Version Packages" PR to release.
+1. **Describe changes.** Feature/fix PRs include a changeset (`npm run changeset`).
+2. **Cut a release.** A maintainer opens a "release" PR:
+
+   ```sh
+   git checkout -b release/next
+   npm run version-packages     # consumes changesets, bumps versions, updates CHANGELOGs
+   npm install                  # refresh the lockfile if workspace versions changed
+   git add -A && git commit -m "chore: version packages"
+   ```
+
+   CI runs on the PR; squash-merge it once green.
+3. **Publish.** On the merge to `main`, the Release workflow runs `npm run verify`, then
+   `changeset publish`, which publishes every package whose version is not on npm (with
+   provenance) and pushes `@agent-corpus/<name>@<version>` git tags. Pushes that don't change a
+   version make this job a no-op.
 
 ## One-time setup
 
-- npm org `agent-corpus` must exist and the publishing account must be a member with publish rights.
-- Create an npm **automation/granular access token** with publish rights to the `@agent-corpus` scope
-  and store it as the repository secret `NPM_TOKEN`.
-- Repository settings → Actions → General → allow GitHub Actions to create and approve pull requests.
-- Optional hardening: configure npm [trusted publishing](https://docs.npmjs.com/trusted-publishers)
-  for each package and drop the long-lived token.
+### Authentication — pick one
 
-## Manual publish (emergency / first release)
+**A. Trusted publishing (recommended, no stored secret).** After a package's first publish
+(trusted publishers can only be attached to an existing package), open
+`https://www.npmjs.com/package/@agent-corpus/<name>/access` → _Trusted Publisher_ → GitHub Actions:
+organization `agent-corpus`, repository `tools`, workflow `release.yml`. Repeat for each package.
+
+**B. Token.** Create a granular npm access token with publish rights on the `@agent-corpus` scope
+and _bypass 2FA_ enabled, and store it as the repository secret `NPM_TOKEN`. The workflow uses it
+automatically when present.
+
+### First publish of a new package
+
+Trusted publishing can't exist before the package does, so the first version needs either
+`NPM_TOKEN` (option B) or a manual publish:
 
 ```sh
-npm login                       # account with access to the @agent-corpus org
-npm run verify
-npm run release                 # build + changeset publish
-git push --follow-tags
+npm login
+npm publish -w @agent-corpus/<name> --access public --otp=<code>
+git tag @agent-corpus/<name>@<version> && git push origin --tags   # via a maintainer with bypass
 ```
 
-Local publishes lack provenance; prefer CI.
+### Branch protection
+
+The `Protect main` ruleset requires a PR, the CI checks (`verify (20|22|24)`, `Package contents`),
+resolved review threads, linear history (squash merges), and blocks force-pushes and deletion.
+Required approvals are 0 while the project has a single maintainer; raise it in
+_Settings → Rules → Rulesets_ when more maintainers join. Repository admins can bypass only when
+merging a pull request, never by pushing directly.
+
+When the organization allows Actions to create pull requests, the release PR can be automated with
+`changesets/action`; until then the manual step above is used.
