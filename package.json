@@ -1,0 +1,37 @@
+{
+  "name": "agent-corpus-tools",
+  "private": true,
+  "type": "module",
+  "description": "Monorepo of coding-agent-agnostic developer tools, published under the @agent-corpus npm scope.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agent-corpus/tools.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "verify": "npm run lint && npm run build && npm run typecheck && npm run test",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "npm run build && changeset publish"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.4",
+    "@changesets/changelog-github": "^1.0.1",
+    "@changesets/cli": "^3.0.3",
+    "@types/node": "^20.19.43",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

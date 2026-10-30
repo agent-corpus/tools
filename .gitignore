@@ -1,0 +1,31 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+coverage/
+
+# packaging
+*.tgz
+
+# logs
+*.log
+npm-debug.log*
+
+# env / secrets
+.env
+.env.*
+!.env.example
+.npmrc.local
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# tool state
+.pr-watch/
+.claude/settings.local.json

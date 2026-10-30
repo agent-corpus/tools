@@ -1,0 +1,58 @@
+{
+  "name": "@agent-corpus/pr-watch",
+  "version": "0.1.0",
+  "description": "Coding-agent-agnostic GitHub PR monitor: blocks until something actionable happens (stale branch, new review, failing checks, conflicts) and emits machine-readable events.",
+  "keywords": [
+    "github",
+    "pull-request",
+    "pr",
+    "monitor",
+    "watch",
+    "coding-agent",
+    "ai-agent",
+    "cli",
+    "events"
+  ],
+  "license": "MIT",
+  "author": "agent-corpus contributors",
+  "homepage": "https://github.com/agent-corpus/tools/tree/main/packages/pr-watch#readme",
+  "bugs": "https://github.com/agent-corpus/tools/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agent-corpus/tools.git",
+    "directory": "packages/pr-watch"
+  },
+  "type": "module",
+  "bin": {
+    "pr-watch": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run clean && npm run build && node -e \"require('fs').copyFileSync('../../LICENSE','LICENSE')\"",
+    "postpack": "node -e \"require('fs').rmSync('LICENSE',{force:true})\""
+  }
+}
