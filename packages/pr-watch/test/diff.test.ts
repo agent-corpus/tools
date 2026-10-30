@@ -158,3 +158,34 @@ describe("diffSnapshots: reviews and comments", () => {
     expect(events.every((e) => e.hint.length > 0)).toBe(true);
   });
 });
+
+describe("diffSnapshots: standing feedback and lifecycle", () => {
+  const cr = (id: number, user: string, state = "CHANGES_REQUESTED") => ({
+    id,
+    user,
+    state,
+    body: "fix",
+    url: "u",
+    submittedAt: null,
+  });
+
+  it("reports outstanding changes-requested reviews on the baseline", () => {
+    const events = diffSnapshots(null, snap({ reviews: [cr(1, "alice")] }), diffOpts());
+    expect(events.map((e) => [e.type, e.initial])).toEqual([["review_changes_requested", true]]);
+  });
+  it("does not report changes-requested that were later approved or dismissed", () => {
+    expect(types(null, snap({ reviews: [cr(1, "a"), cr(2, "a", "APPROVED")] }))).toEqual([]);
+    expect(types(null, snap({ reviews: [cr(1, "a"), cr(2, "a", "DISMISSED")] }))).toEqual([]);
+  });
+  it("replays history with includeExisting", () => {
+    const next = snap({
+      reviews: [cr(1, "a", "APPROVED")],
+      comments: [{ id: 1, user: "b", body: "x", url: "u" }],
+    });
+    const o = diffOpts({ includeExisting: true });
+    expect(types(null, next, o)).toEqual(["review_approved", "comment"]);
+  });
+  it("detects a reopened PR", () => {
+    expect(types(snap({ state: "closed" }), snap())).toEqual(["pr_reopened"]);
+  });
+});

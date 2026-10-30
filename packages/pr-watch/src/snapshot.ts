@@ -72,7 +72,7 @@ interface ApiPull {
   merged_by?: User | null;
   mergeable: boolean | null;
   mergeable_state: string;
-  base: { ref: string };
+  base: { ref: string; sha: string };
   head: { ref: string; sha: string };
 }
 interface ApiReview {
@@ -154,8 +154,13 @@ export async function takeSnapshot(client: GithubClient, ref: PrRef): Promise<Sn
       : "open";
   const headSha = pull.head.sha;
 
-  const [branch, reviews, reviewComments, comments, runs, combined] = await Promise.all([
-    client.get<{ commit: { sha: string } }>(`${repo}/branches/${seg(pull.base.ref)}`),
+  const [baseSha, reviews, reviewComments, comments, runs, combined] = await Promise.all([
+    // A merged/closed PR's base branch may have been deleted; its recorded base is enough.
+    state === "open"
+      ? client
+          .get<{ commit: { sha: string } }>(`${repo}/branches/${seg(pull.base.ref)}`)
+          .then((b) => b.commit.sha)
+      : Promise.resolve(pull.base.sha),
     client.paginate<ApiReview>(`${repo}/pulls/${ref.number}/reviews`),
     client.paginate<ApiReviewComment>(`${repo}/pulls/${ref.number}/comments`),
     client.paginate<ApiComment>(`${repo}/issues/${ref.number}/comments`),
@@ -167,7 +172,7 @@ export async function takeSnapshot(client: GithubClient, ref: PrRef): Promise<Sn
   let aheadBy = 0;
   if (state === "open") {
     const cmp = await client.get<{ ahead_by: number; behind_by: number }>(
-      `${repo}/compare/${branch.commit.sha}...${headSha}?per_page=1`,
+      `${repo}/compare/${baseSha}...${headSha}?per_page=1`,
     );
     behindBy = cmp.behind_by;
     aheadBy = cmp.ahead_by;
@@ -182,7 +187,7 @@ export async function takeSnapshot(client: GithubClient, ref: PrRef): Promise<Sn
     draft: pull.draft ?? false,
     mergedBy: pull.merged_by ? login(pull.merged_by) : null,
     baseRef: pull.base.ref,
-    baseSha: branch.commit.sha,
+    baseSha,
     headRef: pull.head.ref,
     headSha,
     behindBy,

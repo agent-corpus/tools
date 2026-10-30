@@ -7,18 +7,29 @@ export interface PrRef {
   owner: string;
   repo: string;
   number: number;
+  /** Host the PR URL pointed at, when parsed from a URL (e.g. a GitHub Enterprise host). */
+  host?: string;
 }
 
 export function formatRef(ref: PrRef): string {
   return `${ref.owner}/${ref.repo}#${ref.number}`;
 }
 
-const URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#].*)?$/;
+const URL_RE = /^https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#].*)?$/;
 const SHORT_RE = /^([\w.-]+)\/([\w.-]+)#(\d+)$/;
 
 /** Parse `https://github.com/o/r/pull/1`, `o/r#1`. Returns null if not recognised. */
 export function parsePrRef(input: string): PrRef | null {
-  const m = URL_RE.exec(input.trim()) ?? SHORT_RE.exec(input.trim());
+  const url = URL_RE.exec(input.trim());
+  if (url) {
+    return {
+      owner: url[2] as string,
+      repo: url[3] as string,
+      number: Number(url[4]),
+      host: url[1] as string,
+    };
+  }
+  const m = SHORT_RE.exec(input.trim());
   if (!m) return null;
   return { owner: m[1] as string, repo: m[2] as string, number: Number(m[3]) };
 }

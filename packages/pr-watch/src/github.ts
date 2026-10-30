@@ -35,7 +35,7 @@ export async function resolveToken(
   const fromEnv = env.GITHUB_TOKEN || env.GH_TOKEN;
   if (fromEnv) return fromEnv;
   try {
-    const { stdout } = await execFileAsync("gh", ["auth", "token"], { timeout: 5000 });
+    const { stdout } = await execFileAsync("gh", ["auth", "token"], { timeout: 5000, env });
     return stdout.trim() || undefined;
   } catch {
     return undefined;

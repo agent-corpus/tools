@@ -11,6 +11,7 @@ class FakeGithub {
   headSha = "head1";
   behindBy = 0;
   prState: "open" | "merged" = "open";
+  baseDeleted = false;
   reviews: unknown[] = [];
   comments: unknown[] = [];
   requests: string[] = [];
@@ -34,11 +35,14 @@ class FakeGithub {
           draft: false,
           mergeable: true,
           mergeable_state: "clean",
-          base: { ref: "main" },
+          base: { ref: "main", sha: "base-at-merge" },
           head: { ref: "feature", sha: this.headSha },
         });
       }
-      if (path === "/repos/acme/app/branches/main") return send({ commit: { sha: this.baseSha } });
+      if (path === "/repos/acme/app/branches/main") {
+        if (this.baseDeleted) return send({ message: "Branch not found" }, 404);
+        return send({ commit: { sha: this.baseSha } });
+      }
       if (path.startsWith("/repos/acme/app/compare/"))
         return send({ ahead_by: 1, behind_by: this.behindBy });
       if (path === "/repos/acme/app/pulls/7/reviews") return send(this.reviews);
@@ -189,5 +193,65 @@ describe("cli", () => {
     const h = harness();
     expect(await run(["status", "acme/app#999"], h.io)).toBe(1);
     expect(h.err.join("")).toContain("404");
+  });
+
+  it("handles a merged PR whose base branch was deleted", async () => {
+    gh.prState = "merged";
+    gh.baseDeleted = true;
+    const h = harness();
+    expect(await run(["status", PR], h.io)).toBe(0);
+    expect(JSON.parse(h.out.join(""))).toMatchObject({
+      state: "merged",
+      base: { sha: "base-at-merge" },
+    });
+    const w = harness();
+    expect(await run(["watch", PR], w.io)).toBe(0);
+    expect(w.events().map((e) => e.type)).toEqual(["pr_merged"]);
+  });
+
+  it("reports standing changes-requested feedback on a fresh start", async () => {
+    gh.reviews = [
+      {
+        id: 3,
+        user: { login: "alice" },
+        state: "CHANGES_REQUESTED",
+        body: "add tests",
+        html_url: "u",
+      },
+    ];
+    const h = harness();
+    expect(await run(["watch", PR], h.io)).toBe(0);
+    expect(h.events()).toMatchObject([
+      { type: "review_changes_requested", initial: true, data: { user: "alice" } },
+    ]);
+  });
+
+  it("status includes review bodies and --full includes comments", async () => {
+    gh.reviews = [
+      {
+        id: 3,
+        user: { login: "alice" },
+        state: "CHANGES_REQUESTED",
+        body: "add tests",
+        html_url: "u",
+      },
+    ];
+    gh.comments = [{ id: 1, user: { login: "bob" }, body: "hello", html_url: "u" }];
+    const a = harness();
+    await run(["status", PR], a.io);
+    expect(JSON.parse(a.out.join("")).reviews[0]).toMatchObject({
+      user: "alice",
+      body: "add tests",
+    });
+    const b = harness();
+    await run(["status", PR, "--full"], b.io);
+    expect(JSON.parse(b.out.join("")).comments[0].body).toBe("hello");
+  });
+
+  it("warns when no token is available", async () => {
+    const h = harness();
+    h.io.env = { GITHUB_API_URL: gh.url, PATH: "/nonexistent" };
+    await run(["status", PR], h.io);
+    expect(h.err.join("")).toContain("no GitHub token found");
   });
 });
