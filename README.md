@@ -1,6 +1,8 @@
 # agent-corpus/tools
 
 [![CI](https://github.com/agent-corpus/tools/actions/workflows/ci.yml/badge.svg)](https://github.com/agent-corpus/tools/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@agent-corpus/pr-watch.svg?label=%40agent-corpus%2Fpr-watch)](https://www.npmjs.com/package/@agent-corpus/pr-watch)
+[![Node](https://img.shields.io/node/v/@agent-corpus/pr-watch.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Small, composable developer tools for **coding agents** — written in TypeScript, published to npm
@@ -54,6 +56,13 @@ npm run lint:fix    # auto-format
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [docs/adding-a-package.md](docs/adding-a-package.md) and
 [docs/releasing.md](docs/releasing.md).
+
+### Releasing
+
+Versions are managed with [Changesets](https://github.com/changesets/changesets) and published to npm
+by GitHub Actions (trusted publishing, with provenance) when a version bump merges to `main`:
+add a changeset in your PR (`npm run changeset`); a maintainer later runs `npm run version-packages`
+in a release PR and merges it. Details in [docs/releasing.md](docs/releasing.md).
 
 ## License
 
