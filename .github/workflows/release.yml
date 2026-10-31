@@ -23,7 +23,7 @@ jobs:
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Node 24 ships npm >= 11.5, which is required for trusted publishing.
       - uses: actions/setup-node@v4
         with:
