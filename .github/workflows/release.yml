@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Node 24 ships npm >= 11.5, which is required for trusted publishing.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
