@@ -43,5 +43,6 @@ jobs:
         env:
           NPM_CONFIG_PROVENANCE: "true"
 
-      - name: Push release tags
-        run: git push origin --tags
+      # Changesets' own tagging did not reach origin in CI, so tag explicitly (idempotent).
+      - name: Tag released versions
+        run: scripts/tag-releases.sh
