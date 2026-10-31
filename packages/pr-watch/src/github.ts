@@ -28,6 +28,13 @@ export interface GithubClientOptions {
 
 export const DEFAULT_API_URL = "https://api.github.com";
 
+/** Linear-time `replace(/\/+$/, "")`; the regex form is quadratic on long runs of slashes. */
+function trimTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url[end - 1] === "/") end--;
+  return url.slice(0, end);
+}
+
 /** Token from GITHUB_TOKEN / GH_TOKEN, falling back to `gh auth token`. */
 export async function resolveToken(
   env: NodeJS.ProcessEnv = process.env,
@@ -47,7 +54,7 @@ export class GithubClient {
   private readonly doFetch: typeof fetch;
 
   constructor(private readonly opts: GithubClientOptions = {}) {
-    this.apiUrl = (opts.apiUrl ?? DEFAULT_API_URL).replace(/\/+$/, "");
+    this.apiUrl = trimTrailingSlashes(opts.apiUrl ?? DEFAULT_API_URL);
     this.doFetch = opts.fetch ?? fetch;
   }
 
