@@ -1,6 +1,8 @@
 # @agent-corpus/pr-watch
 
 [![npm](https://img.shields.io/npm/v/@agent-corpus/pr-watch.svg)](https://www.npmjs.com/package/@agent-corpus/pr-watch)
+[![CI](https://github.com/agent-corpus/tools/actions/workflows/ci.yml/badge.svg)](https://github.com/agent-corpus/tools/actions/workflows/ci.yml)
+[![Node](https://img.shields.io/node/v/@agent-corpus/pr-watch.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/agent-corpus/tools/blob/main/LICENSE)
 
 **Wait for something actionable to happen on a GitHub pull request.**

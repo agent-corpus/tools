@@ -25,6 +25,27 @@ Node.js 20+ is required (`.nvmrc` pins the development version).
    one-line, user-facing summary. Docs-only and internal changes need no changeset.
 4. Open a pull request. Keep it focused; describe the why.
 
+## Releasing (maintainers)
+
+Publishing is automated; you never run `npm publish` by hand.
+
+1. Contributors add a changeset to their PRs (`npm run changeset`).
+2. To ship, open a release PR from a branch:
+
+   ```sh
+   npm run version-packages   # bumps versions + changelogs; consumes the changesets
+   npm install                # refresh the lockfile
+   ```
+
+   If the changelog step complains about GitHub access, run it with
+   `GITHUB_TOKEN=$(gh auth token)`.
+3. Merge the release PR. The Release workflow publishes every package whose version is not yet on
+   npm (npm trusted publishing, with provenance) and pushes the `@agent-corpus/<name>@<version>` tag.
+   Merges that don't change a version publish nothing ("No unpublished projects to publish").
+
+First-publish and trusted-publisher setup, and the branch rules, are in
+[docs/releasing.md](docs/releasing.md).
+
 ## Conventions
 
 - TypeScript, strict mode, ESM (`NodeNext`). Import local files with a `.js` extension.
