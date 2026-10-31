@@ -1,6 +1,6 @@
 {
   "name": "@agent-corpus/pr-watch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Coding-agent-agnostic GitHub PR monitor: blocks until something actionable happens (stale branch, new review, failing checks, conflicts) and emits machine-readable events.",
   "keywords": [
     "github",
