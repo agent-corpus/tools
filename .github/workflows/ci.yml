@@ -39,6 +39,13 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm pack --dry-run --workspaces
+      - name: Publish dry-run must not auto-correct package.json
+        run: |
+          out=$(npm publish --dry-run --workspaces 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if echo "$out" | grep -q "auto-corrected"; then
+            echo "::error::npm auto-corrected package.json; run 'npm pkg fix'"; exit 1
+          fi
       - name: Smoke-test the packed CLI
         run: |
           set -euo pipefail
