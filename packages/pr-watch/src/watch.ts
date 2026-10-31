@@ -1,5 +1,5 @@
 import { type DiffOptions, diffSnapshots } from "./diff.js";
-import { type EventType, type PrEvent, TERMINAL_EVENTS } from "./events.js";
+import { type EventType, type PrEvent, TERMINAL_EVENTS, WAKING_EVENTS } from "./events.js";
 import { GithubError } from "./github.js";
 import { formatRef } from "./ref.js";
 import { carryForward, type Snapshot } from "./snapshot.js";
@@ -63,8 +63,19 @@ export async function watch(opts: WatchOptions): Promise<WatchResult> {
       failures = 0;
 
       const all = diffSnapshots(prev, next, opts);
+      // Resuming against a PR that was already merged/closed produces no transition; report it
+      // anyway rather than waiting forever.
+      if (next.state !== "open" && !all.some((e) => TERMINAL_EVENTS.includes(e.type))) {
+        all.push(
+          ...diffSnapshots(null, next, opts).filter((e) => TERMINAL_EVENTS.includes(e.type)),
+        );
+      }
       const events = all.filter(
         (e) => !opts.only || opts.only.has(e.type) || TERMINAL_EVENTS.includes(e.type),
+      );
+      // With no explicit --events list, informational events are printed but do not end the watch.
+      const wakes = events.some((e) =>
+        opts.only ? true : WAKING_EVENTS.includes(e.type) || TERMINAL_EVENTS.includes(e.type),
       );
       for (const e of events) opts.onEvent(e);
       emitted.push(...events);
@@ -74,7 +85,7 @@ export async function watch(opts: WatchOptions): Promise<WatchResult> {
       if (events.some((e) => TERMINAL_EVENTS.includes(e.type))) {
         return { outcome: "terminal", events: emitted };
       }
-      if (events.length > 0 && !opts.follow) return { outcome: "events", events: emitted };
+      if (wakes && !opts.follow) return { outcome: "events", events: emitted };
     } catch (err) {
       if (err instanceof GithubError && err.fatal) throw err;
       failures++;

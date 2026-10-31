@@ -7,11 +7,11 @@ describe("parsePrRef", () => {
       owner: "a",
       repo: "b",
       number: 12,
+      host: "github.com",
     });
-    expect(parsePrRef("https://ghe.corp/a/b/pull/12/files#x")).toEqual({
-      owner: "a",
-      repo: "b",
+    expect(parsePrRef("https://ghe.corp/a/b/pull/12/files#x")).toMatchObject({
       number: 12,
+      host: "ghe.corp",
     });
     expect(parsePrRef("a/b#3")).toEqual({ owner: "a", repo: "b", number: 3 });
   });

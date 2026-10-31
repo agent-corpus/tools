@@ -16,6 +16,8 @@ Node.js 20+ is required (`.nvmrc` pins the development version).
 
 ## Workflow
 
+`main` is protected: all changes go through a pull request with passing CI (squash-merged).
+
 1. Create a branch and make your change, with tests.
 2. Run `npm run verify` — this is exactly what CI runs.
 3. If the change affects a published package's behaviour, add a changeset:

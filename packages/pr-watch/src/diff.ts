@@ -9,6 +9,8 @@ export interface DiffOptions {
   /** Lower-cased logins whose comments and reviews never produce events. */
   ignoreAuthors: ReadonlySet<string>;
   ignoreBots: boolean;
+  /** On the baseline, also replay every existing review and comment as `initial` events. */
+  includeExisting?: boolean;
   now?: () => Date;
 }
 
@@ -34,6 +36,19 @@ export function diffSnapshots(prev: Snapshot | null, next: Snapshot, opts: DiffO
   const ignored = (user: string) =>
     opts.ignoreAuthors.has(user.toLowerCase()) || (opts.ignoreBots && user.endsWith("[bot]"));
 
+  const emitReviews = (reviews: Snapshot["reviews"], initial: boolean) => {
+    for (const r of reviews) {
+      if (ignored(r.user)) continue;
+      const { id, user, body, url } = r;
+      if (r.state === "APPROVED") emit("review_approved", { id, user, body, url }, initial);
+      else if (r.state === "CHANGES_REQUESTED") {
+        emit("review_changes_requested", { id, user, body, url }, initial);
+      } else if (r.state === "COMMENTED" && body.trim()) {
+        emit("review_commented", { id, user, body, url }, initial);
+      }
+    }
+  };
+
   const stale = (s: Snapshot) => s.state === "open" && s.behindBy >= opts.staleAfter;
   const failing = (s: Snapshot) => s.checks.state === "failure";
 
@@ -44,6 +59,26 @@ export function diffSnapshots(prev: Snapshot | null, next: Snapshot, opts: DiffO
     }
     if (failing(next) && next.state === "open") {
       emit("checks_failed", { failing: next.checks.failing, headSha: next.headSha }, true);
+    }
+    if (opts.includeExisting) {
+      emitReviews(next.reviews, true);
+      for (const c of next.reviewComments)
+        if (!ignored(c.user)) emit("review_comment", { ...c }, true);
+      for (const c of next.comments) if (!ignored(c.user)) emit("comment", { ...c }, true);
+    } else {
+      // Feedback that is still blocking the PR counts as a standing condition, like staleness.
+      const latest = new Map<string, Snapshot["reviews"][number]>();
+      for (const r of next.reviews) {
+        if (r.state === "COMMENTED") continue;
+        if (r.state === "CHANGES_REQUESTED" || r.state === "APPROVED") latest.set(r.user, r);
+        else latest.delete(r.user); // DISMISSED
+      }
+      if (next.state === "open") {
+        emitReviews(
+          [...latest.values()].filter((r) => r.state === "CHANGES_REQUESTED"),
+          true,
+        );
+      }
     }
     pushTerminal(emit, next, true);
     return events;
@@ -76,15 +111,10 @@ export function diffSnapshots(prev: Snapshot | null, next: Snapshot, opts: DiffO
   }
 
   const seenReviews = new Set(prev.reviews.map((r) => r.id));
-  for (const r of next.reviews) {
-    if (seenReviews.has(r.id) || ignored(r.user)) continue;
-    const { id, user, body, url } = r;
-    if (r.state === "APPROVED") emit("review_approved", { id, user, body, url });
-    else if (r.state === "CHANGES_REQUESTED")
-      emit("review_changes_requested", { id, user, body, url });
-    else if (r.state === "COMMENTED" && body.trim())
-      emit("review_commented", { id, user, body, url });
-  }
+  emitReviews(
+    next.reviews.filter((r) => !seenReviews.has(r.id)),
+    false,
+  );
 
   const seenInline = new Set(prev.reviewComments.map((c) => c.id));
   for (const c of next.reviewComments) {
@@ -99,6 +129,7 @@ export function diffSnapshots(prev: Snapshot | null, next: Snapshot, opts: DiffO
   }
 
   if (prev.state === "open") pushTerminal(emit, next, false);
+  else if (next.state === "open") emit("pr_reopened");
   return events;
 }
 

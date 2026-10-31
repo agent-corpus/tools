@@ -12,9 +12,9 @@
    to stdout, diagnostics to stderr; document exit codes.
 4. `npm install` at the repo root to link the workspace, then `npm run verify`.
 5. Add a row to the package table in the root README.
-6. Add a changeset (`npm run changeset`). The first release of a new package is published by the
-   release workflow when the "Version Packages" PR merges — or, for a brand-new package at its
-   initial version, directly on the next push to `main`.
+6. Add a changeset (`npm run changeset`). The release workflow publishes the package once its
+   version is on `main` and not yet on npm; see [releasing.md](releasing.md) for the first-publish
+   and trusted-publishing setup.
 
 ## Naming
 

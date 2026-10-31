@@ -55,30 +55,31 @@ Example output (one JSON object per line on stdout):
 
 ### Commands
 
-| Command                   | Purpose                                                      |
-| ------------------------- | ------------------------------------------------------------ |
-| `pr-watch watch <pr>`     | Poll until events occur; print them as JSON lines            |
-| `pr-watch status <pr>`    | Print a one-shot JSON summary and exit                       |
-| `pr-watch usage [--json]` | Agent-oriented guide (markdown) or machine-readable manifest |
+| Command                         | Purpose                                                                                  |
+| ------------------------------- | ---------------------------------------------------------------------------------------- |
+| `pr-watch watch <pr>`           | Poll until events occur; print them as JSON lines                                        |
+| `pr-watch status <pr> [--full]` | One-shot JSON summary (latest review per reviewer with text); `--full` adds all comments |
+| `pr-watch usage [--json]`       | Agent-oriented guide (markdown) or machine-readable manifest                             |
 
 `<pr>` is a PR URL, `owner/repo#123`, or a bare number (resolved via `--repo` or the `origin` remote).
 
 ### Options for `watch`
 
-| Flag                      | Default                  | Description                                                         |
-| ------------------------- | ------------------------ | ------------------------------------------------------------------- |
-| `--interval <dur>`        | `60s`                    | Poll interval (`30s`, `5m`, …; min `1s`)                            |
-| `--timeout <dur>`         | none                     | Give up after this long (exit `3`)                                  |
-| `--follow`                | off                      | Keep streaming events; stop only on merge/close                     |
-| `--events a,b`            | all                      | Only wake on these event types                                      |
-| `--stale-after <n>`       | `1`                      | Commits behind base that count as stale                             |
-| `--ignore-author <login>` |                          | Ignore reviews/comments by this user (repeatable)                   |
-| `--ignore-self`           | off                      | Ignore the authenticated user                                       |
-| `--ignore-bots`           | off                      | Ignore logins ending in `[bot]`                                     |
-| `--state-file <path>`     | none                     | Persist the last snapshot; next run reports what changed in between |
-| `--format json\|text`     | `json`                   | NDJSON or one readable line per event                               |
-| `--repo owner/name`       | origin                   | Needed for bare PR numbers outside a clone                          |
-| `--api-url <url>`         | `https://api.github.com` | GitHub Enterprise API base (or `GITHUB_API_URL`)                    |
+| Flag                      | Default                  | Description                                                                 |
+| ------------------------- | ------------------------ | --------------------------------------------------------------------------- |
+| `--interval <dur>`        | `60s`                    | Poll interval (`30s`, `5m`, …; min `1s`)                                    |
+| `--timeout <dur>`         | none                     | Give up after this long (exit `3`)                                          |
+| `--follow`                | off                      | Keep streaming events; stop only on merge/close                             |
+| `--events a,b`            | all                      | Only report (and wake on) these event types; merge/close always pass        |
+| `--include-existing`      | off                      | On the first run, also replay existing reviews/comments as `initial` events |
+| `--stale-after <n>`       | `1`                      | Commits behind base that count as stale                                     |
+| `--ignore-author <login>` |                          | Ignore reviews/comments by this user (repeatable)                           |
+| `--ignore-self`           | off                      | Ignore the authenticated user                                               |
+| `--ignore-bots`           | off                      | Ignore logins ending in `[bot]`                                             |
+| `--state-file <path>`     | none                     | Persist the last snapshot; next run reports what changed in between         |
+| `--format json\|text`     | `json`                   | NDJSON or one readable line per event                                       |
+| `--repo owner/name`       | origin                   | Needed for bare PR numbers outside a clone                                  |
+| `--api-url <url>`         | `https://api.github.com` | GitHub Enterprise API base (or `GITHUB_API_URL`)                            |
 
 ### Events
 
@@ -93,11 +94,17 @@ Example output (one JSON object per line on stdout):
 | `checks_failed` / `checks_passed`                                   | CI result for the head commit                  |
 | `head_updated`                                                      | New commits pushed to the PR branch            |
 | `ready_for_review`                                                  | Draft → ready                                  |
+| `pr_reopened`                                                       | A closed PR was reopened                       |
 | `pr_merged` / `pr_closed`                                           | Terminal; the watch exits                      |
 
 Each event carries `type`, `pr`, `at`, `data`, a `hint` with a suggested next step, and
 `"initial": true` if the condition already held when watching started. Run `pr-watch usage` for
 the full schema of `data` per event.
+
+**What wakes the watch.** Without `--events`, `head_updated`, `base_moved`, `ready_for_review` and
+`conflicts_resolved` are printed but don't end the watch on their own, so your own `git push`
+doesn't wake you. Everything else does. A fresh start also reports standing problems
+(`initial: true`): stale, conflicts, failing checks, and reviews that still request changes.
 
 ### Exit codes
 
@@ -108,6 +115,9 @@ the full schema of `data` per event.
 | `2`   | Usage error                                                      |
 | `3`   | `--timeout` elapsed with no matching event (not an error)        |
 | `130` | Interrupted                                                      |
+
+> **State files** contain PR comment text. Keep `.pr-watch/` out of version control and use one
+> state file per PR. A PR URL on a GitHub Enterprise host automatically uses `https://<host>/api/v3`.
 
 ## Using it from a coding agent
 

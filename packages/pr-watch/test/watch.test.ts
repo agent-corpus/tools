@@ -75,6 +75,33 @@ describe("watch", () => {
     expect(h.events.map((e) => e.type)).toEqual(["pr_merged"]);
   });
 
+  it("does not wake on informational events such as head_updated", async () => {
+    const h = harness([
+      snap(),
+      snap({ headSha: "h2", checks: { state: "pending", failing: [] } }),
+      snap({
+        headSha: "h2",
+        checks: { state: "pending", failing: [] },
+        comments: [{ id: 1, user: "x", body: "b", url: "u" }],
+      }),
+    ]);
+    const r = await watch(h.opts);
+    expect(r.outcome).toBe("events");
+    expect(h.events.map((e) => e.type)).toEqual(["head_updated", "comment"]);
+    expect(h.polls()).toBe(3);
+  });
+
+  it("reports an already-merged PR instead of waiting forever when resuming from state", async () => {
+    const h = harness([snap({ state: "merged" })], {
+      stateFile: join(await mkdtemp(join(tmpdir(), "pr-watch-")), "s.json"),
+    });
+    await watch({ ...h.opts, fetchSnapshot: async () => snap({ state: "merged" }) });
+    const second = harness([snap({ state: "merged" })], { stateFile: h.opts.stateFile });
+    const r = await watch(second.opts);
+    expect(r.outcome).toBe("terminal");
+    expect(second.events.map((e) => e.type)).toEqual(["pr_merged"]);
+  });
+
   it("keeps going with --follow until terminal", async () => {
     const c = { id: 1, user: "x", body: "b", url: "u" };
     const h = harness([snap(), snap({ comments: [c] }), snap({ comments: [c], state: "closed" })], {

@@ -4,6 +4,12 @@ export interface EventSpec {
   description: string;
   /** Agent-agnostic suggestion for a follow-on action. */
   suggestedAction: string;
+  /**
+   * Whether this event alone ends a `watch`. Informational events (e.g. head_updated, which
+   * also fires for the agent's own pushes) are still printed but do not end the watch.
+   * An explicit --events list overrides this.
+   */
+  wakes: boolean;
   /** Shape of the `data` field, for documentation. */
   data: Record<string, string>;
 }
@@ -11,6 +17,7 @@ export interface EventSpec {
 export const EVENT_CATALOG = [
   {
     type: "base_moved",
+    wakes: false,
     description: "The base branch (e.g. main) advanced since the last observation.",
     suggestedAction:
       "Fetch the base branch. If `stale` also fired, merge or rebase the base into the PR branch, run tests, push.",
@@ -18,6 +25,7 @@ export const EVENT_CATALOG = [
   },
   {
     type: "stale",
+    wakes: true,
     description:
       "The PR branch is behind its base by at least --stale-after commits (default 1). Fires on transition, and at startup if already stale (initial: true).",
     suggestedAction:
@@ -26,24 +34,28 @@ export const EVENT_CATALOG = [
   },
   {
     type: "conflicts",
+    wakes: true,
     description: "The PR has merge conflicts with its base. Fires on transition and at startup.",
     suggestedAction: "Update the branch from the base and resolve the conflicts, then push.",
     data: { mergeableState: "GitHub mergeable_state, e.g. dirty" },
   },
   {
     type: "conflicts_resolved",
+    wakes: false,
     description: "A previously conflicting PR can now merge cleanly.",
     suggestedAction: "No action needed; continue watching or proceed to merge.",
     data: { mergeableState: "GitHub mergeable_state" },
   },
   {
     type: "review_approved",
+    wakes: true,
     description: "A reviewer approved the PR.",
     suggestedAction: "If all required approvals and checks are in, the PR may be ready to merge.",
     data: { id: "review id", user: "login", body: "review text", url: "permalink" },
   },
   {
     type: "review_changes_requested",
+    wakes: true,
     description: "A reviewer requested changes.",
     suggestedAction:
       "Read the review and its inline comments, make the changes, push, and reply to or resolve each thread.",
@@ -51,12 +63,14 @@ export const EVENT_CATALOG = [
   },
   {
     type: "review_commented",
+    wakes: true,
     description: "A reviewer submitted a review with state COMMENTED (no verdict).",
     suggestedAction: "Read the review; address any questions or requests it contains.",
     data: { id: "review id", user: "login", body: "review text", url: "permalink" },
   },
   {
     type: "review_comment",
+    wakes: true,
     description: "A new inline code-review comment was posted on the diff.",
     suggestedAction:
       "Read the comment at path:line, make the requested change or reply with reasoning.",
@@ -72,42 +86,56 @@ export const EVENT_CATALOG = [
   },
   {
     type: "comment",
+    wakes: true,
     description: "A new conversation comment was posted on the PR (not on the diff).",
     suggestedAction: "Read the comment; respond or act if it asks for something.",
     data: { id: "comment id", user: "login", body: "comment text", url: "permalink" },
   },
   {
     type: "checks_failed",
+    wakes: true,
     description: "CI checks on the head commit are failing. Fires on transition and at startup.",
     suggestedAction: "Inspect the failing checks' logs, fix the cause, push.",
     data: { failing: "names of failing checks", headSha: "commit the checks ran on" },
   },
   {
     type: "checks_passed",
+    wakes: true,
     description: "All CI checks on the head commit completed successfully.",
     suggestedAction: "Nothing to fix. If approved and not stale, the PR may be ready to merge.",
     data: { headSha: "commit the checks ran on" },
   },
   {
     type: "head_updated",
+    wakes: false,
     description: "New commits were pushed to the PR branch (by anyone).",
     suggestedAction: "If you did not push them, pull the branch before making further changes.",
     data: { from: "previous head sha", to: "new head sha" },
   },
   {
     type: "ready_for_review",
+    wakes: false,
     description: "The PR was moved out of draft.",
     suggestedAction: "Informational.",
     data: {},
   },
   {
     type: "pr_merged",
+    wakes: true,
     description: "The PR was merged. Terminal: the watcher exits.",
     suggestedAction: "Clean up the local branch; stop monitoring.",
     data: { mergedBy: "login or null" },
   },
   {
+    type: "pr_reopened",
+    wakes: true,
+    description: "A closed PR was reopened.",
+    suggestedAction: "Resume monitoring; check whether the branch needs updating.",
+    data: {},
+  },
+  {
     type: "pr_closed",
+    wakes: true,
     description: "The PR was closed without merging. Terminal: the watcher exits.",
     suggestedAction: "Stop monitoring unless the user asks to reopen.",
     data: {},
@@ -133,6 +161,11 @@ export interface PrEvent {
   /** Human/agent readable next step, from the catalog. */
   hint: string;
 }
+
+/** Event types that end a watch when no explicit --events list is given. */
+export const WAKING_EVENTS: readonly EventType[] = EVENT_CATALOG.filter((e) => e.wakes).map(
+  (e) => e.type,
+);
 
 export function isEventType(value: string): value is EventType {
   return (EVENT_TYPES as readonly string[]).includes(value);

@@ -29,6 +29,8 @@ const OPTIONS = {
   "ignore-author": { type: "string", multiple: true },
   "ignore-self": { type: "boolean", default: false },
   "ignore-bots": { type: "boolean", default: false },
+  "include-existing": { type: "boolean", default: false },
+  full: { type: "boolean", default: false },
   "state-file": { type: "string" },
   format: { type: "string", default: "json" },
   "api-url": { type: "string" },
@@ -83,14 +85,24 @@ async function dispatch(argv: string[], io: Io): Promise<number> {
       throw new UsageError(err.message);
     },
   );
+  const token = await resolveToken(io.env);
+  if (!token) {
+    io.stderr(
+      "pr-watch: warning: no GitHub token found (set GITHUB_TOKEN or run `gh auth login`); unauthenticated requests are limited to 60/hour and private repos will return 404\n",
+    );
+  }
+  // A PR URL on another host (GitHub Enterprise Server) implies that host's API.
+  const hostApi = ref.host && ref.host !== "github.com" ? `https://${ref.host}/api/v3` : undefined;
   const client = new GithubClient({
-    token: await resolveToken(io.env),
-    apiUrl: values["api-url"] ?? io.env.GITHUB_API_URL,
+    token,
+    apiUrl: values["api-url"] ?? io.env.GITHUB_API_URL ?? hostApi,
     fetch: io.fetch,
   });
 
   if (command === "status") {
-    io.stdout(`${JSON.stringify(summarize(ref, await takeSnapshot(client, ref)), null, 2)}\n`);
+    const snapshot = await takeSnapshot(client, ref);
+    const out = values.full ? { pr: formatRef(ref), ...snapshot } : summarize(ref, snapshot);
+    io.stdout(`${JSON.stringify(out, null, 2)}\n`);
     return 0;
   }
   return runWatch(ref, client, values, io);
@@ -158,6 +170,7 @@ async function runWatch(
     staleAfter,
     ignoreAuthors,
     ignoreBots: values["ignore-bots"] as boolean,
+    includeExisting: values["include-existing"] as boolean,
     stateFile: values["state-file"],
     onEvent: (event) => io.stdout(`${render(event)}\n`),
     onLog: (msg) => io.stderr(`pr-watch: ${msg}\n`),
@@ -167,6 +180,7 @@ async function runWatch(
 
   switch (result.outcome) {
     case "timeout":
+      if (result.events.length > 0) return 0; // --follow printed events before the deadline
       io.stderr(`pr-watch: timed out after ${values.timeout} with no matching events\n`);
       return 3;
     case "aborted":
@@ -186,10 +200,10 @@ function formatText(e: PrEvent): string {
 
 /** Compact view of a snapshot for `status`. */
 export function summarize(ref: PrRef, s: Snapshot): Record<string, unknown> {
-  const latest = new Map<string, string>();
+  const latest = new Map<string, Snapshot["reviews"][number]>();
   for (const r of s.reviews) {
     if (r.state === "COMMENTED" && latest.has(r.user)) continue;
-    if (r.state !== "DISMISSED") latest.set(r.user, r.state);
+    if (r.state !== "DISMISSED") latest.set(r.user, r);
     else latest.delete(r.user);
   }
   return {
@@ -206,7 +220,7 @@ export function summarize(ref: PrRef, s: Snapshot): Record<string, unknown> {
     conflicting: s.conflicting,
     mergeableState: s.mergeableState,
     checks: s.checks,
-    reviews: [...latest].map(([user, state]) => ({ user, state })),
+    reviews: [...latest.values()].map(({ user, state, body, url }) => ({ user, state, body, url })),
     counts: {
       reviews: s.reviews.length,
       inlineComments: s.reviewComments.length,
