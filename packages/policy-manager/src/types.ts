@@ -29,3 +29,12 @@ export interface Decision {
   needsClassification?: boolean;
   ai?: Classification;
 }
+
+export interface OutcomeReport {
+  requestHash: string;
+  event: "human-response" | "execution-result";
+  response?: "approved" | "denied";
+  status?: "completed" | "succeeded" | "failed" | "cancelled";
+  exitCode?: number;
+  durationMs?: number;
+}

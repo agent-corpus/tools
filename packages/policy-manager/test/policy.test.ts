@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { hookResponse, normalize } from "../src/adapters.js";
+import { executionReport, hookResponse, normalize } from "../src/adapters.js";
 import { evaluate, hash, words } from "../src/policy.js";
 import { PolicySession } from "../src/session.js";
 import type { Request } from "../src/types.js";
@@ -134,7 +134,7 @@ test("AI confidence cannot override unknown effects or hard rules", () => {
 });
 test("cache is session scoped and audit excludes request values", () => {
   const directory = join(root, "audit");
-  mkdirSync(directory);
+  mkdirSync(directory, { mode: 0o700 });
   const session = new PolicySession(directory, "codex", "test");
   const r = request("az resource list --subscription private-subscription");
   expect(session.review(r).cached).toBe(false);
@@ -225,7 +225,7 @@ test("quoting preserves literal query syntax without allowing shell expansion", 
 
 test("AI can approve a bounded cloud inspection and cache only that session request", () => {
   const directory = join(root, "ai-audit");
-  mkdirSync(directory);
+  mkdirSync(directory, { mode: 0o700 });
   const session = new PolicySession(directory, "codex", "test");
   const r = request("az network vnet list --resource-group example");
   expect(session.review(r).decision).toBe("human");
@@ -239,4 +239,50 @@ test("AI can approve a bounded cloud inspection and cache only that session requ
   ).toBe("human");
   const changed = request("az network vnet list --resource-group another");
   expect(session.review(changed).decision).toBe("human");
+});
+
+test("request, classification, decision and reported outcomes share audit correlation", async () => {
+  const directory = join(root, "lifecycle-audit");
+  mkdirSync(directory, { mode: 0o700 });
+  const session = new PolicySession(directory, "codex", "test"),
+    r = request("az network vnet list --resource-group hidden-target");
+  session.review(r);
+  session.classify({ requestHash: hash(r), category: "cloud-read", confidence: 0.999 });
+  session.record({ event: "human-response", requestHash: hash(r), response: "approved" });
+  session.record({
+    event: "execution-result",
+    requestHash: hash(r),
+    status: "succeeded",
+    exitCode: 0,
+  });
+  const { AuditLog } = await import("@agent-corpus/audit-log");
+  const records = (await new AuditLog(directory).query({ requestId: hash(r) })).records;
+  expect(new Set(records.map((r) => r.eventName))).toEqual(
+    new Set(["request", "classification", "decision", "human-response", "execution-result"]),
+  );
+  const text = JSON.stringify(records);
+  expect(text).not.toContain("hidden-target");
+  expect(text).toContain("az network");
+  expect(session.review(request("az resource delete --ids hidden-target")).decision).toBe("human");
+});
+test("audit failure prevents an automatic approval", () => {
+  const directory = join(root, "blocked-audit");
+  mkdirSync(directory, { mode: 0o700 });
+  writeFileSync(join(directory, "audit.lock"), "busy", { mode: 0o600 });
+  const session = new PolicySession(directory, "codex", "test");
+  expect(() => session.review(request("az resource list"))).toThrow();
+});
+
+test("post-tool reports preserve uncertainty and discard raw tool output", () => {
+  const r = request("az resource list");
+  expect(
+    executionReport(r, "PostToolUse", { toolResult: { textResultForLlm: "private-output" } })
+      .status,
+  ).toBe("completed");
+  const failed = executionReport(r, "PostToolUse", {
+    tool_response: { exit_code: 1, stderr: "private-error" },
+  });
+  expect(failed.status).toBe("failed");
+  expect(failed.exitCode).toBe(1);
+  expect(JSON.stringify(failed)).not.toContain("private-error");
 });

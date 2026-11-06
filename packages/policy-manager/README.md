@@ -1,6 +1,6 @@
 # @agent-corpus/policy-manager
 
-A coding-agent-independent permission evaluator. It starts a private background service for each session, verifies ordinary code operations and cloud inspection commands, and records requests and decisions in a temporary audit log. No runtime dependencies or model API calls.
+A coding-agent-independent permission evaluator. It starts a private background service for each session, verifies ordinary code operations and cloud inspection commands, and records requests and decisions in a temporary audit log. Uses the shared `@agent-corpus/audit-log` package and makes no model API calls.
 
 This is a conservative initial implementation. It grants ordinary operations through deterministic checks. For additional cloud inspection operations, AI can confirm a bounded read-only candidate. A same-session AI classifier can categorize candidates and recommend structured replacements for opaque commands. Confidence alone never authorizes an opaque command.
 
@@ -69,9 +69,43 @@ The service uses a Unix socket on macOS/Linux and a named pipe on Windows. A ran
 
 The cache belongs to the service process and is scoped to harness plus session ID. It holds at most 512 cloud-inspection decisions, expires entries after one minute, and evaluates policy before lookup. Filesystem and branch evidence is never cached. `SessionEnd` or `policy-manager stop <harness> <session-id>` stops the service. An idle service stops after 30 minutes. Requests restart it when necessary; crash-created stale sockets require inspection rather than unsafe automatic deletion.
 
-`SessionStart` reports the private temporary directory containing `audit.jsonl`. Each request and decision is recorded before an approval is returned. The log stores request hashes and safe operation metadata, not paths, argument values, source text, credentials, or model explanations. Compare request hashes against the original request in the harness transcript during an investigation. Logs remain after normal shutdown and can disappear during operating-system cleanup. Copy them before cleanup when needed.
+`SessionStart` reports the private temporary directory containing `audit.jsonl`. Each request and decision is recorded before an approval is returned. The log stores versioned event envelopes, readable action summaries, opaque session identifiers, request hashes, and hashed targets. It excludes paths, argument values, source text, credentials, and model explanations. Compare request hashes against the original request in the harness transcript during an investigation. Logs rotate at 10 MiB per segment and stop accepting writes at 100 MiB total. Earlier segments remain available through `audit-log query` and `audit-log export`; no records are automatically deleted. Logs remain after normal shutdown and can disappear during operating-system cleanup. Copy them before cleanup when needed.
 
 Logging failure, malformed requests, service failure, and unknown semantics never produce an automatic approval. Permission hooks fall through to native human handling. Pre-tool failures exit 2. Host timeout behavior differs: Copilot command-hook timeouts fall through to its normal permission flow. Codex does not support `ask` in `PreToolUse`, so human recommendations add context and leave native permission handling unchanged.
+
+## Audit API and reported outcomes
+
+Every policy event uses the shared audit-log schema: `schemaVersion`, unique `eventId`, UTC `timestamp` and `observedTimestamp`, `eventName`, `source`, opaque `sessionId`, optional `requestId`, `severityText`, `summary`, and `attributes`. The existing private session directory remains the storage location. `requestId` is the normalized request hash; repeated identical requests share correlation, and distinct `eventId` values identify each observation.
+
+```sh
+audit-log query /private/session-directory --request-id REQUEST_HASH
+audit-log export /private/session-directory > investigation.jsonl
+policy-manager record codex session-example < outcome.json
+```
+
+The record command accepts a host-reported event:
+
+```json
+{ "event": "human-response", "requestHash": "<64-character request hash>", "response": "approved" }
+```
+
+Or an execution report:
+
+```json
+{
+  "event": "execution-result",
+  "requestHash": "<64-character request hash>",
+  "status": "succeeded",
+  "exitCode": 0,
+  "durationMs": 12
+}
+```
+
+Human responses are `approved` or `denied`. Execution statuses are `completed`, `succeeded`, `failed`, or `cancelled`. Reports use the source `policy-manager.adapter-report`. They are observations declared by the caller and never modify permission decisions or caches. The API does not authenticate a human identity. A denial policy remains a human decision even after an approval report is recorded.
+
+Generated post-tool hooks record execution reports for the supported tool matcher. Claude and Copilot also get failure hooks. Codex uses `PostToolUse`, which can carry nonzero exit codes. When an exit code is absent, the adapter records `completed` rather than inventing success. Output text and error bodies are discarded. Human responses require an explicit report from the host; the native hooks do not provide a universal human-response signal.
+
+The shared logger redacts structured sensitive fields, validates events, locks concurrent access, and flushes each append. Queries cover active and rotated segments. Busy storage, a stale lock, incomplete records, capacity limits, or write failures prevent automatic approval. The initial API is a library plus CLI; an additional resident logging server is deferred until another consumer needs one.
 
 ## Validation and support
 

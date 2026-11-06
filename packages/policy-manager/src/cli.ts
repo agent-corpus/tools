@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hookResponse, normalize } from "./adapters.js";
+import { executionReport, hookResponse, normalize } from "./adapters.js";
 import { hookConfig } from "./config.js";
 import { send, serve, start } from "./service.js";
-import type { Classification, Decision, Request } from "./types.js";
+import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
 
 const usage = `policy-manager usage [--json]
-policy-manager hook <claude|codex|copilot> <SessionStart|PreToolUse|PermissionRequest|SessionEnd>
+policy-manager hook <claude|codex|copilot> <SessionStart|PreToolUse|PermissionRequest|PostToolUse|PostToolUseFailure|SessionEnd>
 policy-manager review <claude|codex|copilot> <session-id>   # normalized request JSON on stdin
 policy-manager classify <claude|codex|copilot> <session-id> # {requestHash,category,confidence} on stdin
+policy-manager record <claude|codex|copilot> <session-id>   # host-reported human response or execution result JSON
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
 policy-manager stop <claude|codex|copilot> <session-id>
 A per-session background service checks policy and writes private temporary audit.jsonl logs.
@@ -39,7 +40,7 @@ try {
   else if (action === "serve") await serve(harness, phase ?? "");
   else if (action === "stop")
     console.log(JSON.stringify(await send(harness, phase ?? "", { action: "stop" })));
-  else if (action === "review" || action === "classify") {
+  else if (action === "review" || action === "classify" || action === "record") {
     const payload = await stdin();
     await start(harness, phase ?? "", cliPath);
     const result = await send(
@@ -47,7 +48,9 @@ try {
       phase ?? "",
       action === "review"
         ? { action, request: payload as unknown as Request }
-        : { action, classification: payload as unknown as Classification },
+        : action === "classify"
+          ? { action, classification: payload as unknown as Classification }
+          : { action, report: payload as unknown as OutcomeReport },
     );
     console.log(JSON.stringify(result));
   } else if (action === "hook") {
@@ -67,6 +70,12 @@ try {
               : { hookSpecificOutput: { hookEventName: phase, additionalContext: context } },
           ),
         );
+      } else if (phase === "PostToolUse" || phase === "PostToolUseFailure") {
+        await send(harness, request.sessionId, {
+          action: "record",
+          report: executionReport(request, phase, payload),
+        });
+        console.log("{}");
       } else if (phase === "PreToolUse" || phase === "PermissionRequest") {
         const decision = (await send(harness, request.sessionId, {
           action: "review",
@@ -77,13 +86,18 @@ try {
     }
   } else throw new Error(usage);
 } catch {
-  // Error text can contain paths or secrets. Keep diagnostics fixed.
-  console.error(
-    "Policy manager failed. Human approval is required. No automatic approval was granted.",
-  );
-  if (action === "hook" && phase === "PermissionRequest") console.log("{}");
-  else if (action === "hook" && phase === "PreToolUse") {
-    console.error("The policy check could not complete.");
-    process.exitCode = 2;
-  } else process.exitCode = 1;
+  if (action === "record" || (action === "hook" && phase?.startsWith("PostToolUse"))) {
+    console.error("The audit report could not be recorded. The tool may already have completed.");
+    process.exitCode = 1;
+  } else {
+    // Error text can contain paths or secrets. Keep diagnostics fixed.
+    console.error(
+      "Policy manager failed. Human approval is required. No automatic approval was granted.",
+    );
+    if (action === "hook" && phase === "PermissionRequest") console.log("{}");
+    else if (action === "hook" && phase === "PreToolUse") {
+      console.error("The policy check could not complete.");
+      process.exitCode = 2;
+    } else process.exitCode = 1;
+  }
 }

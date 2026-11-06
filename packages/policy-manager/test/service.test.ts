@@ -4,8 +4,10 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
+import { normalize } from "../src/adapters.js";
 import { sessionDirectory } from "../src/audit.js";
 import { hookConfig } from "../src/config.js";
+import { hash } from "../src/policy.js";
 
 const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 test.each(["claude", "codex", "copilot"] as const)(
@@ -43,6 +45,28 @@ test.each(["claude", "codex", "copilot"] as const)(
       const entries = readFileSync(join(directory, "audit.jsonl"), "utf8");
       expect(entries).toContain('"decision":"human"');
       expect(entries).not.toContain("private-id");
+      const recorded = JSON.parse(
+        execFileSync(process.execPath, [cli, "record", harness, sessionId], {
+          encoding: "utf8",
+          input: JSON.stringify({
+            event: "human-response",
+            requestHash: hash(normalize(harness, payload)),
+            response: "approved",
+            token: "hidden-human-secret",
+          }),
+        }),
+      );
+      expect(recorded.recorded).toBe(true);
+      run("PostToolUse", {
+        ...payload,
+        tool_response: { exit_code: 0, stdout: "hidden-output" },
+        duration_ms: 12,
+      });
+      const after = readFileSync(join(directory, "audit.jsonl"), "utf8");
+      expect(after).toContain('"eventName":"execution-result"');
+      expect(after).not.toContain("hidden-output");
+      expect(after).not.toContain("hidden-human-secret");
+      expect(after).toContain('"eventName":"human-response"');
       run("SessionEnd", payload);
       stopped = true;
       expect(readFileSync(join(directory, "audit.jsonl"), "utf8")).toContain("session-end");

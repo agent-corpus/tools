@@ -5,13 +5,14 @@ import { join } from "node:path";
 import { audit, sessionDirectory, sessionToken } from "./audit.js";
 import { hash } from "./policy.js";
 import { PolicySession } from "./session.js";
-import type { Classification, Request } from "./types.js";
+import type { Classification, OutcomeReport, Request } from "./types.js";
 
 interface Message {
   token: string;
-  action: "ping" | "review" | "classify" | "stop";
+  action: "ping" | "review" | "classify" | "record" | "stop";
   request?: Request;
   classification?: Classification;
+  report?: OutcomeReport;
 }
 function endpoint(directory: string): string {
   return process.platform === "win32"
@@ -41,7 +42,14 @@ export async function serve(harness: string, sessionId: string): Promise<void> {
         audit(directory, {
           event: "request-envelope",
           payloadHash: hash(data.slice(0, end)),
-          action: ["ping", "review", "classify", "stop"].includes(message.action)
+          ...(message.request
+            ? { requestHash: hash(message.request) }
+            : message.classification
+              ? { requestHash: message.classification.requestHash }
+              : message.report
+                ? { requestHash: message.report.requestHash }
+                : {}),
+          action: ["ping", "review", "classify", "record", "stop"].includes(message.action)
             ? message.action
             : "invalid",
         });
@@ -56,7 +64,10 @@ export async function serve(harness: string, sessionId: string): Promise<void> {
           result = session.review(message.request);
         else if (message.action === "classify" && message.classification)
           result = session.classify(message.classification);
-        else throw new Error("Invalid service request");
+        else if (message.action === "record" && message.report) {
+          session.record(message.report);
+          result = { recorded: true };
+        } else throw new Error("Invalid service request");
         socket.end(`${JSON.stringify({ result })}\n`);
       } catch {
         try {

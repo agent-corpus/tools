@@ -7,13 +7,21 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
   const hooks: Record<string, unknown> = {};
   const matcher =
     "Bash|Read|Edit|Write|apply_patch|bash|powershell|view|read_file|write_file|edit|create|exec_command|shell";
-  for (const phase of ["SessionStart", "PreToolUse", "PermissionRequest", "SessionEnd"]) {
+  const phases = [
+    "SessionStart",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    ...(harness === "codex" ? [] : ["PostToolUseFailure"]),
+    "SessionEnd",
+  ];
+  for (const phase of phases) {
     if (harness === "copilot") {
       const event = phase[0]?.toLowerCase() + phase.slice(1);
       hooks[event] = [
         {
           type: "command",
-          ...(phase === "PreToolUse" ? { matcher } : {}),
+          ...(phase === "PreToolUse" || phase.startsWith("PostToolUse") ? { matcher } : {}),
           exec: process.execPath,
           args: [cliPath, "hook", harness, phase],
           timeoutSec: 8,
@@ -22,7 +30,7 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
     } else
       hooks[phase] = [
         {
-          ...(phase === "PreToolUse" ? { matcher } : {}),
+          ...(phase === "PreToolUse" || phase.startsWith("PostToolUse") ? { matcher } : {}),
           hooks: [
             {
               type: "command",

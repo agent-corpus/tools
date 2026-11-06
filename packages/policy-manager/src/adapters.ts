@@ -1,4 +1,5 @@
-import type { Decision, Request } from "./types.js";
+import { hash } from "./policy.js";
+import type { Decision, OutcomeReport, Request } from "./types.js";
 export function normalize(harness: Request["harness"], payload: Record<string, unknown>): Request {
   let input: unknown = payload.tool_input ?? payload.toolInput ?? payload.toolArgs ?? {};
   if (typeof input === "string") input = JSON.parse(input);
@@ -45,5 +46,40 @@ export function hookResponse(
       permissionDecision: "ask",
       permissionDecisionReason: decision.reason,
     },
+  };
+}
+
+export function executionReport(
+  request: Request,
+  phase: string,
+  payload: Record<string, unknown>,
+): OutcomeReport {
+  const response =
+    payload.tool_response ?? payload.toolResponse ?? payload.tool_result ?? payload.toolResult;
+  const result =
+    response && typeof response === "object" ? (response as Record<string, unknown>) : {};
+  const code = result.exit_code ?? result.exitCode;
+  const exitCode =
+    typeof code === "number" && Number.isSafeInteger(code) && Math.abs(code) <= 2147483647
+      ? code
+      : undefined;
+  const duration = payload.duration_ms ?? payload.durationMs;
+  return {
+    requestHash: hash(request),
+    event: "execution-result",
+    status:
+      phase === "PostToolUseFailure"
+        ? payload.is_interrupt === true
+          ? "cancelled"
+          : "failed"
+        : exitCode === undefined
+          ? "completed"
+          : exitCode === 0
+            ? "succeeded"
+            : "failed",
+    ...(exitCode === undefined ? {} : { exitCode }),
+    ...(typeof duration === "number" && Number.isFinite(duration) && duration >= 0
+      ? { durationMs: duration }
+      : {}),
   };
 }

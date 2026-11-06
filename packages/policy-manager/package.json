@@ -48,5 +48,8 @@
     "test": "vitest run",
     "prepack": "npm run clean && npm run build && node -e \"require('fs').copyFileSync('../../LICENSE','LICENSE')\"",
     "postpack": "node -e \"require('fs').rmSync('LICENSE',{force:true})\""
+  },
+  "dependencies": {
+    "@agent-corpus/audit-log": "^0.1.0"
   }
 }

@@ -1,6 +1,6 @@
 import { audit, requestSummary } from "./audit.js";
 import { evaluate, hash } from "./policy.js";
-import type { Classification, Decision, Request } from "./types.js";
+import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
 
 export class PolicySession {
   private cache = new Map<string, { expires: number; ai?: Classification }>();
@@ -42,6 +42,13 @@ export class PolicySession {
     const key = hash([hash(request), "policy-v1"]);
     const entry = this.cache.get(key);
     const cachedAi = entry && entry.expires > Date.now() ? entry.ai : undefined;
+    if (ai)
+      audit(this.directory, {
+        event: "classification",
+        requestHash: hash(request),
+        category: ai.category,
+        confidence: ai.confidence,
+      });
     const decision = evaluate(request, ai ?? cachedAi);
     if (decision.decision === "human") this.cache.delete(key);
     // Evaluation always precedes lookup. Filesystem evidence is never cached.
@@ -78,6 +85,41 @@ export class PolicySession {
         : {}),
     });
     return decision;
+  }
+  record(report: OutcomeReport): void {
+    if (!report || !/^[a-f0-9]{64}$/.test(report.requestHash))
+      throw new Error("A request hash is required");
+    if (report.event === "human-response") {
+      if (!["approved", "denied"].includes(report.response ?? ""))
+        throw new Error("Invalid human response");
+      audit(this.directory, {
+        event: report.event,
+        requestHash: report.requestHash,
+        response: report.response,
+        summary: "Harness-reported human response",
+      });
+    } else if (report.event === "execution-result") {
+      if (!["completed", "succeeded", "failed", "cancelled"].includes(report.status ?? ""))
+        throw new Error("Invalid execution status");
+      if (
+        report.exitCode !== undefined &&
+        (!Number.isSafeInteger(report.exitCode) || Math.abs(report.exitCode) > 2147483647)
+      )
+        throw new Error("Invalid exit code");
+      if (
+        report.durationMs !== undefined &&
+        (!Number.isFinite(report.durationMs) || report.durationMs < 0)
+      )
+        throw new Error("Invalid execution duration");
+      audit(this.directory, {
+        event: report.event,
+        requestHash: report.requestHash,
+        status: report.status,
+        ...(report.exitCode === undefined ? {} : { exitCode: report.exitCode }),
+        ...(report.durationMs === undefined ? {} : { durationMs: report.durationMs }),
+        summary: "Harness-reported execution result",
+      });
+    } else throw new Error("Invalid outcome event");
   }
   classify(classification: Classification): Decision {
     const request = this.pending.get(classification.requestHash);
