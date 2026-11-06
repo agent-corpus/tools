@@ -19,9 +19,12 @@ Every tool follows the same principles:
 
 ## Packages
 
-| Package                                       | Description                                                                                                                | npm                                                                                                                     |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| [`@agent-corpus/pr-watch`](packages/pr-watch) | Block until something actionable happens on a GitHub PR (stale branch, new review, failing CI, conflicts) and emit events. | [![npm](https://img.shields.io/npm/v/@agent-corpus/pr-watch.svg)](https://www.npmjs.com/package/@agent-corpus/pr-watch) |
+| Package                                                   | Description                                                                                                                | npm                                                                                                                     |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| [`@agent-corpus/pr-watch`](packages/pr-watch)             | Block until something actionable happens on a GitHub PR (stale branch, new review, failing CI, conflicts) and emit events. | [![npm](https://img.shields.io/npm/v/@agent-corpus/pr-watch.svg)](https://www.npmjs.com/package/@agent-corpus/pr-watch) |
+| [`@agent-corpus/agent-scaffold`](packages/agent-scaffold) | Create canonical skill and agent scaffolds with native references.                                                         | Initial release pending                                                                                                 |
+| [`@agent-corpus/audit-log`](packages/audit-log)           | Capture, query, and export correlated audit events in private JSONL files.                                                 | Initial release pending                                                                                                 |
+| [`@agent-corpus/policy-manager`](packages/policy-manager) | Evaluate session permissions with private audit logs and native hook adapters.                                             | Initial release pending                                                                                                 |
 
 ## Quick look
 
@@ -47,6 +50,9 @@ Tooling: npm workspaces, TypeScript (ESM, `tsc`), [Vitest](https://vitest.dev),
 ## Development
 
 Requires Node.js 20+.
+
+Changesets release tooling requires a supported Node.js 22.11+ runtime. CI validates release metadata
+with `npm run check:changesets` on Node.js 22 and 24, alongside full verification on Node.js 20, 22, and 24.
 
 ```sh
 npm install

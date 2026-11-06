@@ -24,7 +24,8 @@
     "verify": "npm run lint && npm run build && npm run typecheck && npm run test",
     "changeset": "changeset",
     "version-packages": "changeset version",
-    "release": "npm run build && changeset publish"
+    "release": "npm run build && changeset publish",
+    "check:changesets": "changeset status"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.4",
