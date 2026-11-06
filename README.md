@@ -51,6 +51,9 @@ Tooling: npm workspaces, TypeScript (ESM, `tsc`), [Vitest](https://vitest.dev),
 
 Requires Node.js 20+.
 
+Changesets release tooling requires a supported Node.js 22.11+ runtime. CI validates release metadata
+with `npm run check:changesets` on Node.js 22 and 24, alongside full verification on Node.js 20, 22, and 24.
+
 ```sh
 npm install
 npm run verify      # lint + build + typecheck + test (what CI runs)
