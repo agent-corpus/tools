@@ -100,6 +100,83 @@ function cloudRead(argv: string[]): boolean {
   }
   return false;
 }
+function cloudReadCandidate(argv: string[]): boolean {
+  const options = [
+    "--resource-group",
+    "--subscription",
+    "--name",
+    "--ids",
+    "--resource-type",
+    "--namespace-name",
+    "--query",
+    "--output",
+    "-o",
+    "--region",
+    "--profile",
+    "--project",
+    "--zone",
+    "--filter",
+    "--format",
+  ];
+  const firstOption = argv.findIndex((arg) => arg.startsWith("-"));
+  const operation = firstOption < 0 ? argv : argv.slice(0, firstOption);
+  const flags = firstOption < 0 ? [] : argv.slice(firstOption);
+  if (!operation.slice(1).every((arg) => /^[a-z][a-z0-9-]*$/.test(arg))) return false;
+  for (let index = 0; index < flags.length; index += 2)
+    if (
+      !options.includes(flags[index] ?? "") ||
+      flags[index + 1] === undefined ||
+      flags[index + 1]?.startsWith("-")
+    )
+      return false;
+  if (argv[0] === "az")
+    return (
+      [
+        "resource",
+        "group",
+        "network",
+        "monitor",
+        "servicebus",
+        "storage",
+        "webapp",
+        "appservice",
+        "containerapp",
+        "vm",
+        "disk",
+      ].includes(operation[1] ?? "") && ["list", "show"].includes(operation.at(-1) ?? "")
+    );
+  if (argv[0] === "aws")
+    return (
+      operation.length === 3 &&
+      [
+        "ec2",
+        "rds",
+        "s3api",
+        "cloudformation",
+        "logs",
+        "cloudwatch",
+        "sqs",
+        "sns",
+        "ecs",
+        "eks",
+      ].includes(operation[1] ?? "") &&
+      /^(?:describe|list)-/.test(operation[2] ?? "")
+    );
+  if (argv[0] === "gcloud")
+    return (
+      [
+        "compute",
+        "projects",
+        "container",
+        "run",
+        "sql",
+        "pubsub",
+        "logging",
+        "monitoring",
+      ].includes(operation[1] ?? "") && ["list", "describe"].includes(operation.at(-1) ?? "")
+    );
+  return false;
+}
 function result(request: Request, category: Category, reason: string, approve = false): Decision {
   return {
     decision: approve ? "approve" : "human",
@@ -137,6 +214,22 @@ export function evaluate(request: Request, ai?: Classification): Decision {
         reason: "Invalid or mismatched AI classification",
       };
     decision.ai = ai;
+    if (
+      decision.category === "cloud-read" &&
+      decision.needsClassification === true &&
+      ai.category === "cloud-read" &&
+      ai.confidence >= 0.99
+    ) {
+      return {
+        ...decision,
+        decision: "approve",
+        cache: "session",
+        reason: "Bounded cloud inspection confirmed by same-session AI",
+        needsClassification: false,
+        ai,
+      };
+    }
+
     if (
       ai.confidence < 0.99 ||
       ai.category !== decision.category ||
@@ -237,6 +330,11 @@ function evaluateCore(request: Request): Decision {
       return result(request, "sensitive", "Credential or secret retrieval requires human approval");
     if (cloudRead(argv))
       return result(request, "cloud-read", "Verified cloud inspection command", true);
+    if (cloudReadCandidate(argv))
+      return {
+        ...result(request, "cloud-read", "Cloud inspection candidate requires AI classification"),
+        needsClassification: true,
+      };
     return result(
       request,
       argv.some((arg) => /^(delete|destroy|purge|remove)/.test(arg))

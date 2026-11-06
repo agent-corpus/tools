@@ -26,5 +26,6 @@ export interface Decision {
   requestHash: string;
   cache: "none" | "session";
   cached: boolean;
+  needsClassification?: boolean;
   ai?: Classification;
 }

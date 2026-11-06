@@ -222,3 +222,21 @@ test("quoting preserves literal query syntax without allowing shell expansion", 
   expect(evaluate(request("cat =sh")).decision).toBe("human");
   expect(words('cat "$(whoami)"')).toBeUndefined();
 });
+
+test("AI can approve a bounded cloud inspection and cache only that session request", () => {
+  const directory = join(root, "ai-audit");
+  mkdirSync(directory);
+  const session = new PolicySession(directory, "codex", "test");
+  const r = request("az network vnet list --resource-group example");
+  expect(session.review(r).decision).toBe("human");
+  expect(
+    session.classify({ requestHash: hash(r), category: "cloud-read", confidence: 0.999 }).decision,
+  ).toBe("approve");
+  expect(session.review(r).cached).toBe(true);
+  expect(session.review(request("az network vnet delete --name example")).decision).toBe("human");
+  expect(
+    session.review(request("az network vnet list --endpoint-url https://evil.example")).decision,
+  ).toBe("human");
+  const changed = request("az network vnet list --resource-group another");
+  expect(session.review(changed).decision).toBe("human");
+});

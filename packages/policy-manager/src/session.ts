@@ -3,7 +3,7 @@ import { evaluate, hash } from "./policy.js";
 import type { Classification, Decision, Request } from "./types.js";
 
 export class PolicySession {
-  private cache = new Map<string, number>();
+  private cache = new Map<string, { expires: number; ai?: Classification }>();
   private pending = new Map<string, Request>();
   constructor(
     readonly directory: string,
@@ -39,18 +39,27 @@ export class PolicySession {
       });
       throw new Error("Malformed AI classification");
     }
-    const decision = evaluate(request, ai);
-    const key = hash([decision.requestHash, "policy-v1"]);
+    const key = hash([hash(request), "policy-v1"]);
+    const entry = this.cache.get(key);
+    const cachedAi = entry && entry.expires > Date.now() ? entry.ai : undefined;
+    const decision = evaluate(request, ai ?? cachedAi);
+    if (decision.decision === "human") this.cache.delete(key);
     // Evaluation always precedes lookup. Filesystem evidence is never cached.
     if (decision.decision === "approve" && decision.cache === "session") {
-      const expires = this.cache.get(key);
-      decision.cached = expires !== undefined && expires > Date.now();
+      decision.cached = entry !== undefined && entry.expires > Date.now() && ai === undefined;
       if (!decision.cached) {
         if (this.cache.size >= 512) this.cache.clear();
-        this.cache.set(key, Date.now() + 60_000);
+        this.cache.set(key, {
+          expires: Date.now() + 60_000,
+          ...(decision.ai ? { ai: { ...decision.ai } } : {}),
+        });
       }
     }
-    if (decision.category === "unknown" && !ai) {
+    if (
+      decision.decision === "human" &&
+      ["unknown", "cloud-read"].includes(decision.category) &&
+      !ai
+    ) {
       if (this.pending.size >= 64) this.pending.delete(this.pending.keys().next().value ?? "");
       this.pending.set(decision.requestHash, request);
     }

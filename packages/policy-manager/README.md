@@ -2,7 +2,7 @@
 
 A coding-agent-independent permission evaluator. It starts a private background service for each session, verifies ordinary code operations and cloud inspection commands, and records requests and decisions in a temporary audit log. No runtime dependencies or model API calls.
 
-This is a conservative initial implementation. It grants only decisions supported by the deterministic catalog. A same-session AI classifier can explain ambiguous requests and recommend a structured replacement. Confidence alone never authorizes an opaque command.
+This is a conservative initial implementation. It grants ordinary operations through deterministic checks. For additional cloud inspection operations, AI can confirm a bounded read-only candidate. A same-session AI classifier can categorize candidates and recommend structured replacements for opaque commands. Confidence alone never authorizes an opaque command.
 
 ## Usage
 
@@ -49,7 +49,7 @@ The session's policy-manager agent returns the following object for an ambiguous
 { "requestHash": "<exact hash from review>", "category": "unknown", "confidence": 0.4 }
 ```
 
-Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
+Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Known cloud services with read-only verbs and permitted selectors can qualify through AI classification. Endpoint overrides and cloud writes cannot qualify. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
 
 ## Policy
 
