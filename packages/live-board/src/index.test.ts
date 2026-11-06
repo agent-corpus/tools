@@ -80,3 +80,16 @@ it("sends initial state over SSE and accepts durable agent reports", async () =>
   });
   expect(result.status).toBe(200);
 });
+
+it("keeps internal exception details out of HTTP responses", async () => {
+  const { token } = (await (await fetch(`${app.url}/api/session`)).json()) as { token: string };
+  const response = await fetch(`${app.url}/api/projects`, {
+    method: "POST",
+    headers: { "X-Tracker-Token": token },
+    body: "null",
+  });
+  expect(response.status).toBe(400);
+  expect(await response.json()).toEqual({
+    error: "Request failed. Check the input and the local server logs.",
+  });
+});

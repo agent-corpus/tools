@@ -78,9 +78,20 @@ export const planSchema = z
   });
 export type Plan = z.infer<typeof planSchema>;
 export function parsePlan(body: string): Plan {
-  const blocks = [...body.matchAll(/^```tracking-plan\s*\r?\n([\s\S]*?)^```\s*$/gm)];
-  if (blocks.length !== 1) throw new Error("Expected exactly one tracking-plan block");
-  return planSchema.parse(JSON.parse(blocks[0]?.[1] ?? ""));
+  const blocks: string[] = [];
+  let lines: string[] | undefined;
+  for (const line of body.split(/\r?\n/)) {
+    const fence = line.trimEnd();
+    if (lines) {
+      if (fence === "```") {
+        blocks.push(lines.join("\n"));
+        lines = undefined;
+      } else lines.push(line);
+    } else if (fence === "```tracking-plan") lines = [];
+  }
+  if (lines || blocks.length !== 1)
+    throw new Error("Expected exactly one complete tracking-plan block");
+  return planSchema.parse(JSON.parse(blocks[0] ?? ""));
 }
 export const dataDir = () =>
   resolve(process.env.TRACKER_HOME || join(homedir(), ".agent-corpus", "trackers"));

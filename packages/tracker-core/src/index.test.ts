@@ -45,3 +45,9 @@ it("serializes concurrent writers and leaves readable durable state", async () =
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+it("rejects an unterminated second plan and scans whitespace line by line", () => {
+  const block = `\`\`\`tracking-plan\n${JSON.stringify(plan)}\n\`\`\`\n`;
+  expect(() => parsePlan(`${block}\`\`\`tracking-plan\n{`)).toThrow("exactly one");
+  expect(parsePlan(`${"\n ".repeat(100000)}\n${block}`).name).toBe("Demo");
+});

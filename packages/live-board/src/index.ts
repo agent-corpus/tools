@@ -77,6 +77,7 @@ export async function serve(port = 17999, pollMs = 60000) {
           res.writeHead(403).end();
           return;
         }
+        req.setEncoding("utf8");
         let body = "";
         for await (const chunk of req) {
           body += chunk;
@@ -137,7 +138,10 @@ export async function serve(port = 17999, pollMs = 60000) {
       }
     } catch (e) {
       if (!res.headersSent) res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+      process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
+      res.end(
+        JSON.stringify({ error: "Request failed. Check the input and the local server logs." }),
+      );
     }
   });
   await new Promise<void>((ok, fail) => {
