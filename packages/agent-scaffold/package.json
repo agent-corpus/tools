@@ -1,7 +1,7 @@
 {
   "name": "@agent-corpus/agent-scaffold",
   "version": "0.1.0",
-  "description": "Create portable skill and agent silhouettes with canonical instructions and native discovery adapters.",
+  "description": "Create portable skill and agent scaffolds with canonical instructions and native discovery adapters.",
   "keywords": [
     "coding-agent",
     "scaffold",

@@ -3,7 +3,7 @@ import { type ArtifactKind, scaffold } from "./index.js";
 
 const args = process.argv.slice(2);
 const usage =
-  "agent-scaffold <agent|skill> <name> <description> [root]\nCreates silhouettes first. Refuses existing artifacts. Add content only to the returned canonical file.";
+  "agent-scaffold <agent|skill> <name> <description> [root]\nCreates scaffolds first. Refuses existing artifacts. Add content only to the returned canonical file.";
 try {
   if (args[0] === "usage" || !args.length)
     console.log(args.includes("--json") ? JSON.stringify({ usage }) : usage);
