@@ -19,9 +19,11 @@ Every tool follows the same principles:
 
 ## Packages
 
-| Package                                       | Description                                                                                                                | npm                                                                                                                     |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| [`@agent-corpus/pr-watch`](packages/pr-watch) | Block until something actionable happens on a GitHub PR (stale branch, new review, failing CI, conflicts) and emit events. | [![npm](https://img.shields.io/npm/v/@agent-corpus/pr-watch.svg)](https://www.npmjs.com/package/@agent-corpus/pr-watch) |
+| Package                                                   | Description                                                                                                                | npm                                                                                                                     |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| [`@agent-corpus/pr-watch`](packages/pr-watch)             | Block until something actionable happens on a GitHub PR (stale branch, new review, failing CI, conflicts) and emit events. | [![npm](https://img.shields.io/npm/v/@agent-corpus/pr-watch.svg)](https://www.npmjs.com/package/@agent-corpus/pr-watch) |
+| [`@agent-corpus/agent-scaffold`](packages/agent-scaffold) | Create canonical skill and agent silhouettes with native references.                                                       | Initial release pending                                                                                                 |
+| [`@agent-corpus/policy-manager`](packages/policy-manager) | Evaluate session permissions with private audit logs and native hook adapters.                                             | Initial release pending                                                                                                 |
 
 ## Quick look
 
