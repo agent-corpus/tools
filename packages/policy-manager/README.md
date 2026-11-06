@@ -27,6 +27,25 @@ Use the generated absolute installed path. Do not point approval hooks at a muta
 
 The `SessionStart` hook starts one deterministic service and injects instructions to create a read-only policy-manager agent. Creation of the AI agent is a model action, not a native hook guarantee. Resident-agent availability varies by harness. This release has not established automatic resident-agent parity across the three CLIs. The fallback can run in the parent session when resident agents are unavailable.
 
+## Install native hooks
+
+Install the reviewed package outside Git checkouts, then run one setup command:
+
+```sh
+policy-manager setup-hook-claude --dry-run
+policy-manager setup-hook-claude
+policy-manager setup-hook-codex
+policy-manager setup-hook-copilot
+```
+
+The canonical form is `policy-manager setup-hook <claude|codex|copilot>`. Each alias uses that same implementation. Setup connects native tool, permission, execution-report, startup, and shutdown hooks directly to the deterministic service. The working AI does not need to request policy-manager approval for recognized native hook events.
+
+Setup merges only the managed hook definitions. Existing custom hooks, permissions, settings, allow rules, and deny rules remain. Repeated setup is idempotent. Package upgrades replace hooks carrying the managed marker; unmarked manual entries remain. Existing settings receive an owner-only backup, and updates use a temporary file with atomic replacement. Invalid JSON, unsupported schemas, symbolic links, concurrent setup, and detected concurrent edits fail without replacing the existing settings.
+
+`--dry-run` prints the target path, proposed managed hooks, and next steps without writing files or printing existing settings. `--config-dir <directory>` selects a harness configuration root for portable profiles or testing. Defaults respect `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `COPILOT_HOME`, then use the standard user directories listed above. Setup refuses to activate an entrypoint inside a Git checkout, including an npm link into a checkout. Source builds can preview with `--dry-run`.
+
+Start a new session after setup. Codex still requires explicit review and trust through `/hooks`; setup does not grant that trust. Existing sandbox controls and host permission rules continue to apply. Ambiguous requests retain the documented classification or human fallback; setup does not enable automatic AI fallback across unsupported native interfaces.
+
 ## Request protocol
 
 Pass one JSON object on standard input:
@@ -49,7 +68,7 @@ The session's policy-manager agent returns the following object for an ambiguous
 { "requestHash": "<exact hash from review>", "category": "unknown", "confidence": 0.4 }
 ```
 
-Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Known cloud services with read-only verbs and permitted selectors can qualify through AI classification. Endpoint overrides and cloud writes cannot qualify. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
+Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Explicitly listed metadata operations with permitted selectors can qualify through AI classification. Endpoint overrides and cloud writes cannot qualify. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
 
 ## Policy
 
@@ -57,7 +76,7 @@ Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactf
 - Ordinary file writes must resolve inside a linked worktree on a feature branch.
 - Main clones, protected branches, credentials, Git metadata, policy files, and hook settings require human approval.
 - Structured patches check all add, update, and move paths. Deletions require human approval.
-- Cloud reads use an exact operation catalog and permitted options. Unknown verbs, endpoint overrides, secret retrieval, and cloud writes require human approval.
+- Cloud reads use exact inspection and metadata operation catalogs with permitted options. Credential-returning settings, connection strings, publishing credentials, and storage keys are sensitive before AI classification. Unknown verbs, endpoint overrides, secret retrieval, and cloud writes require human approval.
 - A small Git inspection subset, `git fetch origin` with a verified network transport, and constrained feature worktree creation under `.worktrees/` are automatic. Branch deletion reports upstream and reachability evidence, but always requires a human. Fetched remote references can be stale.
 - Shell expansions, pipelines, interpreters, package scripts, and unknown effects require human review. A worktree does not establish their safety.
 

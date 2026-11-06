@@ -1,7 +1,8 @@
 import { isAbsolute } from "node:path";
 import type { Request } from "./types.js";
+export const managedHookFlag = "--agent-corpus-policy-manager-hook";
 export function hookConfig(harness: Request["harness"], cliPath: string): Record<string, unknown> {
-  if (!isAbsolute(cliPath) || /["\r\n$`%]/.test(cliPath))
+  if (![cliPath, process.execPath].every((path) => isAbsolute(path) && !/["\r\n$`%]/.test(path)))
     throw new Error("Use a safe absolute path to the reviewed CLI installation");
   if (!["claude", "codex", "copilot"].includes(harness)) throw new Error("Unknown harness");
   const hooks: Record<string, unknown> = {};
@@ -23,7 +24,7 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
           type: "command",
           ...(phase === "PreToolUse" || phase.startsWith("PostToolUse") ? { matcher } : {}),
           exec: process.execPath,
-          args: [cliPath, "hook", harness, phase],
+          args: [cliPath, "hook", harness, phase, managedHookFlag],
           timeoutSec: 8,
         },
       ];
@@ -34,7 +35,7 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
           hooks: [
             {
               type: "command",
-              command: `"${process.execPath}" "${cliPath}" hook ${harness} ${phase}`,
+              command: `"${process.execPath}" "${cliPath}" hook ${harness} ${phase} ${managedHookFlag}`,
               timeout: 8,
             },
           ],

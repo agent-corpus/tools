@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
 import { executionReport, hookResponse, normalize } from "./adapters.js";
 import { hookConfig } from "./config.js";
 import { send, serve, start } from "./service.js";
+import { SetupError, setupHook } from "./setup.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
 
 const usage = `policy-manager usage [--json]
@@ -11,6 +13,8 @@ policy-manager hook <claude|codex|copilot> <SessionStart|PreToolUse|PermissionRe
 policy-manager review <claude|codex|copilot> <session-id>   # normalized request JSON on stdin
 policy-manager classify <claude|codex|copilot> <session-id> # {requestHash,category,confidence} on stdin
 policy-manager record <claude|codex|copilot> <session-id>   # host-reported human response or execution result JSON
+policy-manager setup-hook <claude|codex|copilot> [--dry-run] [--config-dir <harness-config-directory>]
+policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run] [--config-dir <directory>]
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
 policy-manager stop <claude|codex|copilot> <session-id>
 A per-session background service checks policy and writes private temporary audit.jsonl logs.
@@ -35,7 +39,24 @@ const cliPath = fileURLToPath(import.meta.url);
 try {
   if (action === "usage" || !action)
     console.log(args.includes("--json") ? JSON.stringify({ usage }) : usage);
-  else if (action === "config")
+  else if (action === "setup-hook" || /^setup-hook-(claude|codex|copilot)$/.test(action)) {
+    const alias = action.match(/^setup-hook-(claude|codex|copilot)$/)?.[1];
+    const selected = (alias ?? harnessArg) as Request["harness"];
+    const { values } = parseArgs({
+      args: args.slice(alias ? 1 : 2),
+      options: { "dry-run": { type: "boolean" }, "config-dir": { type: "string" } },
+    });
+    console.log(
+      JSON.stringify(
+        setupHook(selected, cliPath, {
+          dryRun: values["dry-run"],
+          configDirectory: values["config-dir"],
+        }),
+        null,
+        2,
+      ),
+    );
+  } else if (action === "config")
     console.log(JSON.stringify(hookConfig(harness, phase ?? ""), null, 2));
   else if (action === "serve") await serve(harness, phase ?? "");
   else if (action === "stop")
@@ -62,7 +83,7 @@ try {
     } else {
       const directory = await start(harness, request.sessionId, cliPath);
       if (phase === "SessionStart") {
-        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Read .agent-config/agents/policy-manager.md and create one read-only policy-manager agent for this session. Use it only for ambiguous requests. Never ask it to approve its own tools.`;
+        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. For ambiguous requests, use a configured policy-manager agent or retain native human approval. If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent. Never ask an agent to approve its own tools.`;
         console.log(
           JSON.stringify(
             harness === "copilot"
@@ -85,8 +106,15 @@ try {
       } else throw new Error("Unsupported hook event");
     }
   } else throw new Error(usage);
-} catch {
-  if (action === "record" || (action === "hook" && phase?.startsWith("PostToolUse"))) {
+} catch (error) {
+  if (action?.startsWith("setup-hook")) {
+    console.error(
+      error instanceof SetupError
+        ? error.message
+        : "Hook setup failed. No automatic approval was granted.",
+    );
+    process.exitCode = 1;
+  } else if (action === "record" || (action === "hook" && phase?.startsWith("PostToolUse"))) {
     console.error("The audit report could not be recorded. The tool may already have completed.");
     process.exitCode = 1;
   } else {
