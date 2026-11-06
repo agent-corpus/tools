@@ -286,3 +286,29 @@ test("post-tool reports preserve uncertainty and discard raw tool output", () =>
   expect(failed.exitCode).toBe(1);
   expect(JSON.stringify(failed)).not.toContain("private-error");
 });
+
+test.each([
+  "az webapp config connection-string list --name example --resource-group example",
+  "az webapp config appsettings list --name example --resource-group example",
+  "az storage account keys list --resource-group example",
+  "az webapp deployment list-publishing-credentials --name example --resource-group example",
+  "az containerapp secret list --name example --resource-group example",
+])("credential-returning reads never qualify for AI approval: %s", (command) => {
+  const r = request(command);
+  const decision = evaluate(r, { requestHash: hash(r), category: "cloud-read", confidence: 1 });
+  expect(decision.decision).toBe("human");
+  expect(decision.category).toBe("sensitive");
+  expect(decision.cache).toBe("none");
+  expect(decision.needsClassification).not.toBe(true);
+});
+
+test.each([
+  "az webapp config container list --name example",
+  "az webapp config storage-account list --name example",
+  "gcloud container clusters describe example --project example",
+])("unlisted cloud read routes cannot enter the AI approval path: %s", (command) => {
+  const r = request(command);
+  const decision = evaluate(r, { requestHash: hash(r), category: "cloud-read", confidence: 1 });
+  expect(decision.decision).toBe("human");
+  expect(decision.needsClassification).not.toBe(true);
+});

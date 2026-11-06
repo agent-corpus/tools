@@ -129,54 +129,32 @@ function cloudReadCandidate(argv: string[]): boolean {
       flags[index + 1]?.startsWith("-")
     )
       return false;
-  if (argv[0] === "az")
-    return (
-      [
-        "resource",
-        "group",
-        "network",
-        "monitor",
-        "servicebus",
-        "storage",
-        "webapp",
-        "appservice",
-        "containerapp",
-        "vm",
-        "disk",
-      ].includes(operation[1] ?? "") && ["list", "show"].includes(operation.at(-1) ?? "")
-    );
-  if (argv[0] === "aws")
-    return (
-      operation.length === 3 &&
-      [
-        "ec2",
-        "rds",
-        "s3api",
-        "cloudformation",
-        "logs",
-        "cloudwatch",
-        "sqs",
-        "sns",
-        "ecs",
-        "eks",
-      ].includes(operation[1] ?? "") &&
-      /^(?:describe|list)-/.test(operation[2] ?? "")
-    );
-  if (argv[0] === "gcloud")
-    return (
-      [
-        "compute",
-        "projects",
-        "container",
-        "run",
-        "sql",
-        "pubsub",
-        "logging",
-        "monitoring",
-      ].includes(operation[1] ?? "") && ["list", "describe"].includes(operation.at(-1) ?? "")
-    );
-  return false;
+  const metadataOperations = new Set([
+    "az network vnet list",
+    "az network vnet show",
+    "az network nic list",
+    "az network nic show",
+    "az network nsg list",
+    "az network nsg show",
+    "az network public-ip list",
+    "az network public-ip show",
+    "az servicebus namespace list",
+    "az servicebus namespace show",
+    "az servicebus queue list",
+    "az servicebus queue show",
+    "az servicebus topic list",
+    "az servicebus topic show",
+    "az storage account list",
+    "az storage account show",
+    "aws ec2 describe-security-groups",
+    "aws ec2 describe-subnets",
+    "aws ec2 describe-vpcs",
+    "gcloud compute networks list",
+    "gcloud compute networks describe",
+  ]);
+  return metadataOperations.has(operation.join(" "));
 }
+
 function result(request: Request, category: Category, reason: string, approve = false): Decision {
   return {
     decision: approve ? "approve" : "human",
@@ -322,7 +300,7 @@ function evaluateCore(request: Request): Decision {
   if (["az", "aws", "gcloud"].includes(program ?? "")) {
     if (
       argv.some((arg) =>
-        /(?:secret|credential|password|list-keys|listKeys|access-token|get-token|kubeconfig)/i.test(
+        /(?:secret|credential|password|connection[-_]?strings?|app[-_]?settings|publishing|(?:^|[-_])keys?(?:$|[-_])|listKeys|access-token|get-token|kubeconfig)/i.test(
           arg,
         ),
       )
