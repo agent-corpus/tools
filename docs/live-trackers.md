@@ -5,6 +5,42 @@
 Serve the approved React interface on loopback port 17999. Collect issue plans,
 PR evidence, and task reports independently. Persist state between sessions.
 
+## Dependency boundary
+
+These packages are foundational tools. They do not depend on a consuming organization's
+repositories, agent instructions, private issue conventions, or domain model.
+
+The public [tracking plan contract](tracking-plan-v1.md) is owned by `tracker-core`.
+The board accepts this normalized data without requiring a GitHub issue: register a local JSON file
+with `project-watch add plan.json`. The built-in GitHub reader is an optional source integration
+for issues that explicitly embed this public contract.
+
+A consumer owns its source formats and mapping into this contract. A consumer-specific adapter
+can read its issues, apply its conventions, and write a validated JSON plan for the tools to observe.
+It can instead adopt the public contract directly. The tools never load the consumer's instructions
+to interpret its private format, and do not infer a plan from arbitrary issue prose.
+
+The consumer also decides which work requires approval and what evidence proves completion.
+The tools display supplied facts and derive dependency readiness; they do not establish an
+organization's approval or completion policy. The conservative `pending` default represents
+unspecified approval, not a requirement that every organization use the same approval workflow.
+
+Dependency direction:
+
+```text
+Consumer domain, issue conventions, agents, and policy
+                         |
+               consumer-owned mapping
+                         |
+              public tracking contract
+                         |
+       generic collectors, state, CLI, and board
+```
+
+A new consumer must be able to use the tools without accessing another consumer's repository.
+Examples and test fixtures therefore use neutral projects. Domain-specific agents and adapters
+belong in the consuming organization's repositories.
+
 ## Contract
 
 Tracking issues contain exactly one fenced `tracking-plan` JSON block. Version 1
@@ -114,7 +150,7 @@ Use the registered project ID, not the plan's descriptive ID. Report IDs are uni
 Send the same report ID again to renew its heartbeat. `running` reports expire after `ttlSeconds`.
 Terminal states are `blocked`, `done`, and `failed`; they remain dated claims.
 A report never marks a plan unit complete. Completion remains a deliberate source-plan update.
-See the shared `project-tracker` agent in caredocs-ai/agent-config for the operating procedure.
+An organization-specific agent can publish reports through this CLI. Its instructions and execution policy live outside these tools.
 
 ## State, refresh, and recovery
 
@@ -152,7 +188,7 @@ SSE reconnects send a full snapshot, so a dropped browser connection does not lo
 POST requests require `X-Tracker-Token`. Origin and Host checks reject foreign browser origins and DNS rebinding hosts.
 No CORS access is granted. Source strings and report text render as text, not HTML.
 The token protects browser requests; it does not isolate other processes running as the same local user.
-Files contain source text and task messages, so use an appropriate local workspace and do not include secrets or PHI.
+Files contain source text and task messages, so use an appropriate local workspace and do not include secrets or sensitive personal data.
 No credentials are saved in state or sent to the browser.
 
 ## Development checks

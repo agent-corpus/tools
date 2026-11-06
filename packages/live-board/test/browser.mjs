@@ -8,9 +8,9 @@ import { serve } from "../dist/index.js";
 const dir = await mkdtemp(join(tmpdir(), "live-board-browser-"));
 process.env.TRACKER_HOME = join(dir, "state");
 for (const [id, name, total] of [
-  ["group", "Group & concurrent", 5],
-  ["command", "Command Center", 3],
-  ["billing", "Billing foundations", 4],
+  ["website", "Website refresh", 5],
+  ["portal", "Developer portal", 3],
+  ["release", "Release automation", 4],
 ]) {
   const plan = {
     version: 1,
@@ -135,7 +135,7 @@ try {
       path: join(process.env.TRACKER_SCREENSHOT_DIR, "detail.png"),
       fullPage: true,
     });
-  const fixture = join(dir, "group.json");
+  const fixture = join(dir, "website.json");
   const original = await readFile(fixture, "utf8");
   const changed = JSON.parse(original);
   changed.name = "Live update received";
@@ -150,7 +150,7 @@ try {
   assert.equal(await page.locator(".live-plan").first().locator(".unit").count(), 5);
   await writeFile(fixture, original);
   await page
-    .getByRole("heading", { name: "Group & concurrent", exact: true })
+    .getByRole("heading", { name: "Website refresh", exact: true })
     .waitFor({ timeout: 15000 });
   await page.getByRole("button", { name: "Track a project", exact: true }).last().click();
   await page.getByRole("dialog").waitFor();
@@ -161,7 +161,7 @@ try {
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Dismiss error" }).click();
   await page.locator(".brand-button").click();
-  await page.getByLabel("Search projects").fill("billing");
+  await page.getByLabel("Search projects").fill("release");
   assert.equal(await page.locator(".project-card").count(), 1);
   await page.getByLabel("Search projects").fill("");
   for (const [width, height] of [

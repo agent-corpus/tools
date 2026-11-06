@@ -1,7 +1,10 @@
 # Tracking plan version 1
 
-One GitHub issue body contains exactly one fenced `tracking-plan` JSON block.
-The same block works in a Markdown file. A local JSON file can contain the object directly.
+This is the public input contract owned by `@agent-corpus/tracker-core`.
+It is independent of any consuming organization's issue templates or operating procedures.
+A local JSON file can contain the object directly. A Markdown file or GitHub issue can embed
+exactly one fenced `tracking-plan` JSON block.
+Consumers with other source formats own the mapping from those formats into this contract.
 Validate with `project-watch validate --file FILE`. Unsupported versions and unknown fields fail validation.
 
 ```tracking-plan
