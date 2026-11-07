@@ -12,7 +12,9 @@ export function git(cwd: string, args: string[]): string {
   }).trim();
 }
 export function canonical(path: string): string {
-  if (existsSync(path)) return realpathSync(path);
+  // Native resolution expands Windows 8.3 aliases as well as symlinks, so
+  // paths supplied by Node and Git describe the same repository boundaries.
+  if (existsSync(path)) return realpathSync.native(path);
   const parent = dirname(path);
   if (parent === path) throw new Error("Cannot resolve path");
   return resolve(canonical(parent), basename(path));

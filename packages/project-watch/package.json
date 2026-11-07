@@ -1,0 +1,51 @@
+{
+  "name": "@agent-corpus/project-watch",
+  "version": "0.1.0",
+  "description": "project-watch portable local tracking tools",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@agent-corpus/tracker-core": "0.1.0",
+    "@agent-corpus/pr-watch": "0.1.1",
+    "@agent-corpus/issue-watch": "0.1.0",
+    "@agent-corpus/task-report": "0.1.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --root . --exclude \"**/dist/**\"",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prepack": "npm run clean && npm run build && node -e \"require('fs').copyFileSync('../../LICENSE','LICENSE')\"",
+    "postpack": "node -e \"require('fs').rmSync('LICENSE',{force:true})\""
+  },
+  "bin": {
+    "project-watch": "dist/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agent-corpus/tools.git",
+    "directory": "packages/project-watch"
+  },
+  "homepage": "https://github.com/agent-corpus/tools/tree/main/packages/project-watch#readme",
+  "bugs": "https://github.com/agent-corpus/tools/issues"
+}
