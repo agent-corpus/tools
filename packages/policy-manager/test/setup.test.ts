@@ -119,8 +119,13 @@ test("upgrades managed hooks while preserving mixed custom hook groups", () => {
   setupHook("claude", replacement, { configDirectory: f.configDirectory });
   const result = JSON.parse(readFileSync(path, "utf8"));
   expect(result.hooks.PreToolUse[0].hooks).toEqual([custom]);
-  expect(JSON.stringify(result)).not.toContain(f.installed);
-  expect(JSON.stringify(result)).toContain(replacement);
+  const commands = Object.values(
+    result.hooks as Record<string, { hooks: { command: string }[] }[]>,
+  ).flatMap((groups) => groups.flatMap((group) => group.hooks.map((hook) => hook.command)));
+  expect(commands.some((command) => command.includes(f.installed))).toBe(false);
+  expect(commands.filter((command) => command !== custom.command)).toHaveLength(6);
+  for (const command of commands.filter((command) => command !== custom.command))
+    expect(command).toContain(replacement);
 });
 test("refuses malformed settings without replacing them", () => {
   const f = fixture();

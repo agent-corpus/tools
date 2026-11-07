@@ -19,6 +19,14 @@ import "./styles.css";
 
 const blank = { projects: [], events: [], seenAt: null };
 const colors = ["sage", "peach", "lavender", "blue"];
+async function sessionToken() {
+  const response = await fetch("/api/session");
+  if (!response.ok) throw new Error(`Unable to connect to the local server (${response.status}).`);
+  const session = await response.json();
+  if (typeof session.token !== "string" || !session.token)
+    throw new Error("The local server returned an invalid session.");
+  return session.token;
+}
 function when(date) {
   return date ? new Date(date).toLocaleString() : "Not observed yet";
 }
@@ -50,10 +58,9 @@ function App() {
     addButton = useRef(null);
   useEffect(() => {
     let alive = true;
-    fetch("/api/session")
-      .then((r) => r.json())
-      .then((s) => {
-        if (alive) token.current = s.token;
+    sessionToken()
+      .then((value) => {
+        if (alive) token.current = value;
       })
       .catch(() => {
         if (alive) setError("Unable to connect to the local server.");
@@ -78,12 +85,20 @@ function App() {
     setBusy(true);
     setError("");
     try {
-      if (!token.current) token.current = (await (await fetch("/api/session")).json()).token;
-      const response = await fetch(`/api/${path}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Tracker-Token": token.current },
-        body: JSON.stringify(body),
-      });
+      if (!token.current) token.current = await sessionToken();
+      const send = () =>
+        fetch(`/api/${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Tracker-Token": token.current },
+          body: JSON.stringify(body),
+        });
+      let response = await send();
+      // A restarted server rejects the old token before performing any mutation.
+      // Renew and retry once; never replay failed writes for other status codes.
+      if (response.status === 403) {
+        token.current = await sessionToken();
+        response = await send();
+      }
       if (!response.ok) {
         const result = await response.json().catch(() => ({}));
         throw new Error(result.error || `Request failed (${response.status})`);

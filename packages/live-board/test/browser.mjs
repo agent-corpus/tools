@@ -29,7 +29,7 @@ for (const [id, name, total] of [
   await register(file);
 }
 await refresh();
-const app = await serve(0, 5000);
+let app = await serve(0, 5000);
 
 import assert from "node:assert/strict";
 
@@ -164,6 +164,45 @@ try {
   await page.getByLabel("Search projects").fill("release");
   assert.equal(await page.locator(".project-card").count(), 1);
   await page.getByLabel("Search projects").fill("");
+  async function markSeen() {
+    const response = page.waitForResponse(
+      (r) => r.url().endsWith("/api/seen") && r.request().method() === "POST" && r.ok(),
+      { timeout: 10000 },
+    );
+    await page.getByRole("button", { name: "Mark seen", exact: true }).click();
+    assert.equal((await response).status(), 200);
+    assert.equal(await page.getByRole("alert").count(), 0);
+  }
+  await markSeen();
+  const pageIdentity = await page.evaluate(() => performance.timeOrigin);
+  const port = Number(new URL(app.url).port);
+  const reconnected = page.waitForResponse((r) => r.url().endsWith("/api/events") && r.ok());
+  await app.close();
+  app = await serve(port, 5000);
+  await reconnected;
+  await page.locator(".connection-status").filter({ hasText: "Live connection" }).waitFor();
+  await markSeen();
+  assert.equal(await page.evaluate(() => performance.timeOrigin), pageIdentity);
+  console.log("PASS: mutations recover after a server restart without reloading the tab.");
+  for (const [status, attempts] of [
+    [403, 2],
+    [500, 1],
+  ]) {
+    let requests = 0;
+    await page.route("**/api/seen", (route) => {
+      requests++;
+      return route.fulfill({ status });
+    });
+    await page.getByRole("button", { name: "Mark seen", exact: true }).click();
+    await page
+      .getByRole("alert")
+      .filter({ hasText: `Request failed (${status})` })
+      .waitFor();
+    assert.equal(requests, attempts);
+    await page.unroute("**/api/seen");
+    await page.getByRole("button", { name: "Dismiss error" }).click();
+  }
+  console.log("PASS: persistent 403 stops after one retry; other failed writes are not replayed.");
   for (const [width, height] of [
     [1024, 900],
     [390, 844],

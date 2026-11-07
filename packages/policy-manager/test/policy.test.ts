@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { executionReport, hookResponse, normalize } from "../src/adapters.js";
+import { canonical } from "../src/evidence.js";
 import { evaluate, hash, words } from "../src/policy.js";
 import { PolicySession } from "../src/session.js";
 import type { Request } from "../src/types.js";
@@ -36,6 +37,10 @@ beforeAll(() => {
   writeFileSync(join(other, "code.txt"), "other");
 });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
+test("Node and Git paths agree on repository boundaries, including Windows short paths", () => {
+  for (const directory of [repo, worktree, other])
+    expect(canonical(directory)).toBe(canonical(git(directory, ["rev-parse", "--show-toplevel"])));
+});
 test("approves writes only in a linked feature worktree", () => {
   const r = { ...request(""), tool: "Write", input: { file_path: "src/new.ts", content: "x" } };
   expect(evaluate(r).decision).toBe("approve");
