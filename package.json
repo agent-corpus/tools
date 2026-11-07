@@ -15,7 +15,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @agent-corpus/pr-watch && npm run build -w @agent-corpus/tracker-core && npm run build -w @agent-corpus/issue-watch && npm run build -w @agent-corpus/task-report && npm run build -w @agent-corpus/project-watch && npm run build -w @agent-corpus/live-board",
+    "build": "npm run build -w @agent-corpus/agent-scaffold && npm run build -w @agent-corpus/audit-log && npm run build -w @agent-corpus/policy-manager && npm run build -w @agent-corpus/pr-watch && npm run build -w @agent-corpus/tracker-core && npm run build -w @agent-corpus/issue-watch && npm run build -w @agent-corpus/task-report && npm run build -w @agent-corpus/project-watch && npm run build -w @agent-corpus/live-board",
     "clean": "npm run clean --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "lint": "biome check .",
@@ -26,7 +26,8 @@
     "version-packages": "changeset version",
     "release": "npm run build && changeset publish",
     "board": "node packages/live-board/dist/cli.js serve",
-    "tracker": "node packages/project-watch/dist/cli.js"
+    "tracker": "node packages/project-watch/dist/cli.js",
+    "check:changesets": "changeset status"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.4",
