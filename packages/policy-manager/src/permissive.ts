@@ -43,6 +43,8 @@ const DESTRUCTIVE = new Set([
   "crontab",
   "launchctl",
   "systemctl",
+  "pushd",
+  "popd",
 ]);
 const WRITERS = new Set([
   "mv",
@@ -59,7 +61,7 @@ const WRITERS = new Set([
 const WRAPPERS = new Set(["env", "nohup", "time", "command", "nice", "timeout", "xargs"]);
 const BANNED_ENV =
   /^(?:LD_|DYLD_|GIT_|PYTHON|NODE_OPTIONS$|PATH$|HOME$|BASH_ENV$|ENV$|SHELL$|PAGER$|EDITOR$|GH_TOKEN$|GITHUB_TOKEN$)/;
-const FORCE_PUSH = /^--(?:force|force-with-lease|force-if-includes|mirror|prune)(?:=.*)?$/;
+const FORCE_PUSH = ["--force", "--force-with-lease", "--force-if-includes", "--mirror", "--prune"];
 
 function human(request: Request, category: Decision["category"], reason: string): Decision {
   return result(request, category, reason);
@@ -115,23 +117,44 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
   return pathEvidence(cwd, input, true);
 }
 
-function unwrap(argv: string[]): string[] {
+interface Unwrapped {
+  argv: string[];
+  /** Assignments given to `env`, which the parser does not see as shell assignments. */
+  env: string[];
+  refusal?: string;
+}
+
+function unwrap(argv: string[]): Unwrapped {
   let current = argv;
+  const env: string[] = [];
   for (let depth = 0; depth < 4; depth++) {
     const program = basename(current[0] ?? "");
-    if (!WRAPPERS.has(program) || program === "xargs") return current;
+    if (!WRAPPERS.has(program) || program === "xargs") return { argv: current, env };
     let rest = current.slice(1);
     while (
       rest[0]?.startsWith("-") ||
       (program === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rest[0] ?? "")) ||
       (program === "timeout" && /^[0-9.]+[smhd]?$/.test(rest[0] ?? "")) ||
       (program === "nice" && /^[0-9-]+$/.test(rest[0] ?? ""))
-    )
+    ) {
+      const word = rest[0] ?? "";
+      // env options can change the program searched for, the directory or the environment.
+      if (program === "env" && word.startsWith("-") && word !== "-i" && word !== "--")
+        return { argv: current, env, refusal: "env options require human review" };
+      if (program === "env" && !word.startsWith("-")) env.push(word.slice(0, word.indexOf("=")));
       rest = rest.slice(1);
-    if (!rest.length) return current;
+    }
+    if (!rest.length) return { argv: current, env };
     current = rest;
   }
-  return current;
+  return { argv: current, env };
+}
+
+/** True when `flag` is `name` or a unique-looking abbreviation Git's option parser would accept. */
+function abbreviates(flag: string, name: string): boolean {
+  if (!flag.startsWith("--") || !name.startsWith("--")) return flag === name;
+  const given = flag.split("=")[0] as string;
+  return given.length > 2 && name.startsWith(given);
 }
 
 function gitDecision(request: Request, argv: string[], cwdForGit: string): Decision {
@@ -149,7 +172,8 @@ function gitDecision(request: Request, argv: string[], cwdForGit: string): Decis
   const rest = args.slice(index + 1);
   const flags = rest.filter((word) => word.startsWith("-"));
   const positional = rest.filter((word) => !word.startsWith("-"));
-  const has = (...names: string[]) => flags.some((flag) => names.includes(flag));
+  const has = (...names: string[]) =>
+    flags.some((flag) => names.some((name) => abbreviates(flag, name)));
   const cluster = (letter: string) =>
     flags.some((flag) => /^-[a-zA-Z]+$/.test(flag) && flag.includes(letter));
   const ok = (reason = "Permissive profile: Git operation has no destructive effect") =>
@@ -177,7 +201,7 @@ function gitDecision(request: Request, argv: string[], cwdForGit: string): Decis
       positional.includes(":/"))
   )
     return human(request, "destructive", "git checkout would discard working-tree changes");
-  if (sub === "restore" && !has("--staged", "-S"))
+  if (sub === "restore" && (!has("--staged", "-S") || has("--worktree", "-W") || cluster("W")))
     return human(request, "destructive", "git restore would discard working-tree changes");
   if (sub === "switch" && has("-f", "--force", "--discard-changes"))
     return human(request, "destructive", "git switch would discard working-tree changes");
@@ -232,20 +256,18 @@ function gitPush(request: Request, cwd: string, rest: string[]): Decision {
   const remote = refs[0];
   const refspecs = refs.slice(1);
   if (
-    flags.some((flag) => FORCE_PUSH.test(flag) || (/^-[a-zA-Z]+$/.test(flag) && flag.includes("f")))
-  )
-    return human(request, "destructive", "Force or mirror pushes overwrite remote history");
-  if (
     flags.some(
       (flag) =>
-        ["--receive-pack", "--exec"].includes(flag) ||
-        flag.startsWith("--receive-pack=") ||
-        flag.startsWith("--exec="),
+        FORCE_PUSH.some((name) => abbreviates(flag, name)) ||
+        (/^-[a-zA-Z]+$/.test(flag) && flag.includes("f")),
     )
   )
+    return human(request, "destructive", "Force or mirror pushes overwrite remote history");
+  if (flags.some((flag) => abbreviates(flag, "--receive-pack") || abbreviates(flag, "--exec")))
     return human(request, "unknown", "Custom push executables require human review");
   const deleting =
-    flags.includes("--delete") || flags.some((flag) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(flag));
+    flags.some((flag) => abbreviates(flag, "--delete")) ||
+    flags.some((flag) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(flag));
   const targets: string[] = [];
   for (const spec of refspecs) {
     if (spec.startsWith("+"))
@@ -325,19 +347,30 @@ function simpleDecision(
   profile: Profile,
   depth: number,
   stageIndex: number,
+  cwd: string,
 ): Decision {
   for (const [name] of command.env)
     if (BANNED_ENV.test(name))
       return human(request, "unknown", "Environment override requires human review");
   for (const redirect of command.redirects) {
-    if (redirect.op === ">&" || redirect.target === "/dev/null") continue;
+    // `>& word` duplicates a descriptor only when word is a number or `-`; otherwise it names a file.
+    if (
+      redirect.target === "/dev/null" ||
+      (redirect.op === ">&" && /^(?:[0-9]+|-)$/.test(redirect.target))
+    )
+      continue;
     const check =
       redirect.op === "<"
-        ? permissiveRead(request.cwd, redirect.target)
-        : permissiveWrite(request.cwd, redirect.target, profile);
+        ? permissiveRead(cwd, redirect.target)
+        : permissiveWrite(cwd, redirect.target, profile);
     if (!check.allowed) return human(request, check.category, check.reason);
   }
-  const argv = unwrap(command.argv);
+  const unwrapped = unwrap(command.argv);
+  if (unwrapped.refusal) return human(request, "unknown", unwrapped.refusal);
+  for (const name of unwrapped.env)
+    if (BANNED_ENV.test(name))
+      return human(request, "unknown", "Environment override requires human review");
+  const argv = unwrapped.argv;
   const program = basename(argv[0] ?? "");
   const args = argv.slice(1);
   const joined = argv.join(" ");
@@ -361,7 +394,7 @@ function simpleDecision(
       const script = inline >= 0 ? args[inline + 1] : undefined;
       if (script === undefined || depth >= 2)
         return human(request, "unknown", "Shell invocation requires human review");
-      return commandDecision(request, script, profile, depth + 1);
+      return commandDecision(request, script, profile, depth + 1, [cwd]);
     }
     if (args.length === 0 || args[0] === "-")
       return human(
@@ -399,12 +432,12 @@ function simpleDecision(
     (program === "perl" && args.some((arg) => /^-[a-zA-Z]*i/.test(arg)))
   ) {
     for (const file of args.filter((arg) => !arg.startsWith("-")).slice(1)) {
-      const check = permissiveWrite(request.cwd, file, profile);
+      const check = permissiveWrite(cwd, file, profile);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   } else if (WRITERS.has(program)) {
     for (const file of args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg))) {
-      const check = permissiveWrite(request.cwd, file, profile);
+      const check = permissiveWrite(cwd, file, profile);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   }
@@ -436,7 +469,7 @@ function simpleDecision(
     /(?:-X|--request)[=\s]?(?:DELETE|PUT)\b/i.test(joined)
   )
     return human(request, "destructive", "Destructive HTTP verbs require human approval");
-  if (program === "git") return gitDecision(request, argv, request.cwd);
+  if (program === "git") return gitDecision(request, argv, cwd);
   if (program === "gh") {
     const gh = ghDecision(request, argv);
     if (gh) return gh;
@@ -450,11 +483,19 @@ function simpleDecision(
   );
 }
 
+const MAX_DIRECTORIES = 8;
+
+/**
+ * Evaluates a compound command. `cd <literal>` is tracked: every later command is judged in each
+ * directory it could run in (before and after the `cd`, since `cd x || ...` may fail), so a command
+ * that only looks safe relative to the starting directory cannot hide behind a `cd`.
+ */
 export function commandDecision(
   request: Request,
   command: string,
   profile: Profile,
   depth = 0,
+  start: string[] = [request.cwd],
 ): Decision {
   const pipelines = parseShell(command);
   if (!pipelines)
@@ -463,11 +504,25 @@ export function commandDecision(
       "unknown",
       "Unsupported shell syntax; expansions and subshells need human review",
     );
+  let cwds = [...start];
   let last: Decision | undefined;
   for (const pipeline of pipelines)
     for (const [index, simple] of pipeline.entries()) {
-      last = simpleDecision(request, simple, profile, depth, index);
-      if (last.decision !== "approve") return last;
+      if (basename(simple.argv[0] ?? "") === "cd") {
+        const target = simple.argv.slice(1).filter((word) => word !== "--");
+        const word = target[0];
+        if (target.length !== 1 || !word || /^[-~]|[*?[\]]/.test(word) || word.startsWith("-"))
+          return human(request, "unknown", "Directory change requires human review");
+        cwds = [...new Set([...cwds, ...cwds.map((cwd) => resolve(cwd, word))])];
+        if (cwds.length > MAX_DIRECTORIES)
+          return human(request, "unknown", "Too many directory changes to verify");
+        last = result(request, "code-read", "Directory change", true);
+        continue;
+      }
+      for (const cwd of cwds) {
+        last = simpleDecision(request, simple, profile, depth, index, cwd);
+        if (last.decision !== "approve") return last;
+      }
     }
   return last ?? human(request, "unknown", "Empty command");
 }

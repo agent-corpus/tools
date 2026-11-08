@@ -40,10 +40,15 @@ function verifyLocation(path: string): void {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink())
     throw new ProfileError("Profile must be a regular file");
-  if (process.getuid && stat.uid !== process.getuid())
-    throw new ProfileError("Profile must be owned by the current user");
-  if ((stat.mode & 0o022) !== 0)
-    throw new ProfileError("Profile must not be group or world writable");
+  // POSIX ownership and mode bits do not exist on Windows. There the trust boundary is the NTFS
+  // ACL of the user's profile directory, which Node cannot inspect, so only the file type,
+  // symlink and Git-checkout checks apply.
+  if (process.platform !== "win32") {
+    if (process.getuid && stat.uid !== process.getuid())
+      throw new ProfileError("Profile must be owned by the current user");
+    if ((stat.mode & 0o022) !== 0)
+      throw new ProfileError("Profile must not be group or world writable");
+  }
   try {
     git(dirname(canonical(path)), ["rev-parse", "--show-toplevel"]);
   } catch {

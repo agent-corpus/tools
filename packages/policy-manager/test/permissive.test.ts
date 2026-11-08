@@ -112,6 +112,7 @@ describe("permissive profile", () => {
     "git push origin HEAD",
     "python3 -c 'print(1)'",
     "echo hi > /dev/null 2>&1",
+    "cd src && ls",
     "git -C . log -5",
     "timeout 30 git fetch origin",
   ])("approves %s", (command) => expect(decide(command).decision).toBe("approve"));
@@ -151,6 +152,19 @@ describe("permissive profile", () => {
     ["cat .env", "sensitive"],
     ["LD_PRELOAD=/tmp/x.so ls", "unknown"],
     ["bash -c 'rm -rf x'", "destructive"],
+    ["echo x >& /etc/hosts", "worktree-write"],
+    ["env PATH=/tmp/override ls", "unknown"],
+    ["env LD_PRELOAD=/tmp/x.so ls", "unknown"],
+    ["env -S 'ls' x", "unknown"],
+    ["git restore --staged --worktree src/a.ts", "destructive"],
+    ["git restore -SW src/a.ts", "destructive"],
+    ["git push --force-with-leas origin feature", "destructive"],
+    ["git push --forc origin feature", "destructive"],
+    ["git push --mirro origin", "destructive"],
+    ["git reset --har HEAD~1", "destructive"],
+    ["cd /etc && echo x > note.txt", "worktree-write"],
+    ["cd .. && rm -rf x", "destructive"],
+    ["pushd /etc", "destructive"],
   ])("sends %s to a human (%s)", (command, category) => {
     const d = decide(command);
     expect(d.decision).toBe("human");
@@ -172,6 +186,17 @@ describe("permissive profile", () => {
     expect(evaluate(r, undefined, allow).decision).toBe("approve");
     r.input = { command: "az group delete --name x" };
     expect(evaluate(r, undefined, allow).decision).toBe("human");
+  });
+
+  test("cd is tracked so a scratch-relative write cannot hide behind it", () => {
+    const scratch = join(root, "scratch");
+    mkdirSync(join(scratch, "sub"), { recursive: true });
+    expect(decide("echo x > note.txt", scratch).decision).toBe("approve");
+    expect(decide("cd sub && echo x > note.txt", scratch).decision).toBe("approve");
+    expect(decide("cd /etc && echo x > note.txt", scratch).decision).toBe("human");
+    expect(decide("cd /etc || echo x > note.txt", scratch).decision).toBe("human");
+    expect(decide("cd && ls", scratch).decision).toBe("human");
+    expect(decide("bash -c 'cd /etc && echo x > note.txt'", scratch).decision).toBe("human");
   });
 
   test("humanPatterns add organization rules", () => {
@@ -290,9 +315,11 @@ describe("profile loading", () => {
     const link = join(dir, "link.json");
     symlinkSync(good, link);
     expect(() => loadProfile(link)).toThrow(ProfileError);
-    const open = join(dir, "open.json");
-    writeFileSync(open, '{"version":1,"mode":"permissive"}', { mode: 0o666 });
-    execFileSync("chmod", ["666", open]);
-    expect(() => loadProfile(open)).toThrow(ProfileError);
+    if (process.platform !== "win32") {
+      const open = join(dir, "open.json");
+      writeFileSync(open, '{"version":1,"mode":"permissive"}', { mode: 0o666 });
+      execFileSync("chmod", ["666", open]);
+      expect(() => loadProfile(open)).toThrow(ProfileError);
+    }
   });
 });
