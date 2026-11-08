@@ -513,6 +513,12 @@ export function commandDecision(
         const word = target[0];
         if (target.length !== 1 || !word || /^[-~]|[*?[\]]/.test(word) || word.startsWith("-"))
           return human(request, "unknown", "Directory change requires human review");
+        // The cd's own redirections, env assignments and organization patterns run first, in the
+        // directories it could start from.
+        for (const cwd of cwds) {
+          const own = simpleDecision(request, simple, profile, depth, index, cwd);
+          if (own.decision !== "approve") return own;
+        }
         cwds = [...new Set([...cwds, ...cwds.map((cwd) => resolve(cwd, word))])];
         if (cwds.length > MAX_DIRECTORIES)
           return human(request, "unknown", "Too many directory changes to verify");

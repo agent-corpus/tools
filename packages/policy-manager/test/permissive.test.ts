@@ -196,6 +196,11 @@ describe("permissive profile", () => {
     expect(decide("cd /etc && echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd /etc || echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd && ls", scratch).decision).toBe("human");
+    expect(decide("cd /tmp > /etc/hosts", scratch).decision).toBe("human");
+    expect(decide("cd sub >& /etc/hosts", scratch).decision).toBe("human");
+    expect(decide("LD_PRELOAD=/tmp/x.so cd sub", scratch).decision).toBe("human");
+    expect(decide("bash -c 'cd /tmp > /etc/hosts'", scratch).decision).toBe("human");
+    expect(decide("cd sub > note.txt && ls", scratch).decision).toBe("approve");
     expect(decide("bash -c 'cd /etc && echo x > note.txt'", scratch).decision).toBe("human");
   });
 
