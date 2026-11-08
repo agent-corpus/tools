@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { mergedEvidence } from "../src/merged.js";
 import { evaluate } from "../src/policy.js";
 import { loadProfile, ProfileError, parseProfile } from "../src/profile.js";
+import { replayTranscripts } from "../src/replay.js";
 import { parseShell } from "../src/shell.js";
 import type { Request } from "../src/types.js";
 
@@ -115,6 +116,16 @@ describe("permissive profile", () => {
     "cd src && ls",
     "git -C . log -5",
     "timeout 30 git fetch origin",
+    "cd ~ && ls",
+    "cd && pwd",
+    "cd ~/code 2>/dev/null && ls",
+    "az cosmosdb list --query name -o tsv",
+    "az webapp show --name x --resource-group y",
+    "aws s3api list-buckets",
+    "gcloud run services describe svc",
+    "git config core.bare false",
+    "git config --local user.email t@example.com",
+    "git config --unset core.bare",
   ])("approves %s", (command) => expect(decide(command).decision).toBe("approve"));
 
   test.each([
@@ -165,6 +176,16 @@ describe("permissive profile", () => {
     ["cd /etc && echo x > note.txt", "worktree-write"],
     ["cd .. && rm -rf x", "destructive"],
     ["pushd /etc", "destructive"],
+    ["az cosmosdb keys list --name x", "sensitive"],
+    ["az webapp list --endpoint-url https://evil.example", "impactful-write"],
+    ["aws secretsmanager get-secret-value --secret-id x", "sensitive"],
+    ["aws iam create-user --user-name x", "impactful-write"],
+    ["git config core.hooksPath /tmp/hooks", "sensitive"],
+    ["git config alias.st '!rm -rf /'", "sensitive"],
+    ["git config --global user.name x", "sensitive"],
+    ["git config credential.helper store", "sensitive"],
+    ["git config remote.origin.url https://evil.example/x.git", "sensitive"],
+    ["cd ~user && ls", "unknown"],
   ])("sends %s to a human (%s)", (command, category) => {
     const d = decide(command);
     expect(d.decision).toBe("human");
@@ -195,7 +216,8 @@ describe("permissive profile", () => {
     expect(decide("cd sub && echo x > note.txt", scratch).decision).toBe("approve");
     expect(decide("cd /etc && echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd /etc || echo x > note.txt", scratch).decision).toBe("human");
-    expect(decide("cd && ls", scratch).decision).toBe("human");
+    expect(decide("cd && ls", scratch).decision).toBe("approve");
+    expect(decide("cd && echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd /tmp > /etc/hosts", scratch).decision).toBe("human");
     expect(decide("cd sub >& /etc/hosts", scratch).decision).toBe("human");
     expect(decide("LD_PRELOAD=/tmp/x.so cd sub", scratch).decision).toBe("human");
@@ -326,5 +348,51 @@ describe("profile loading", () => {
       execFileSync("chmod", ["666", open]);
       expect(() => loadProfile(open)).toThrow(ProfileError);
     }
+  });
+});
+
+describe("protected names are relative to the repository root", () => {
+  test("a worktree under .claude/worktrees is ordinary code; its own .claude is protected", () => {
+    const nested = join(repo, ".claude", "worktrees", "inner");
+    mkdirSync(join(repo, ".claude", "worktrees"), { recursive: true });
+    git(repo, ["worktree", "add", "-b", "inner-feature", nested]);
+    const write = (file: string): Request => ({
+      sessionId: "t",
+      harness: "claude",
+      cwd: nested,
+      tool: "Write",
+      input: { file_path: file, content: "" },
+    });
+    expect(evaluate(write("src/new.ts"), undefined, profile).decision).toBe("approve");
+    expect(evaluate(write("src/new.ts")).decision).toBe("approve");
+    expect(evaluate(write(".claude/settings.json"), undefined, profile).decision).toBe("human");
+    expect(evaluate(write("AGENTS.md"), undefined, profile).decision).toBe("human");
+    expect(decide("echo x > src/a.txt", nested).decision).toBe("approve");
+    expect(decide("sed -i '' s/a/b/ .claude/settings.json", nested).decision).toBe("human");
+  });
+});
+
+describe("replay", () => {
+  test("reports approval rates and reasons without executing anything", () => {
+    const dir = join(root, "transcripts");
+    mkdirSync(dir);
+    const entry = (command: string) =>
+      JSON.stringify({
+        cwd: worktree,
+        message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] },
+      });
+    writeFileSync(
+      join(dir, "s.jsonl"),
+      [
+        entry("ls && git status"),
+        entry("ls && git status"),
+        entry("rm -rf x"),
+        entry("echo $(id)"),
+      ].join("\n"),
+    );
+    const report = replayTranscripts([dir], profile);
+    expect(report.commands).toBe(3);
+    expect(report.approved).toBe(1);
+    expect(report.reasons.map((r) => r.count)).toEqual([1, 1]);
   });
 });

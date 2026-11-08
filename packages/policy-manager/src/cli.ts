@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { executionReport, hookResponse, normalize } from "./adapters.js";
 import { hookConfig } from "./config.js";
-import { defaultProfilePath, parseProfile } from "./profile.js";
+import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
+import { replayTranscripts } from "./replay.js";
 import { send, serve, start } from "./service.js";
 import { SetupError, setupHook } from "./setup.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
@@ -20,6 +21,7 @@ policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run]
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
 policy-manager profile validate <file>   # check a policy profile without installing it
 policy-manager profile install <file>    # install it to the user config directory outside Git
+policy-manager replay <transcript-dir-or-file...> [--profile <file>] [--files <n>]  # approval rate over recorded Bash commands; nothing is executed
 policy-manager stop <claude|codex|copilot> <session-id>
 A per-session background service checks policy and writes private temporary audit.jsonl logs.
 AI classification comes from the session's policy-manager agent, never an external API.
@@ -81,6 +83,24 @@ try {
       renameSync(temporary, target);
       console.log(JSON.stringify({ installed: target, ...summary }));
     } else console.log(JSON.stringify({ valid: true, ...summary }));
+  } else if (action === "replay") {
+    const { values, positionals } = parseArgs({
+      args: args.slice(1),
+      options: { profile: { type: "string" }, files: { type: "string" } },
+      allowPositionals: true,
+    });
+    const profile = values.profile
+      ? parseProfile(readFileSync(values.profile, "utf8"))
+      : loadProfile();
+    const report = replayTranscripts(positionals, profile, Number(values.files ?? 50));
+    const pct = (n: number) => `${((100 * n) / Math.max(report.commands, 1)).toFixed(1)}%`;
+    console.log(
+      `${report.commands} unique commands; approved ${pct(report.approved)} (strict ${pct(report.strictApproved)})`,
+    );
+    for (const row of report.reasons.slice(0, 15)) {
+      console.log(`${row.count}\t${row.reason}`);
+      for (const example of row.examples) console.log(`\t  ${example}`);
+    }
   } else if (action === "serve") await serve(harness, phase ?? "");
   else if (action === "stop")
     console.log(JSON.stringify(await send(harness, phase ?? "", { action: "stop" })));

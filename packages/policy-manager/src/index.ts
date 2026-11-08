@@ -10,6 +10,8 @@ export {
   parseProfile,
   strictProfile,
 } from "./profile.js";
+export type { ReplayReport } from "./replay.js";
+export { replayTranscripts } from "./replay.js";
 export { PolicySession } from "./session.js";
 export type { SetupOptions, SetupResult } from "./setup.js";
 export { SetupError, setupHook } from "./setup.js";
