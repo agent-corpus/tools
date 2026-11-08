@@ -1,0 +1,473 @@
+import { basename, resolve } from "node:path";
+import {
+  branchEvidence,
+  canonical,
+  inside,
+  pathEvidence,
+  protectedPath,
+  sensitive,
+} from "./evidence.js";
+import { mergedEvidence, remoteTipMatches } from "./merged.js";
+import { evaluateArgv, result } from "./policy.js";
+import type { Profile } from "./profile.js";
+import { parseShell, type SimpleCommand } from "./shell.js";
+import type { Decision, Request } from "./types.js";
+
+/**
+ * Permissive profile: approve everything except effects that are destructive, irreversible,
+ * outward-facing, or touch credentials and protected configuration. The default for anything not
+ * recognised as dangerous is approval, so the deny side below is the policy. Each simple command
+ * of a compound command is judged separately and the first refusal decides.
+ */
+
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"]);
+const INTERPRETERS = new Set(["python", "python3", "node", "perl", "ruby", "php", "deno", "bun"]);
+const DESTRUCTIVE = new Set([
+  "rm",
+  "rmdir",
+  "unlink",
+  "shred",
+  "srm",
+  "sudo",
+  "su",
+  "doas",
+  "dd",
+  "mkfs",
+  "diskutil",
+  "fdisk",
+  "truncate",
+  "eval",
+  "source",
+  ".",
+  "exec",
+  "crontab",
+  "launchctl",
+  "systemctl",
+]);
+const WRITERS = new Set([
+  "mv",
+  "cp",
+  "mkdir",
+  "touch",
+  "tee",
+  "ln",
+  "install",
+  "rsync",
+  "chmod",
+  "chown",
+]);
+const WRAPPERS = new Set(["env", "nohup", "time", "command", "nice", "timeout", "xargs"]);
+const BANNED_ENV =
+  /^(?:LD_|DYLD_|GIT_|PYTHON|NODE_OPTIONS$|PATH$|HOME$|BASH_ENV$|ENV$|SHELL$|PAGER$|EDITOR$|GH_TOKEN$|GITHUB_TOKEN$)/;
+const FORCE_PUSH = /^--(?:force|force-with-lease|force-if-includes|mirror|prune)(?:=.*)?$/;
+
+function human(request: Request, category: Decision["category"], reason: string): Decision {
+  return result(request, category, reason);
+}
+
+export function permissiveRead(cwd: string, input: string) {
+  try {
+    const lexical = resolve(cwd, input);
+    const path = canonical(lexical);
+    if (sensitive(path) || sensitive(lexical))
+      return {
+        allowed: false,
+        category: "sensitive" as const,
+        reason: "Protected path requires human approval",
+      };
+    return {
+      allowed: true,
+      category: "code-read" as const,
+      reason: "Read of a non-sensitive path",
+    };
+  } catch {
+    return {
+      allowed: false,
+      category: "code-read" as const,
+      reason: "Cannot verify path evidence",
+    };
+  }
+}
+
+export function permissiveWrite(cwd: string, input: string, profile: Profile) {
+  try {
+    const lexical = resolve(cwd, input);
+    const path = canonical(lexical);
+    if (sensitive(path) || sensitive(lexical) || protectedPath(path) || protectedPath(lexical))
+      return {
+        allowed: false,
+        category: "sensitive" as const,
+        reason: "Protected path requires human approval",
+      };
+    // Never let a scratch root reach the policy service's own session directories.
+    if (
+      !path.split(/[\\/]/).some((part) => part.startsWith("acp-")) &&
+      profile.scratchRoots.some((root) => inside(root, path))
+    )
+      return {
+        allowed: true,
+        category: "worktree-write" as const,
+        reason: "Write within a scratch directory",
+      };
+  } catch {
+    /* fall through to the repository check, which fails closed */
+  }
+  return pathEvidence(cwd, input, true);
+}
+
+function unwrap(argv: string[]): string[] {
+  let current = argv;
+  for (let depth = 0; depth < 4; depth++) {
+    const program = basename(current[0] ?? "");
+    if (!WRAPPERS.has(program) || program === "xargs") return current;
+    let rest = current.slice(1);
+    while (
+      rest[0]?.startsWith("-") ||
+      (program === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rest[0] ?? "")) ||
+      (program === "timeout" && /^[0-9.]+[smhd]?$/.test(rest[0] ?? "")) ||
+      (program === "nice" && /^[0-9-]+$/.test(rest[0] ?? ""))
+    )
+      rest = rest.slice(1);
+    if (!rest.length) return current;
+    current = rest;
+  }
+  return current;
+}
+
+function gitDecision(request: Request, argv: string[], cwdForGit: string): Decision {
+  const args = argv.slice(1);
+  let index = 0;
+  let cwd = cwdForGit;
+  while (index < args.length && args[index]?.startsWith("-")) {
+    if (args[index] === "-C" && args[index + 1]) {
+      cwd = resolve(cwd, args[index + 1] as string);
+      index += 2;
+    } else if (args[index] === "--no-pager" || args[index] === "-P") index++;
+    else return human(request, "unknown", "Git global option requires human review");
+  }
+  const sub = args[index];
+  const rest = args.slice(index + 1);
+  const flags = rest.filter((word) => word.startsWith("-"));
+  const positional = rest.filter((word) => !word.startsWith("-"));
+  const has = (...names: string[]) => flags.some((flag) => names.includes(flag));
+  const cluster = (letter: string) =>
+    flags.some((flag) => /^-[a-zA-Z]+$/.test(flag) && flag.includes(letter));
+  const ok = (reason = "Permissive profile: Git operation has no destructive effect") =>
+    result(request, "impactful-write", reason, true);
+  if (!sub) return ok();
+  if (sub === "push") return gitPush(request, cwd, rest);
+  if (sub === "branch" && (has("-d", "-D", "--delete") || cluster("d") || cluster("D"))) {
+    if (has("-r", "--remotes")) return ok();
+    const unmerged = positional.filter((name) => !mergedEvidence(cwd, `refs/heads/${name}`).merged);
+    return unmerged.length
+      ? human(request, "destructive", branchEvidence(cwd, unmerged[0] ?? ""))
+      : ok("Branch is already merged into origin's default branch");
+  }
+  if (sub === "branch" && (has("-f", "--force") || cluster("f") || has("-M")))
+    return human(request, "destructive", "Forced branch move requires human approval");
+  if (sub === "reset" && has("--hard"))
+    return human(request, "destructive", "git reset --hard discards work");
+  if (sub === "clean" && !has("-n", "--dry-run") && !cluster("n"))
+    return human(request, "destructive", "git clean deletes untracked files");
+  if (
+    sub === "checkout" &&
+    (has("-f", "--force", "-B") ||
+      rest.includes("--") ||
+      positional.includes(".") ||
+      positional.includes(":/"))
+  )
+    return human(request, "destructive", "git checkout would discard working-tree changes");
+  if (sub === "restore" && !has("--staged", "-S"))
+    return human(request, "destructive", "git restore would discard working-tree changes");
+  if (sub === "switch" && has("-f", "--force", "--discard-changes"))
+    return human(request, "destructive", "git switch would discard working-tree changes");
+  if (sub === "stash" && ["drop", "clear"].includes(positional[0] ?? ""))
+    return human(request, "destructive", "Dropping stashes discards work");
+  if (sub === "reflog" && ["expire", "delete"].includes(positional[0] ?? ""))
+    return human(request, "destructive", "Reflog expiry removes recovery points");
+  if (
+    ["gc", "prune", "filter-branch", "filter-repo", "replace"].includes(sub) ||
+    (sub === "update-ref" && has("-d"))
+  )
+    return human(
+      request,
+      "destructive",
+      "Repository history or object pruning requires human approval",
+    );
+  if (
+    sub === "worktree" &&
+    ["remove", "prune"].includes(positional[0] ?? "") &&
+    (has("-f", "--force") || positional[0] === "prune")
+  )
+    return human(request, "destructive", "Forced worktree removal requires human approval");
+  if (
+    sub === "config" &&
+    !has("--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin")
+  )
+    return human(request, "sensitive", "Git configuration can install hooks or credential helpers");
+  if (
+    sub === "remote" &&
+    ["set-url", "remove", "rm", "rename", "set-head"].includes(positional[0] ?? "")
+  )
+    return human(request, "impactful-write", "Changing remotes requires human approval");
+  return ok();
+}
+
+function gitPush(request: Request, cwd: string, rest: string[]): Decision {
+  const flags = rest.filter((word) => word.startsWith("-"));
+  const positional = rest.filter((word) => !word.startsWith("-"));
+  const optionValues = new Set<string>();
+  rest.forEach((word, i) => {
+    if (
+      (word === "-o" ||
+        word === "--push-option" ||
+        word === "--receive-pack" ||
+        word === "--exec" ||
+        word === "--repo") &&
+      rest[i + 1]
+    )
+      optionValues.add(rest[i + 1] as string);
+  });
+  const refs = positional.filter((word) => !optionValues.has(word));
+  const remote = refs[0];
+  const refspecs = refs.slice(1);
+  if (
+    flags.some((flag) => FORCE_PUSH.test(flag) || (/^-[a-zA-Z]+$/.test(flag) && flag.includes("f")))
+  )
+    return human(request, "destructive", "Force or mirror pushes overwrite remote history");
+  if (
+    flags.some(
+      (flag) =>
+        ["--receive-pack", "--exec"].includes(flag) ||
+        flag.startsWith("--receive-pack=") ||
+        flag.startsWith("--exec="),
+    )
+  )
+    return human(request, "unknown", "Custom push executables require human review");
+  const deleting =
+    flags.includes("--delete") || flags.some((flag) => /^-[a-zA-Z]*d[a-zA-Z]*$/.test(flag));
+  const targets: string[] = [];
+  for (const spec of refspecs) {
+    if (spec.startsWith("+"))
+      return human(request, "destructive", "Forced refspecs overwrite remote history");
+    if (spec.startsWith(":")) targets.push(spec.slice(1));
+    else if (deleting) targets.push(spec);
+  }
+  if (!targets.length)
+    return result(request, "impactful-write", "Permissive profile: push without deletion", true);
+  if (remote !== "origin")
+    return human(request, "destructive", "Remote branch deletion is only verified for origin");
+  for (const target of targets) {
+    const name = target.replace(/^refs\/heads\//, "");
+    if (target.startsWith("refs/tags/") || !/^[a-zA-Z0-9][a-zA-Z0-9/_.-]*$/.test(name))
+      return human(
+        request,
+        "destructive",
+        "Only branch deletions with verified merge state are automatic",
+      );
+    const evidence = mergedEvidence(cwd, `refs/remotes/origin/${name}`);
+    if (!evidence.merged)
+      return human(request, "destructive", `Remote branch deletion may lose work: ${evidence.how}`);
+    if (!remoteTipMatches(cwd, name))
+      return human(
+        request,
+        "destructive",
+        "Remote branch has commits that are not fetched; fetch and retry",
+      );
+  }
+  return result(
+    request,
+    "impactful-write",
+    "Deleting remote branch already merged into origin's default branch",
+    true,
+  );
+}
+
+function ghDecision(request: Request, argv: string[]): Decision | undefined {
+  const text = argv.join(" ");
+  if (argv[1] === "api") {
+    const method =
+      /(?:^|\s)(?:-X|--method)[=\s]?DELETE\b/i.test(text) || /\s-XDELETE\b/i.test(text);
+    if (method || /\/(?:protection|rulesets|keys|secrets|hooks)\b/.test(text))
+      return human(request, "destructive", "Destructive or security-sensitive GitHub API call");
+  }
+  if (
+    argv.includes("delete") ||
+    (argv[1] === "pr" && argv[2] === "merge" && argv.includes("--admin"))
+  )
+    return human(request, "destructive", "Destructive GitHub operation requires human approval");
+  if (
+    argv[1] === "secret" ||
+    (argv[1] === "auth" && ["token", "refresh", "logout"].includes(argv[2] ?? ""))
+  )
+    return human(request, "sensitive", "Credential or secret handling requires human approval");
+  return undefined;
+}
+
+function cloudDecision(request: Request, argv: string[], profile: Profile): Decision {
+  const strict = evaluateArgv(request, argv);
+  if (strict.decision === "approve" || strict.category === "sensitive") return strict;
+  if (argv.some((arg) => /^(delete|destroy|purge|remove|terminate|deregister)/.test(arg)))
+    return human(request, "destructive", "Cloud deletion requires human approval");
+  if (profile.cloudWrites === "allow" && strict.category === "impactful-write")
+    return result(
+      request,
+      "impactful-write",
+      "Permissive profile: non-destructive cloud change",
+      true,
+    );
+  return strict;
+}
+
+function simpleDecision(
+  request: Request,
+  command: SimpleCommand,
+  profile: Profile,
+  depth: number,
+  stageIndex: number,
+): Decision {
+  for (const [name] of command.env)
+    if (BANNED_ENV.test(name))
+      return human(request, "unknown", "Environment override requires human review");
+  for (const redirect of command.redirects) {
+    if (redirect.op === ">&" || redirect.target === "/dev/null") continue;
+    const check =
+      redirect.op === "<"
+        ? permissiveRead(request.cwd, redirect.target)
+        : permissiveWrite(request.cwd, redirect.target, profile);
+    if (!check.allowed) return human(request, check.category, check.reason);
+  }
+  const argv = unwrap(command.argv);
+  const program = basename(argv[0] ?? "");
+  const args = argv.slice(1);
+  const joined = argv.join(" ");
+  if (profile.humanPatterns.some((pattern) => pattern.test(joined)))
+    return human(request, "destructive", "Matches an organization human-approval pattern");
+  // Anything that looks like a credential or protected-config path stays with a human.
+  for (const word of argv.slice(1)) {
+    const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
+    if (candidate.includes("/") || candidate.startsWith(".")) {
+      if (sensitive(candidate))
+        return human(request, "sensitive", "Protected path requires human approval");
+    }
+  }
+  if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
+    return human(request, "destructive", "Destructive operation requires human approval");
+  if (SHELLS.has(program) || INTERPRETERS.has(program)) {
+    if (stageIndex > 0)
+      return human(request, "unknown", "Piping into a shell or interpreter requires human review");
+    if (SHELLS.has(program)) {
+      const inline = args.indexOf("-c");
+      const script = inline >= 0 ? args[inline + 1] : undefined;
+      if (script === undefined || depth >= 2)
+        return human(request, "unknown", "Shell invocation requires human review");
+      return commandDecision(request, script, profile, depth + 1);
+    }
+    if (args.length === 0 || args[0] === "-")
+      return human(
+        request,
+        "unknown",
+        "Interpreter reading code from standard input requires human review",
+      );
+  }
+  if (
+    program === "xargs" &&
+    args.some(
+      (arg) =>
+        DESTRUCTIVE.has(basename(arg)) || SHELLS.has(basename(arg)) || basename(arg) === "git",
+    )
+  )
+    return human(
+      request,
+      "destructive",
+      "xargs into a destructive or shell command requires human review",
+    );
+  if (
+    program === "find" &&
+    args.some((arg) =>
+      ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"].includes(
+        arg,
+      ),
+    )
+  )
+    return human(request, "destructive", "find with actions requires human review");
+  if (["chmod", "chown"].includes(program) && args.some((arg) => /^-[a-zA-Z]*R/.test(arg)))
+    return human(request, "destructive", "Recursive permission changes require human approval");
+  if (
+    (program === "sed" &&
+      args.some((arg) => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"))) ||
+    (program === "perl" && args.some((arg) => /^-[a-zA-Z]*i/.test(arg)))
+  ) {
+    for (const file of args.filter((arg) => !arg.startsWith("-")).slice(1)) {
+      const check = permissiveWrite(request.cwd, file, profile);
+      if (!check.allowed) return human(request, check.category, check.reason);
+    }
+  } else if (WRITERS.has(program)) {
+    for (const file of args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg))) {
+      const check = permissiveWrite(request.cwd, file, profile);
+      if (!check.allowed) return human(request, check.category, check.reason);
+    }
+  }
+  if (program === "terraform" || program === "pulumi" || program === "tofu")
+    if (
+      args.includes("destroy") ||
+      args.includes("-destroy") ||
+      (args[0] === "state" && ["rm", "push"].includes(args[1] ?? ""))
+    )
+      return human(request, "destructive", "Infrastructure destruction requires human approval");
+  if (program === "kubectl" && ["delete", "drain", "replace", "cordon"].includes(args[0] ?? ""))
+    return human(request, "destructive", "Cluster deletion requires human approval");
+  if (
+    program === "docker" &&
+    (["rm", "rmi", "kill", "prune"].includes(args[0] ?? "") ||
+      args.includes("prune") ||
+      (args[0] === "volume" && args[1] === "rm"))
+  )
+    return human(request, "destructive", "Container deletion requires human approval");
+  if (
+    ["npm", "pnpm", "yarn"].includes(program) &&
+    ["publish", "unpublish", "deprecate", "owner", "token"].includes(args[0] ?? "")
+  )
+    return human(request, "destructive", "Publishing or registry changes require human approval");
+  if (program === "dotnet" && args[0] === "nuget" && ["push", "delete"].includes(args[1] ?? ""))
+    return human(request, "destructive", "Package publishing requires human approval");
+  if (
+    (program === "curl" || program === "wget") &&
+    /(?:-X|--request)[=\s]?(?:DELETE|PUT)\b/i.test(joined)
+  )
+    return human(request, "destructive", "Destructive HTTP verbs require human approval");
+  if (program === "git") return gitDecision(request, argv, request.cwd);
+  if (program === "gh") {
+    const gh = ghDecision(request, argv);
+    if (gh) return gh;
+  }
+  if (["az", "aws", "gcloud"].includes(program)) return cloudDecision(request, argv, profile);
+  return result(
+    request,
+    "impactful-write",
+    "Permissive profile: no destructive effect detected",
+    true,
+  );
+}
+
+export function commandDecision(
+  request: Request,
+  command: string,
+  profile: Profile,
+  depth = 0,
+): Decision {
+  const pipelines = parseShell(command);
+  if (!pipelines)
+    return human(
+      request,
+      "unknown",
+      "Unsupported shell syntax; expansions and subshells need human review",
+    );
+  let last: Decision | undefined;
+  for (const pipeline of pipelines)
+    for (const [index, simple] of pipeline.entries()) {
+      last = simpleDecision(request, simple, profile, depth, index);
+      if (last.decision !== "approve") return last;
+    }
+  return last ?? human(request, "unknown", "Empty command");
+}

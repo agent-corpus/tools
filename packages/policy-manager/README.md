@@ -82,6 +82,31 @@ Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactf
 
 These are approval recommendations, not a sandbox. Trusted local executables and their configuration remain part of the host's trust boundary. Hooks cannot observe every hosted tool or prevent arbitrary same-user processes from changing files. Recheck path evidence on every request; filesystem races still require host enforcement.
 
+## Policy profiles
+
+Without a profile the engine is strict (everything above). An organization can install one profile file that widens automatic approval without changing the checks themselves:
+
+```json
+{
+  "version": 1,
+  "mode": "permissive",
+  "cloudWrites": "human",
+  "humanPatterns": ["^npm install"],
+  "scratchRoots": ["/tmp"]
+}
+```
+
+```sh
+policy-manager profile validate policy.json
+policy-manager profile install policy.json   # writes ~/.config/agent-corpus/policy-manager/policy.json
+```
+
+The service reads the profile only from that user directory (`$XDG_CONFIG_HOME` honored). It must be a regular, non-symlink file owned by the user, not group/world writable, and outside every Git checkout, so an agent cannot rewrite its own rules from a worktree. An invalid or untrusted profile logs `profile ... invalid-using-strict` and the session stays strict. Each session records the profile mode and SHA-256 digest in `audit.jsonl`.
+
+`permissive` approves compound commands (`;`, `&&`, `||`, `|`, quotes, redirects, `VAR=x` prefixes) when every simple command is acceptable, and approves unknown executables and interpreters with inline code. It still sends these to a human: deletion (`rm`, `find -delete`, `xargs rm`), `sudo`, `git reset --hard`, `git clean`, forced or mirror pushes, discarding checkouts and restores, stash and reflog destruction, `gh` deletions and security endpoints, cloud deletion and credential retrieval, infrastructure destroy, `npm publish`, destructive HTTP verbs, piping into a shell, expansions and subshells, writes outside linked feature worktrees and `scratchRoots`, and protected or credential paths. `humanPatterns` adds organization-specific expressions. `cloudWrites: "allow"` also approves non-destructive cloud changes.
+
+Deleting a branch is automatic only when it is already merged into `origin/main` (or `master`): reachable from it, or patch-equivalent to a squash or rebase merge. Remote deletion also needs `origin` and a `git ls-remote` tip that matches the fetched tracking ref, so unfetched commits block it. Evidence uses the locally fetched default branch; fetch first for very recent merges.
+
 ## Service, cache, and logs
 
 The service uses a Unix socket on macOS/Linux and a named pipe on Windows. A random session token authenticates local requests. Files use owner-only modes on Unix. On Windows, the operating system's temporary-directory ACL is the access boundary; Unix modes do not establish Windows ACL isolation. Other processes running as the same user are outside this boundary.
