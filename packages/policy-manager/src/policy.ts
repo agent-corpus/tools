@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
+import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
+import { type Profile, strictProfile } from "./profile.js";
 import type { Category, Classification, Decision, Request } from "./types.js";
 
 export function hash(value: unknown): string {
@@ -155,7 +157,12 @@ function cloudReadCandidate(argv: string[]): boolean {
   return metadataOperations.has(operation.join(" "));
 }
 
-function result(request: Request, category: Category, reason: string, approve = false): Decision {
+export function result(
+  request: Request,
+  category: Category,
+  reason: string,
+  approve = false,
+): Decision {
   return {
     decision: approve ? "approve" : "human",
     category,
@@ -165,8 +172,12 @@ function result(request: Request, category: Category, reason: string, approve = 
     cached: false,
   };
 }
-export function evaluate(request: Request, ai?: Classification): Decision {
-  const decision = evaluateCore(request);
+export function evaluate(
+  request: Request,
+  ai?: Classification,
+  profile: Profile = strictProfile,
+): Decision {
+  const decision = evaluateCore(request, profile);
   if (ai) {
     // Self-reported confidence is not a probability or a substitute for verified effects.
     if (
@@ -222,7 +233,7 @@ export function evaluate(request: Request, ai?: Classification): Decision {
   }
   return decision;
 }
-function evaluateCore(request: Request): Decision {
+function evaluateCore(request: Request, profile: Profile): Decision {
   if (
     !request.sessionId ||
     !request.cwd ||
@@ -249,7 +260,11 @@ function evaluateCore(request: Request): Decision {
         if (line.startsWith(prefix)) paths.push(line.slice(prefix.length));
     }
     if (!paths.length) return result(request, "unknown", "Patch has no verified target paths");
-    const checks = paths.map((path) => pathEvidence(request.cwd, path, true));
+    const checks = paths.map((path) =>
+      profile.mode === "permissive"
+        ? permissiveWrite(request.cwd, path, profile)
+        : pathEvidence(request.cwd, path, true),
+    );
     const denied = checks.find((check) => !check.allowed);
     return result(
       request,
@@ -265,27 +280,38 @@ function evaluateCore(request: Request): Decision {
     typeof file === "string"
   ) {
     const write = !["Read", "view", "read_file"].includes(request.tool);
-    const evidence = pathEvidence(request.cwd, file, write);
+    const evidence =
+      profile.mode === "permissive"
+        ? write
+          ? permissiveWrite(request.cwd, file, profile)
+          : permissiveRead(request.cwd, file)
+        : pathEvidence(request.cwd, file, write);
     return result(request, evidence.category, evidence.reason, evidence.allowed);
   }
   if (!["Bash", "bash", "powershell", "exec_command", "shell"].includes(request.tool))
     return result(
       request,
       "unknown",
-      "Unknown tool or file operation; request same-session AI classification before human review",
+      "Unknown tool or file operation; no AI classification was performed for this request, so a human decision is required",
     );
   if (request.tool === "powershell")
     return result(request, "unknown", "PowerShell semantics require human review");
   if (input.env !== undefined || input.shell !== undefined || input.stdin !== undefined)
     return result(request, "unknown", "Custom execution environment requires human review");
   const command = input.command ?? input.cmd;
+  if (profile.mode === "permissive" && typeof command === "string")
+    return commandDecision(request, command, profile);
   const argv = typeof command === "string" ? words(command) : undefined;
   if (!argv)
     return result(
       request,
       "unknown",
-      "Unsupported shell syntax; request same-session AI classification before human review",
+      "Unsupported shell syntax; no AI classification was performed for this request, so a human decision is required",
     );
+  return evaluateArgv(request, argv);
+}
+
+export function evaluateArgv(request: Request, argv: string[]): Decision {
   const [program, ...args] = argv;
   let gitCwd = request.cwd;
   if (program === "git" && args[0] === "-C" && args[1]) {
@@ -389,6 +415,6 @@ function evaluateCore(request: Request): Decision {
   return result(
     request,
     "unknown",
-    "Unknown executable or effects; request same-session AI classification before human review",
+    "Unknown executable or effects; no AI classification was performed for this request, so a human decision is required",
   );
 }

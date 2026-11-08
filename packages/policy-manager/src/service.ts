@@ -4,6 +4,7 @@ import { createConnection, createServer } from "node:net";
 import { join } from "node:path";
 import { audit, sessionDirectory, sessionToken } from "./audit.js";
 import { hash } from "./policy.js";
+import { loadProfile, type Profile, strictProfile } from "./profile.js";
 import { PolicySession } from "./session.js";
 import type { Classification, OutcomeReport, Request } from "./types.js";
 
@@ -22,7 +23,14 @@ function endpoint(directory: string): string {
 export async function serve(harness: string, sessionId: string): Promise<void> {
   const directory = sessionDirectory(harness, sessionId),
     token = sessionToken(directory);
-  const session = new PolicySession(directory, harness, sessionId);
+  let profile: Profile = strictProfile;
+  let profileFailure = false;
+  try {
+    profile = loadProfile();
+  } catch {
+    profileFailure = true; // an unreadable or untrusted profile must never loosen policy
+  }
+  const session = new PolicySession(directory, harness, sessionId, profile);
   const server = createServer((socket) => {
     socket.setTimeout(3000, () => socket.destroy());
     let data = "";
@@ -95,6 +103,16 @@ export async function serve(harness: string, sessionId: string): Promise<void> {
     });
   });
   audit(directory, { event: "session-start", harness, sessionHash: hash(sessionId) });
+  audit(directory, {
+    event: "profile",
+    mode: profile.mode,
+    status: profileFailure
+      ? "invalid-using-strict"
+      : profile.digest
+        ? "loaded"
+        : "none-using-strict",
+    ...(profile.digest ? { digest: profile.digest } : {}),
+  });
 }
 export function send(
   harness: string,

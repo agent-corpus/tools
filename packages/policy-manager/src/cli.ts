@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-import { join } from "node:path";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { executionReport, hookResponse, normalize } from "./adapters.js";
 import { hookConfig } from "./config.js";
+import { defaultProfilePath, parseProfile } from "./profile.js";
 import { send, serve, start } from "./service.js";
 import { SetupError, setupHook } from "./setup.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
@@ -16,6 +18,8 @@ policy-manager record <claude|codex|copilot> <session-id>   # host-reported huma
 policy-manager setup-hook <claude|codex|copilot> [--dry-run] [--config-dir <harness-config-directory>]
 policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run] [--config-dir <directory>]
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
+policy-manager profile validate <file>   # check a policy profile without installing it
+policy-manager profile install <file>    # install it to the user config directory outside Git
 policy-manager stop <claude|codex|copilot> <session-id>
 A per-session background service checks policy and writes private temporary audit.jsonl logs.
 AI classification comes from the session's policy-manager agent, never an external API.
@@ -58,7 +62,26 @@ try {
     );
   } else if (action === "config")
     console.log(JSON.stringify(hookConfig(harness, phase ?? ""), null, 2));
-  else if (action === "serve") await serve(harness, phase ?? "");
+  else if (
+    action === "profile" &&
+    (harnessArg === "validate" || harnessArg === "install") &&
+    phase
+  ) {
+    const profile = parseProfile(readFileSync(phase, "utf8"));
+    const summary = {
+      mode: profile.mode,
+      cloudWrites: profile.cloudWrites,
+      digest: profile.digest,
+    };
+    if (harnessArg === "install") {
+      const target = defaultProfilePath();
+      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+      const temporary = `${target}.${process.pid}.tmp`;
+      writeFileSync(temporary, readFileSync(phase, "utf8"), { mode: 0o600 });
+      renameSync(temporary, target);
+      console.log(JSON.stringify({ installed: target, ...summary }));
+    } else console.log(JSON.stringify({ valid: true, ...summary }));
+  } else if (action === "serve") await serve(harness, phase ?? "");
   else if (action === "stop")
     console.log(JSON.stringify(await send(harness, phase ?? "", { action: "stop" })));
   else if (action === "review" || action === "classify" || action === "record") {
