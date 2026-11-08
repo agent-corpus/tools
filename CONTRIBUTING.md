@@ -12,7 +12,7 @@ npm install
 npm run verify
 ```
 
-Node.js 20+ is required (`.nvmrc` pins the development version).
+Node.js 20.19+ or 22.12+ is required (`.nvmrc` pins the development version).
 
 ## Workflow
 

@@ -1,0 +1,58 @@
+{
+  "name": "@agent-corpus/live-board",
+  "version": "0.1.0",
+  "description": "live-board portable local tracking tools",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@agent-corpus/tracker-core": "0.1.0",
+    "@agent-corpus/project-watch": "0.1.0",
+    "@agent-corpus/task-report": "0.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "lucide-react": "^0.468.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --root . --exclude \"**/dist/**\"",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prepack": "npm run clean && npm run build && node -e \"require('fs').copyFileSync('../../LICENSE','LICENSE')\"",
+    "postpack": "node -e \"require('fs').rmSync('LICENSE',{force:true})\"",
+    "test:browser": "node test/browser.mjs"
+  },
+  "bin": {
+    "live-board": "dist/cli.js"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0",
+    "@playwright/test": "^1.65.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agent-corpus/tools.git",
+    "directory": "packages/live-board"
+  },
+  "homepage": "https://github.com/agent-corpus/tools/tree/main/packages/live-board#readme",
+  "bugs": "https://github.com/agent-corpus/tools/issues"
+}

@@ -36,6 +36,36 @@ jobs:
         run: npm run check:changesets
       - run: npm run verify
 
+  browser:
+    name: Browser smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser --workspace @agent-corpus/live-board
+
+  portable:
+    name: Portable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+
   pack:
     name: Package contents
     runs-on: ubuntu-latest
@@ -46,14 +76,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run build
       - run: npm pack --dry-run --workspaces
-      - name: Publish dry-run must not auto-correct package.json
+      - name: Package manifests require no normalization
         run: |
-          out=$(npm publish --dry-run --workspaces 2>&1) || { echo "$out"; exit 1; }
-          echo "$out"
-          if echo "$out" | grep -q "auto-corrected"; then
-            echo "::error::npm auto-corrected package.json; run 'npm pkg fix'"; exit 1
-          fi
+          npm pkg fix --workspaces
+          git diff --exit-code -- packages/*/package.json
       - name: Smoke-test the packed CLI
         run: |
           set -euo pipefail

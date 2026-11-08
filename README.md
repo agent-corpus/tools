@@ -22,6 +22,11 @@ Every tool follows the same principles:
 | Package                                                   | Description                                                                                                                | npm                                                                                                                     |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | [`@agent-corpus/pr-watch`](packages/pr-watch)             | Block until something actionable happens on a GitHub PR (stale branch, new review, failing CI, conflicts) and emit events. | [![npm](https://img.shields.io/npm/v/@agent-corpus/pr-watch.svg)](https://www.npmjs.com/package/@agent-corpus/pr-watch) |
+| [`@agent-corpus/tracker-core`](packages/tracker-core)     | Versioned tracking-plan validation and atomic local state.                                                                 | Initial release                                                                                                         |
+| [`@agent-corpus/issue-watch`](packages/issue-watch)       | GitHub issue snapshots and change events.                                                                                  | Initial release                                                                                                         |
+| [`@agent-corpus/task-report`](packages/task-report)       | Durable agent reports with expiring heartbeats.                                                                            | Initial release                                                                                                         |
+| [`@agent-corpus/project-watch`](packages/project-watch)   | Multi-project registration, readiness, observations, and event history.                                                    | Initial release                                                                                                         |
+| [`@agent-corpus/live-board`](packages/live-board)         | A local React project board with live updates.                                                                             | Initial release                                                                                                         |
 | [`@agent-corpus/agent-scaffold`](packages/agent-scaffold) | Create canonical skill and agent scaffolds with native references.                                                         | Initial release pending                                                                                                 |
 | [`@agent-corpus/audit-log`](packages/audit-log)           | Capture, query, and export correlated audit events in private JSONL files.                                                 | Initial release pending                                                                                                 |
 | [`@agent-corpus/policy-manager`](packages/policy-manager) | Evaluate session permissions with private audit logs and native hook adapters.                                             | Initial release pending                                                                                                 |
@@ -49,7 +54,9 @@ Tooling: npm workspaces, TypeScript (ESM, `tsc`), [Vitest](https://vitest.dev),
 
 ## Development
 
-Requires Node.js 20+.
+Requires Node.js 20.19+ or 22.12+ for the full workspace.
+
+For the local project board, see [Live trackers](docs/live-trackers.md).
 
 Changesets release tooling requires a supported Node.js 22.11+ runtime. CI validates release metadata
 with `npm run check:changesets` on Node.js 22 and 24, alongside full verification on Node.js 20, 22, and 24.
