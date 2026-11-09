@@ -344,6 +344,26 @@ function ghDecision(request: Request, argv: string[]): Decision | undefined {
  * Read-only operations by verb, for services outside the exact catalog. The selectors already
  * passed the credential screen in `evaluateArgv`; endpoint overrides still need a human.
  */
+const AWS_METADATA_GETTERS = new Set([
+  "get-caller-identity",
+  "get-account-summary",
+  "get-role",
+  "get-user",
+  "get-group",
+  "get-policy",
+  "get-policy-version",
+  "get-function-configuration",
+  "get-bucket-location",
+  "get-bucket-versioning",
+  "get-bucket-tagging",
+  "get-bucket-policy-status",
+  "get-rest-apis",
+  "get-resources",
+  "get-hosted-zone",
+  "get-metric-statistics",
+  "get-log-events",
+]);
+
 function readVerb(argv: string[]): boolean {
   const [tool] = argv;
   const firstOption = argv.findIndex((arg) => arg.startsWith("-"));
@@ -357,7 +377,12 @@ function readVerb(argv: string[]): boolean {
     return false;
   if (/token|secret|password|credential|key/i.test(verb)) return false;
   if (tool === "az") return /^(?:list|show|exists|list-[a-z-]+|show-[a-z-]+)$/.test(verb);
-  if (tool === "aws") return /^(?:describe|list|get)-[a-z-]+$/.test(verb);
+  if (tool === "aws") {
+    // `get-*` is not safe as a family: it includes secret, password, token and access-detail
+    // retrieval. Only `describe-`/`list-` and an explicit set of metadata getters are automatic.
+    if (argv.some((arg) => /^--(?:no-)?with-decryption/.test(arg))) return false;
+    return /^(?:describe|list)-[a-z-]+$/.test(verb) || AWS_METADATA_GETTERS.has(verb);
+  }
   if (tool === "gcloud") {
     // gcloud passes the resource as a positional after the verb: `run services describe svc`.
     const at = operation.findIndex((word) => /^(?:list|describe)$/.test(word));

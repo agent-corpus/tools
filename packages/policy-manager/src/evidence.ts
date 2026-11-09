@@ -52,7 +52,17 @@ export function isProtectedPath(path: string): boolean {
     let parent = existsSync(path) && statSync(path).isDirectory() ? path : dirname(path);
     while (!existsSync(parent)) parent = dirname(parent);
     const root = canonical(git(parent, ["rev-parse", "--show-toplevel"]));
-    return protectedPath(relative(root, canonical(path)));
+    if (protectedPath(relative(root, canonical(path)))) return true;
+    // A protected name that is a symlink (`.claude -> config`) vanishes once the path is resolved,
+    // so also judge the path as written, relative to the checkout it lives in.
+    const written = resolve(path);
+    let ancestor = dirname(written);
+    while (ancestor !== dirname(ancestor)) {
+      if (existsSync(ancestor) && canonical(ancestor) === root)
+        return protectedPath(relative(ancestor, written));
+      ancestor = dirname(ancestor);
+    }
+    return false;
   } catch {
     return protectedPath(path);
   }

