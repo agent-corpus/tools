@@ -1,6 +1,9 @@
 # dependencies
 node_modules/
 
+# workspace
+.worktrees/
+
 # build output
 dist/
 *.tsbuildinfo
