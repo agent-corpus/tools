@@ -1,5 +1,6 @@
 import { audit, requestSummary } from "./audit.js";
 import { evaluate, hash } from "./policy.js";
+import { type Profile, strictProfile } from "./profile.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
 
 export class PolicySession {
@@ -9,6 +10,7 @@ export class PolicySession {
     readonly directory: string,
     readonly harness: string,
     readonly sessionId: string,
+    readonly profile: Profile = strictProfile,
   ) {}
   review(request: Request, ai?: Classification): Decision {
     if (request.sessionId !== this.sessionId || request.harness !== this.harness)
@@ -39,7 +41,7 @@ export class PolicySession {
       });
       throw new Error("Malformed AI classification");
     }
-    const key = hash([hash(request), "policy-v1"]);
+    const key = hash([hash(request), "policy-v1", this.profile.digest ?? this.profile.mode]);
     const entry = this.cache.get(key);
     const cachedAi = entry && entry.expires > Date.now() ? entry.ai : undefined;
     if (ai)
@@ -49,7 +51,7 @@ export class PolicySession {
         category: ai.category,
         confidence: ai.confidence,
       });
-    const decision = evaluate(request, ai ?? cachedAi);
+    const decision = evaluate(request, ai ?? cachedAi, this.profile);
     if (decision.decision === "human") this.cache.delete(key);
     // Evaluation always precedes lookup. Filesystem evidence is never cached.
     if (decision.decision === "approve" && decision.cache === "session") {
