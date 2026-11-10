@@ -110,6 +110,20 @@ describe("shell parser", () => {
     expect(argv("echo \\> out.txt")?.[0]?.[0]?.slice(1)).toEqual([">", "out.txt"]);
     expect(parseShell("echo a\\> out.txt")?.[0]?.[0]?.redirects).toEqual([]);
   });
+  test("quotes and escapes in an assignment value keep it an assignment", () => {
+    const first = (command: string) => parseShell(command)?.[0]?.[0];
+    for (const command of [
+      'FOO="a b" rm -rf example',
+      "FOO='a b' rm -rf example",
+      "FOO=a\\ b rm -rf example",
+      'FOO=a"b c"d rm -rf example',
+    ])
+      expect(first(command)).toMatchObject({ argv: ["rm", "-rf", "example"] });
+    expect(first("FOO=a\\ b rm")?.env).toEqual([["FOO", "a b"]]);
+    // A quote or escape before the `=` means the word is a command name, not an assignment.
+    expect(first('"FOO"=a rm')).toMatchObject({ env: [], argv: ["FOO=a", "rm"] });
+    expect(first("FO\\O=a rm")).toMatchObject({ env: [], argv: ["FOO=a", "rm"] });
+  });
   test("assignments precede the program", () =>
     expect(parseShell("FOO=1 BAR=2 make test")?.[0]?.[0]).toMatchObject({
       env: [
@@ -216,6 +230,13 @@ describe("permissive profile", () => {
     ["echo a\\; rm -rf x && rm -rf y", "destructive"],
     ['echo "\\" && rm -rf x', "unknown"],
     ["echo a\\ b; rm -rf x", "destructive"],
+    ['FOO="a b" rm -rf example', "destructive"],
+    ["FOO='a b' rm -rf example", "destructive"],
+    ["FOO=a\\ b rm -rf example", "destructive"],
+    ["FOO=a\\ b git push --force origin feature", "destructive"],
+    ["FOO='a b' git push --force origin feature", "destructive"],
+    ["FOO=a\\ b aws secretsmanager get-secret-value --secret-id x", "sensitive"],
+    ['A=1 B="x y" git reset --hard HEAD~1', "destructive"],
     ["cd ~user && ls", "unknown"],
   ])("sends %s to a human (%s)", (command, category) => {
     const d = decide(command);
