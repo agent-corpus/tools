@@ -134,7 +134,8 @@ function unwrap(argv: string[]): Unwrapped {
     let rest = current.slice(1);
     while (
       rest[0]?.startsWith("-") ||
-      (program === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rest[0] ?? "")) ||
+      // `env` treats any word with a non-empty name before `=` as an assignment (`A+=1`, `A[0]=1`).
+      (program === "env" && /^[^=-][^=]*=/.test(rest[0] ?? "")) ||
       (program === "timeout" && /^[0-9.]+[smhd]?$/.test(rest[0] ?? "")) ||
       (program === "nice" && /^[0-9-]+$/.test(rest[0] ?? ""))
     ) {

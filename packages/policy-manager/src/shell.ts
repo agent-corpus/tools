@@ -1,7 +1,7 @@
 // Parses a bounded subset of POSIX shell: simple commands joined by `;`, newlines, `&&`, `||`
 // and `|`, with quoting, leading VAR=value assignments and file redirections. Anything whose
 // effects depend on expansion (`$`, backticks, subshells, braces, heredocs, background jobs,
-// backslashes, comments, process substitution) is rejected so a caller can fall back to a human.
+// comments, process substitution) is rejected so a caller can fall back to a human.
 
 export interface Redirect {
   fd: string;
@@ -15,27 +15,33 @@ export interface SimpleCommand {
 }
 export type Pipeline = SimpleCommand[];
 
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const ASSIGNMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export function parseShell(command: string): Pipeline[] | undefined {
   if (!command || command.includes("\0") || command.includes("\r")) return undefined;
   const pipelines: Pipeline[] = [];
   let pipeline: Pipeline = [];
-  let words: Array<{ text: string; quoted: boolean }> = [];
+  let words: Array<{ text: string; assignAt: number }> = [];
   let redirects: Redirect[] = [];
   let pendingRedirect: { fd: string; op: Redirect["op"] } | undefined;
   let current = "";
   let active = false;
   let quoted = false;
+  // A word is an assignment only if its `NAME=` prefix was typed plainly. Quotes or escapes later,
+  // in the value, are fine (`FOO="a b" cmd`); a quote or escape before the `=` is not an assignment.
+  let plain = true;
+  let eqAt = -1;
   let quote = "";
   let dangling = false;
 
   const endWord = (): boolean => {
     if (!active) return true;
-    const word = { text: current, quoted };
+    const word = { text: current, assignAt: plain ? eqAt : -1 };
     current = "";
     active = false;
     quoted = false;
+    plain = true;
+    eqAt = -1;
     if (pendingRedirect) {
       redirects.push({ ...pendingRedirect, target: word.text });
       pendingRedirect = undefined;
@@ -52,13 +58,17 @@ export function parseShell(command: string): Pipeline[] | undefined {
     let index = 0;
     while (index < words.length) {
       const word = words[index];
-      if (!word || word.quoted || !ASSIGNMENT.test(word.text)) break;
-      const eq = word.text.indexOf("=");
-      env.push([word.text.slice(0, eq), word.text.slice(eq + 1)]);
+      if (!word || word.assignAt < 1 || !ASSIGNMENT_NAME.test(word.text.slice(0, word.assignAt)))
+        break;
+      env.push([word.text.slice(0, word.assignAt), word.text.slice(word.assignAt + 1)]);
       index++;
     }
     const argv = words.slice(index).map((word) => word.text);
     if (!argv.length) return false;
+    // Bash also treats `FOO+=x`, `FOO[0]=x` and quoted or escaped forms as assignments and then runs
+    // the next word. A program name never contains `=`, so a leading word that still has one is
+    // an assignment this parser cannot represent: reject it instead of judging it as the program.
+    if (argv[0]?.includes("=")) return false;
     pipeline.push({ env, argv, redirects });
     words = [];
     redirects = [];
@@ -75,7 +85,20 @@ export function parseShell(command: string): Pipeline[] | undefined {
   for (let i = 0; i < command.length; i++) {
     const char = command[i] as string;
     if (quote) {
-      if (quote === '"' && /[$`\\]/.test(char)) return undefined;
+      if (quote === '"') {
+        if (char === "\\") {
+          // Inside double quotes a backslash only escapes `"`, `\`, `$` and a backtick; before any
+          // other character it is literal. Either way nothing is expanded or executed.
+          const next = command[i + 1];
+          if (next === undefined || next === "\n") return undefined;
+          if ('"\\$`'.includes(next)) {
+            current += next;
+            i++;
+          } else current += char;
+          continue;
+        }
+        if (char === "$" || char === "`") return undefined;
+      }
       if (char === quote) quote = "";
       else current += char;
       continue;
@@ -84,9 +107,21 @@ export function parseShell(command: string): Pipeline[] | undefined {
       quote = char;
       active = true;
       quoted = true;
+      if (eqAt < 0) plain = false;
       continue;
     }
-    if (/[`$(){}\\#!]/.test(char)) {
+    if (char === "\\") {
+      // An unquoted backslash makes the next character literal (`\.`, `\|`, `\ `).
+      const next = command[i + 1];
+      if (next === undefined || next === "\n") return undefined;
+      current += next;
+      active = true;
+      quoted = true;
+      if (eqAt < 0) plain = false;
+      i++;
+      continue;
+    }
+    if (/[`$(){}#!]/.test(char)) {
       // `#` only starts a comment at a word boundary, but rejecting it everywhere is simpler.
       return undefined;
     }
@@ -136,6 +171,7 @@ export function parseShell(command: string): Pipeline[] | undefined {
       pendingRedirect = { fd, op };
       continue;
     }
+    if (plain && eqAt < 0 && char === "=") eqAt = current.length;
     current += char;
     active = true;
   }
