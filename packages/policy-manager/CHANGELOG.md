@@ -1,5 +1,11 @@
 # @agent-corpus/policy-manager
 
+## 0.2.1
+
+### Patch Changes
+
+- [#19](https://github.com/agent-corpus/tools/pull/19) [`e3b73d3`](https://github.com/agent-corpus/tools/commit/e3b73d3147b31eaef31b845cc3384cf6c80264b3) Thanks [@charlesprakash](https://github.com/charlesprakash)! - The shell parser now accepts backslash escapes: `\.`, `\|` and `\ ` outside quotes, and `\"`, `\\`, `\$` inside double quotes. An escaped character is always literal, so an escaped `;`, `&&` or quote never splits a command or ends a string. A trailing backslash and a backslash-newline are still rejected. In replay over local transcripts this raises the permissive approval rate from 34.7% to 53.7%.
+
 ## 0.2.0
 
 ### Minor Changes
