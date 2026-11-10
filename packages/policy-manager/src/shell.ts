@@ -65,6 +65,10 @@ export function parseShell(command: string): Pipeline[] | undefined {
     }
     const argv = words.slice(index).map((word) => word.text);
     if (!argv.length) return false;
+    // Bash also treats `FOO+=x`, `FOO[0]=x` and quoted or escaped forms as assignments and then runs
+    // the next word. A program name never contains `=`, so a leading word that still has one is
+    // an assignment this parser cannot represent: reject it instead of judging it as the program.
+    if (argv[0]?.includes("=")) return false;
     pipeline.push({ env, argv, redirects });
     words = [];
     redirects = [];

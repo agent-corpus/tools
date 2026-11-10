@@ -120,10 +120,20 @@ describe("shell parser", () => {
     ])
       expect(first(command)).toMatchObject({ argv: ["rm", "-rf", "example"] });
     expect(first("FOO=a\\ b rm")?.env).toEqual([["FOO", "a b"]]);
-    // A quote or escape before the `=` means the word is a command name, not an assignment.
-    expect(first('"FOO"=a rm')).toMatchObject({ env: [], argv: ["FOO=a", "rm"] });
-    expect(first("FO\\O=a rm")).toMatchObject({ env: [], argv: ["FOO=a", "rm"] });
   });
+  test.each([
+    "FOO+=a rm -rf example",
+    "FOO[0]=a rm -rf example",
+    "FOO[0]+=a rm -rf example",
+    "FOO+=a\\ b rm -rf example",
+    "FOO[0]=a\\ b rm -rf example",
+    "FOO[0]+='a b' rm -rf example",
+    '"FOO"=a rm -rf example',
+    "FO\\O=a rm -rf example",
+    "A=1 FOO+=a rm -rf example",
+  ])("rejects assignment-like prefixes it cannot represent: %j", (command) =>
+    expect(parseShell(command)).toBeUndefined(),
+  );
   test("assignments precede the program", () =>
     expect(parseShell("FOO=1 BAR=2 make test")?.[0]?.[0]).toMatchObject({
       env: [
@@ -237,6 +247,13 @@ describe("permissive profile", () => {
     ["FOO='a b' git push --force origin feature", "destructive"],
     ["FOO=a\\ b aws secretsmanager get-secret-value --secret-id x", "sensitive"],
     ['A=1 B="x y" git reset --hard HEAD~1', "destructive"],
+    ["FOO+=a rm -rf example", "unknown"],
+    ["FOO[0]=a\\ b rm -rf example", "unknown"],
+    ["FOO+=a git push --force origin feature", "unknown"],
+    ["FOO[0]='a b' aws secretsmanager get-secret-value --secret-id x", "unknown"],
+    ["env FOO+=a rm -rf example", "destructive"],
+    ["env 'FOO[0]=a' git push --force origin feature", "destructive"],
+    ["env -i FOO+=a rm -rf example", "destructive"],
     ["cd ~user && ls", "unknown"],
   ])("sends %s to a human (%s)", (command, category) => {
     const d = decide(command);
