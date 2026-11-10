@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 import { normalize } from "../src/adapters.js";
-import { sessionDirectory } from "../src/audit.js";
+import { sessionDirectory, sessionDirectoryPath } from "../src/audit.js";
 import { hookConfig } from "../src/config.js";
 import { hash } from "../src/policy.js";
 
@@ -94,3 +94,16 @@ test.each(["claude", "codex", "copilot"] as const)(
     expect(() => hookConfig(harness, "relative/path")).toThrow();
   },
 );
+
+test("SessionEnd for a session with no service succeeds and creates nothing", () => {
+  const cliPath = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const sessionId = randomUUID();
+  const directory = sessionDirectoryPath("claude", sessionId);
+  const out = execFileSync(process.execPath, [cliPath, "hook", "claude", "SessionEnd"], {
+    encoding: "utf8",
+    input: JSON.stringify({ session_id: sessionId, cwd: process.cwd() }),
+    timeout: 15000,
+  });
+  expect(JSON.parse(out)).toEqual({});
+  expect(existsSync(directory)).toBe(false);
+});

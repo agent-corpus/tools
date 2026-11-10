@@ -17,13 +17,17 @@ const tools = new Set(
   ),
 );
 
-export function sessionDirectory(harness: string, sessionId: string): string {
+export function sessionDirectoryPath(harness: string, sessionId: string): string {
   if (!sessionId || !["claude", "codex", "copilot"].includes(harness))
     throw new Error("A harness and session ID are required");
-  const path = join(
+  return join(
     tmpdir(),
     `acp-${process.getuid?.() ?? "user"}-${hash([harness, sessionId]).slice(0, 24)}`,
   );
+}
+
+export function sessionDirectory(harness: string, sessionId: string): string {
+  const path = sessionDirectoryPath(harness, sessionId);
   try {
     mkdirSync(path, { mode: 0o700 });
   } catch (error) {
