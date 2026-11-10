@@ -1,10 +1,11 @@
-import { basename, resolve } from "node:path";
+import { homedir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import {
   branchEvidence,
   canonical,
   inside,
+  isProtectedPath,
   pathEvidence,
-  protectedPath,
   sensitive,
 } from "./evidence.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
@@ -95,7 +96,7 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
   try {
     const lexical = resolve(cwd, input);
     const path = canonical(lexical);
-    if (sensitive(path) || sensitive(lexical) || protectedPath(path) || protectedPath(lexical))
+    if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
         allowed: false,
         category: "sensitive" as const,
@@ -155,6 +156,18 @@ function abbreviates(flag: string, name: string): boolean {
   if (!flag.startsWith("--") || !name.startsWith("--")) return flag === name;
   const given = flag.split("=")[0] as string;
   return given.length > 2 && name.startsWith(given);
+}
+
+const SAFE_CONFIG_KEYS =
+  /^(?:core\.(?:bare|filemode|autocrlf|longpaths|ignorecase|precomposeunicode|untrackedcache)|user\.(?:name|email)|push\.(?:default|autosetupremote|followtags)|pull\.(?:rebase|ff)|fetch\.prune|merge\.ff|rebase\.autostash|rerere\.enabled|init\.defaultbranch|branch\.[A-Za-z0-9/_.-]+\.(?:remote|merge|rebase)|advice\.[a-z]+|color\.[a-z.]+)$/i;
+
+/** Only local, non-executable settings; hooks, aliases, credential helpers and URLs need a human. */
+function safeConfigWrite(rest: string[]): boolean {
+  const flags = rest.filter((word) => word.startsWith("-"));
+  if (flags.some((flag) => !["--local", "--worktree", "--unset", "--bool", "--int"].includes(flag)))
+    return false;
+  const words = rest.filter((word) => !word.startsWith("-"));
+  return words.length >= 1 && words.length <= 2 && SAFE_CONFIG_KEYS.test(words[0] ?? "");
 }
 
 function gitDecision(request: Request, argv: string[], cwdForGit: string): Decision {
@@ -226,7 +239,8 @@ function gitDecision(request: Request, argv: string[], cwdForGit: string): Decis
     return human(request, "destructive", "Forced worktree removal requires human approval");
   if (
     sub === "config" &&
-    !has("--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin")
+    !has("--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin") &&
+    !safeConfigWrite(rest)
   )
     return human(request, "sensitive", "Git configuration can install hooks or credential helpers");
   if (
@@ -326,11 +340,64 @@ function ghDecision(request: Request, argv: string[]): Decision | undefined {
   return undefined;
 }
 
+/**
+ * Read-only operations by verb, for services outside the exact catalog. The selectors already
+ * passed the credential screen in `evaluateArgv`; endpoint overrides still need a human.
+ */
+const AWS_METADATA_GETTERS = new Set([
+  "get-caller-identity",
+  "get-account-summary",
+  "get-role",
+  "get-user",
+  "get-group",
+  "get-policy",
+  "get-policy-version",
+  "get-function-configuration",
+  "get-bucket-location",
+  "get-bucket-versioning",
+  "get-bucket-tagging",
+  "get-bucket-policy-status",
+  "get-rest-apis",
+  "get-resources",
+  "get-hosted-zone",
+  "get-metric-statistics",
+  "get-log-events",
+]);
+
+function readVerb(argv: string[]): boolean {
+  const [tool] = argv;
+  const firstOption = argv.findIndex((arg) => arg.startsWith("-"));
+  const operation = (firstOption < 0 ? argv : argv.slice(0, firstOption)).slice(1);
+  const verb = operation.at(-1) ?? "";
+  if (tool === "gcloud" && /token|secret|password|credential|key/i.test(operation.join(" ")))
+    return false;
+  if (operation.length < 2 || !operation.every((word) => /^[a-z][a-z0-9-]*$/.test(word)))
+    return false;
+  if (argv.some((arg) => /^--(?:endpoint|endpoint-url|api-endpoint|debug|profile-file)/.test(arg)))
+    return false;
+  if (/token|secret|password|credential|key/i.test(verb)) return false;
+  if (tool === "az") return /^(?:list|show|exists|list-[a-z-]+|show-[a-z-]+)$/.test(verb);
+  if (tool === "aws") {
+    // `get-*` is not safe as a family: it includes secret, password, token and access-detail
+    // retrieval. Only `describe-`/`list-` and an explicit set of metadata getters are automatic.
+    if (argv.some((arg) => /^--(?:no-)?with-decryption/.test(arg))) return false;
+    return /^(?:describe|list)-[a-z-]+$/.test(verb) || AWS_METADATA_GETTERS.has(verb);
+  }
+  if (tool === "gcloud") {
+    // gcloud passes the resource as a positional after the verb: `run services describe svc`.
+    const at = operation.findIndex((word) => /^(?:list|describe)$/.test(word));
+    return at >= 0 && operation.length - at <= 2;
+  }
+  return false;
+}
+
 function cloudDecision(request: Request, argv: string[], profile: Profile): Decision {
   const strict = evaluateArgv(request, argv);
   if (strict.decision === "approve" || strict.category === "sensitive") return strict;
   if (argv.some((arg) => /^(delete|destroy|purge|remove|terminate|deregister)/.test(arg)))
     return human(request, "destructive", "Cloud deletion requires human approval");
+  if (readVerb(argv))
+    return result(request, "cloud-read", "Permissive profile: cloud read-only verb", true);
   if (profile.cloudWrites === "allow" && strict.category === "impactful-write")
     return result(
       request,
@@ -510,8 +577,10 @@ export function commandDecision(
     for (const [index, simple] of pipeline.entries()) {
       if (basename(simple.argv[0] ?? "") === "cd") {
         const target = simple.argv.slice(1).filter((word) => word !== "--");
-        const word = target[0];
-        if (target.length !== 1 || !word || /^[-~]|[*?[\]]/.test(word) || word.startsWith("-"))
+        // A bare `cd` and `~` or `~/x` go to the home directory; `~user` and `-` stay with a human.
+        const raw = target.length === 0 ? "~" : target[0];
+        const word = raw === "~" || raw?.startsWith("~/") ? join(homedir(), raw.slice(1)) : raw;
+        if (target.length > 1 || !word || /^~|[*?[\]]/.test(word) || word.startsWith("-"))
           return human(request, "unknown", "Directory change requires human review");
         // The cd's own redirections, env assignments and organization patterns run first, in the
         // directories it could start from.

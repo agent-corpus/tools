@@ -41,6 +41,33 @@ export function protectedPath(path: string): boolean {
       ),
     );
 }
+/**
+ * Protected names (.claude, .agent-config, AGENTS.md ...) guard a repository's own configuration,
+ * so they are judged relative to the Git top level. A linked worktree that lives under
+ * `<repo>/.claude/worktrees/<name>` is ordinary code, while `<worktree>/.claude/settings.json`
+ * stays protected.
+ */
+export function isProtectedPath(path: string): boolean {
+  try {
+    let parent = existsSync(path) && statSync(path).isDirectory() ? path : dirname(path);
+    while (!existsSync(parent)) parent = dirname(parent);
+    const root = canonical(git(parent, ["rev-parse", "--show-toplevel"]));
+    if (protectedPath(relative(root, canonical(path)))) return true;
+    // A protected name that is a symlink (`.claude -> config`) vanishes once the path is resolved,
+    // so also judge the path as written, relative to the checkout it lives in.
+    const written = resolve(path);
+    let ancestor = dirname(written);
+    while (ancestor !== dirname(ancestor)) {
+      if (existsSync(ancestor) && canonical(ancestor) === root)
+        return protectedPath(relative(ancestor, written));
+      ancestor = dirname(ancestor);
+    }
+    return false;
+  } catch {
+    return protectedPath(path);
+  }
+}
+
 export function pathEvidence(
   cwd: string,
   input: string,
@@ -52,7 +79,7 @@ export function pathEvidence(
     if (
       sensitive(path) ||
       sensitive(lexical) ||
-      (write && (protectedPath(path) || protectedPath(lexical)))
+      (write && (isProtectedPath(path) || isProtectedPath(lexical)))
     )
       return {
         allowed: false,
