@@ -89,7 +89,27 @@ describe("shell parser", () => {
     "a && ",
     "| ls",
     "echo 'unterminated",
+    "echo trailing\\",
+    'echo "trailing\\',
+    'echo "a\\\nb"',
+    'echo "$(rm -rf x)"',
+    'echo "x" "$HOME"',
   ])("rejects %j", (command) => expect(parseShell(command)).toBeUndefined());
+  test("backslashes only make the next character literal", () => {
+    const argv = (command: string) => parseShell(command)?.map((l) => l.map((c) => c.argv));
+    // Escaped operators stay inside one word instead of splitting the command.
+    expect(argv("echo a\\; rm -rf x")).toEqual([[["echo", "a;", "rm", "-rf", "x"]]]);
+    expect(argv("echo a\\&\\&b")).toEqual([[["echo", "a&&b"]]]);
+    expect(argv("echo a\\ b")).toEqual([[["echo", "a b"]]]);
+    expect(argv("grep a\\|b f")).toEqual([[["grep", "a|b", "f"]]]);
+    // An escaped quote does not end the string, so the rest is still data.
+    expect(argv('echo "a\\"; rm -rf x; echo \\""')).toEqual([[["echo", 'a"; rm -rf x; echo "']]]);
+    expect(argv('grep -E "x\\b|\\"out\\"" f')).toEqual([[["grep", "-E", 'x\\b|"out"', "f"]]]);
+    // `\$` is a literal dollar, not an expansion.
+    expect(argv('echo "\\$HOME"')).toEqual([[["echo", "$HOME"]]]);
+    expect(argv("echo \\> out.txt")?.[0]?.[0]?.slice(1)).toEqual([">", "out.txt"]);
+    expect(parseShell("echo a\\> out.txt")?.[0]?.[0]?.redirects).toEqual([]);
+  });
   test("assignments precede the program", () =>
     expect(parseShell("FOO=1 BAR=2 make test")?.[0]?.[0]).toMatchObject({
       env: [
@@ -124,6 +144,8 @@ describe("permissive profile", () => {
     "aws s3api list-buckets",
     "aws sts get-caller-identity",
     "gcloud run services describe svc",
+    'grep -n -iE "nw|northwest|--out\\b|\\"out\\"" src/env.ts | head -30',
+    "grep -rn foo\\|bar src",
     "git config core.bare false",
     "git config --local user.email t@example.com",
     "git config --unset core.bare",
@@ -191,6 +213,9 @@ describe("permissive profile", () => {
     ["git config --global user.name x", "sensitive"],
     ["git config credential.helper store", "sensitive"],
     ["git config remote.origin.url https://evil.example/x.git", "sensitive"],
+    ["echo a\\; rm -rf x && rm -rf y", "destructive"],
+    ['echo "\\" && rm -rf x', "unknown"],
+    ["echo a\\ b; rm -rf x", "destructive"],
     ["cd ~user && ls", "unknown"],
   ])("sends %s to a human (%s)", (command, category) => {
     const d = decide(command);
