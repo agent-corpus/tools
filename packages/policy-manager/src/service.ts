@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
-import { chmodSync } from "node:fs";
+import { chmodSync, existsSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { join } from "node:path";
-import { audit, sessionDirectory, sessionToken } from "./audit.js";
+import { audit, sessionDirectory, sessionDirectoryPath, sessionToken } from "./audit.js";
 import { hash } from "./policy.js";
 import { loadProfile, type Profile, strictProfile } from "./profile.js";
 import { PolicySession } from "./session.js";
@@ -142,6 +142,23 @@ export function send(
       }
     });
   });
+}
+/**
+ * Stops a session's service. A session with no service (it never started, already ended, or the
+ * harness fired SessionEnd outside a real session such as `claude update`) is not an error:
+ * there is nothing left to stop, and no session directory is created for it. Unsafe directories
+ * and other failures still throw.
+ */
+export async function stop(harness: string, sessionId: string): Promise<"stopped" | "not-running"> {
+  if (!existsSync(sessionDirectoryPath(harness, sessionId))) return "not-running";
+  try {
+    await send(harness, sessionId, { action: "stop" });
+    return "stopped";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ECONNREFUSED") return "not-running";
+    throw error;
+  }
 }
 export async function start(harness: string, sessionId: string, cliPath: string): Promise<string> {
   const directory = sessionDirectory(harness, sessionId);

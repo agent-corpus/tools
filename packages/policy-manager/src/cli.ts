@@ -7,7 +7,7 @@ import { executionReport, hookResponse, normalize } from "./adapters.js";
 import { hookConfig } from "./config.js";
 import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
 import { replayTranscripts } from "./replay.js";
-import { send, serve, start } from "./service.js";
+import { send, serve, start, stop } from "./service.js";
 import { SetupError, setupHook } from "./setup.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
 
@@ -121,7 +121,7 @@ try {
     const payload = await stdin();
     const request = normalize(harness, payload);
     if (phase === "SessionEnd") {
-      await send(harness, request.sessionId, { action: "stop" });
+      await stop(harness, request.sessionId);
       console.log("{}");
     } else {
       const directory = await start(harness, request.sessionId, cliPath);
