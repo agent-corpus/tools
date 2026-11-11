@@ -109,7 +109,13 @@ describe("shell parser", () => {
     expect(
       // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
       first('echo "exit: $? $# $$ ${pipestatus[1]} ${PIPESTATUS[0]} $PIPESTATUS"')?.argv,
-    ).toEqual(["echo", "exit: 0 0 0 0 0 0"]);
+    ).toEqual([
+      "echo",
+      `exit: ${[SUBSTITUTION, SUBSTITUTION, SUBSTITUTION, SUBSTITUTION, SUBSTITUTION, SUBSTITUTION].join(" ")}`,
+    ]);
+    // Unknown values are never replaced by a made-up digit: an out-of-range array element is empty.
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    expect(first('echo "status${PIPESTATUS[9]}"')?.argv).toEqual(["echo", `status${SUBSTITUTION}`]);
     // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
     expect(first("ls $HOME/x ${HOME}/y")?.argv).toEqual(["ls", `${homedir()}/x`, `${homedir()}/y`]);
     const sub = first('echo "a $(git log -1) b" `date`');
@@ -307,6 +313,27 @@ describe("permissive profile", () => {
     ["env $(echo rm) -rf x", "unknown"],
     ["timeout $(echo 5) rm -rf x", "unknown"],
     ["echo $(echo $(echo $(echo $(echo x))))", "unknown"],
+    // Unknown parameter values (`$?`, `$#`, `$$`, PIPESTATUS) are only accepted where they cannot
+    // change what runs: never as a program, option, path or redirection target.
+    ["rm$? -rf x", "unknown"],
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    ["rm${PIPESTATUS[9]} -rf x", "unknown"],
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    ["git push --force${PIPESTATUS[9]} origin x", "unknown"],
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    ["git push ${PIPESTATUS[9]}--force origin x", "unknown"],
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    ["cat ${pipestatus[5]}/etc/passwd", "unknown"],
+    ["echo hi > /tmp/x$$", "unknown"],
+    ["cd $? && ls", "unknown"],
+    // Substitution inside words a wrapper consumes can split into extra words and pick a program.
+    ['env FOO=$(echo "x echo CALLED") false', "unknown"],
+    ['env FOO="$(echo a)" false', "unknown"],
+    ["env FOO=$? false", "unknown"],
+    ["timeout $(echo 5) true", "unknown"],
+    ["nice -n $(echo 5) true", "unknown"],
+    ["time $(echo rm) -rf x", "unknown"],
+    ["nohup $? true", "unknown"],
     ["cat $HOME/.ssh/id_rsa", "sensitive"],
     ["cat ~/.config/gh/hosts.yml", "sensitive"],
     ["cat $HOME/.config/gh/hosts.yml", "sensitive"],

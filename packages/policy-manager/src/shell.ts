@@ -1,11 +1,12 @@
 // Parses a bounded subset of POSIX shell: simple commands joined by `;`, newlines, `&&`, `||`
 // and `|`, with quoting, leading VAR=value assignments and file redirections. Anything whose
-// effects depend on expansion is rejected so a caller can fall back to a human. Two kinds of
-// expansion are understood: parameters whose value is known without running anything (`$?`, `$#`,
-// `$$`, `$HOME`, `PIPESTATUS`), which are substituted, and command substitution (`$(...)` and
-// backticks), whose inner command is returned in `subs` for the caller to judge and whose output
-// is represented in a word by SUBSTITUTION. Everything else (other variables, arithmetic, braces,
-// subshells, heredocs, background jobs, comments, process substitution) is rejected.
+// effects depend on expansion is rejected so a caller can fall back to a human. Three kinds of
+// expansion are understood: `$HOME`, which is substituted because its value is known before
+// anything runs; command substitution (`$(...)` and backticks), whose inner command is returned in
+// `subs` for the caller to judge; and parameters whose value is unknown (`$?`, `$#`, `$$`,
+// `PIPESTATUS`). The output of the last two is represented in a word by SUBSTITUTION. Everything
+// else (other variables, arithmetic, braces, subshells, heredocs, background jobs, comments,
+// process substitution) is rejected.
 
 import { homedir } from "node:os";
 
@@ -77,7 +78,11 @@ function closingBacktick(command: string, start: number): number | undefined {
   return undefined;
 }
 
-const KNOWN_PARAMETER = /^(?:HOME|(?:PIPESTATUS|pipestatus)(?:\[[0-9@*]+\])?)$/;
+// Only HOME has a value that is known before anything runs. The others are recognised so a
+// harmless read like `echo "exit: $?"` can be judged, but their value is unknown: `$?` and friends
+// change per run, and an array element such as `${PIPESTATUS[5]}` is empty when out of range.
+// They are therefore represented by SUBSTITUTION, never by a made-up value.
+const UNKNOWN_PARAMETER = /^(?:(?:PIPESTATUS|pipestatus)(?:\[[0-9@*]+\])?)$/;
 
 /**
  * Reads the expansion that starts at `command[at] === "$"`. Returns the text it stands for and the
@@ -89,14 +94,11 @@ function expansion(
   at: number,
 ): { text: string; next: number; inner?: string } | undefined {
   const rest = command.slice(at + 1);
-  const known = (name: string): string | undefined => {
-    if (name === "HOME") {
-      const home = homedir();
-      // The text is inserted as-is and never re-parsed, so a backslash (a Windows separator) is
-      // harmless; whitespace and glob characters would split or expand when unquoted.
-      return /[\s*?[\]'"$`]/.test(home) ? undefined : home;
-    }
-    return "0"; // an exit status or PIPESTATUS entry: digits only
+  const home = (): string | undefined => {
+    const path = homedir();
+    // The text is inserted as-is and never re-parsed, so a backslash (a Windows separator) is
+    // harmless; whitespace and glob characters would split or expand when unquoted.
+    return /[\s*?[\]'"$`]/.test(path) ? undefined : path;
   };
   if (rest[0] === "(") {
     if (rest[1] === "(") return undefined; // arithmetic expansion
@@ -107,17 +109,21 @@ function expansion(
   if (rest[0] === "{") {
     const close = rest.indexOf("}");
     const name = close > 0 ? rest.slice(1, close) : "";
-    if (!KNOWN_PARAMETER.test(name)) return undefined;
-    const text = known(name.startsWith("HOME") ? "HOME" : name);
-    return text === undefined ? undefined : { text, next: at + close + 2 };
+    const next = at + close + 2;
+    if (name === "HOME") {
+      const text = home();
+      return text === undefined ? undefined : { text, next };
+    }
+    return UNKNOWN_PARAMETER.test(name) ? { text: SUBSTITUTION, next } : undefined;
   }
-  if (rest[0] && "?#$".includes(rest[0])) return { text: "0", next: at + 2 };
+  if (rest[0] && "?#$".includes(rest[0])) return { text: SUBSTITUTION, next: at + 2 };
   const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest)?.[0];
-  if (name && KNOWN_PARAMETER.test(name)) {
-    const text = known(name);
-    return text === undefined ? undefined : { text, next: at + 1 + name.length };
+  const next = at + 1 + (name?.length ?? 0);
+  if (name === "HOME") {
+    const text = home();
+    return text === undefined ? undefined : { text, next };
   }
-  return undefined;
+  return name && UNKNOWN_PARAMETER.test(name) ? { text: SUBSTITUTION, next } : undefined;
 }
 
 /** Body of a backtick substitution: backslash escapes `\``, `\\` and `\$` are removed first. */

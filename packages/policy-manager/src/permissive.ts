@@ -463,6 +463,16 @@ function simpleDecision(
       return human(request, "unknown", "Environment override requires human review");
   const argv = unwrapped.argv;
   const program = basename(argv[0] ?? "");
+  // Words a wrapper consumed (env assignments, options, durations) are gone from `argv`, but an
+  // unquoted substitution in them can still split into extra words and pick a different program.
+  if (
+    command.argv.slice(0, command.argv.length - argv.length).some((w) => w.includes(SUBSTITUTION))
+  )
+    return human(
+      request,
+      "unknown",
+      "Command substitution inside a wrapper command requires human review",
+    );
   if (
     argv.some((word) => word.includes(SUBSTITUTION)) &&
     (argv[0]?.includes(SUBSTITUTION) || !SUBSTITUTION_OK.has(program))
