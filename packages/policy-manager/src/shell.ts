@@ -92,7 +92,9 @@ function expansion(
   const known = (name: string): string | undefined => {
     if (name === "HOME") {
       const home = homedir();
-      return /[\s*?[\]'"\\$`]/.test(home) ? undefined : home;
+      // The text is inserted as-is and never re-parsed, so a backslash (a Windows separator) is
+      // harmless; whitespace and glob characters would split or expand when unquoted.
+      return /[\s*?[\]'"$`]/.test(home) ? undefined : home;
     }
     return "0"; // an exit status or PIPESTATUS entry: digits only
   };
