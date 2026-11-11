@@ -1,5 +1,13 @@
 # @agent-corpus/policy-manager
 
+## 0.3.0
+
+### Minor Changes
+
+- The shell parser now understands two kinds of expansion instead of rejecting every `$`. `$HOME` and `${HOME}` are substituted, so `ls $HOME/x` is judged on its real path. Parameters whose value is unknown (`$?`, `$#`, `$$`, `PIPESTATUS`/`pipestatus` entries) are accepted like a command substitution result, so `echo "exit: ${pipestatus[1]}"` is judged on its real command but the unknown value can never become a program, option, path or redirection target. Command substitution (`$(...)` and backticks, including nested and quoted) is judged by evaluating the inner command with the same rules before the outer command; its output (and the unknown parameters above) is accepted only as an argument to `echo`, `printf`, `test`, `[`, `true`, `false`, `basename` and `dirname`, and never as a program, `cd` target, redirection target, wrapper word (such as an `env` assignment or `timeout` duration), or argument to any other command. Other variables, arithmetic expansion, `$'...'` and heredocs are still sent to a human.
+  
+  Security: the protected-path list now also covers `~/.config/gh`, `~/.config/gcloud`, `~/.config/op`, `~/.docker`, `~/.gnupg`, `~/.git-credentials`, `~/.password-store`, `~/.vault-token`, `~/.pgpass`, `~/.my.cnf` and `~/.pypirc`, which the permissive profile could previously read.
+
 ## 0.2.1
 
 ### Patch Changes

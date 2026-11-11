@@ -1,7 +1,17 @@
 // Parses a bounded subset of POSIX shell: simple commands joined by `;`, newlines, `&&`, `||`
 // and `|`, with quoting, leading VAR=value assignments and file redirections. Anything whose
-// effects depend on expansion (`$`, backticks, subshells, braces, heredocs, background jobs,
-// comments, process substitution) is rejected so a caller can fall back to a human.
+// effects depend on expansion is rejected so a caller can fall back to a human. Three kinds of
+// expansion are understood: `$HOME`, which is substituted because its value is known before
+// anything runs; command substitution (`$(...)` and backticks), whose inner command is returned in
+// `subs` for the caller to judge; and parameters whose value is unknown (`$?`, `$#`, `$$`,
+// `PIPESTATUS`). The output of the last two is represented in a word by SUBSTITUTION. Everything
+// else (other variables, arithmetic, braces, subshells, heredocs, background jobs, comments,
+// process substitution) is rejected.
+
+import { homedir } from "node:os";
+
+/** Stands for the unknown output of a command substitution inside a word. */
+export const SUBSTITUTION = "\uE000";
 
 export interface Redirect {
   fd: string;
@@ -12,17 +22,128 @@ export interface SimpleCommand {
   env: Array<[string, string]>;
   argv: string[];
   redirects: Redirect[];
+  /** Inner commands of `$(...)` and backticks in this command's words, in order. */
+  subs: string[];
 }
 export type Pipeline = SimpleCommand[];
 
 const ASSIGNMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/** Index of the `)` that closes a `$(` whose body starts at `start`, honouring quotes and nesting. */
+function closingParen(command: string, start: number): number | undefined {
+  let depth = 1;
+  let j = start;
+  while (j < command.length) {
+    const c = command[j] as string;
+    if (c === "\\") j += 2;
+    else if (c === "'") {
+      const end = command.indexOf("'", j + 1);
+      if (end < 0) return undefined;
+      j = end + 1;
+    } else if (c === '"') {
+      j++;
+      while (j < command.length && command[j] !== '"') {
+        const d = command[j] as string;
+        if (d === "\\") j += 2;
+        else if (d === "$" && command[j + 1] === "(") {
+          const end = closingParen(command, j + 2);
+          if (end === undefined) return undefined;
+          j = end + 1;
+        } else if (d === "`") {
+          const end = closingBacktick(command, j + 1);
+          if (end === undefined) return undefined;
+          j = end + 1;
+        } else j++;
+      }
+      if (j >= command.length) return undefined;
+      j++;
+    } else if (c === "`") {
+      const end = closingBacktick(command, j + 1);
+      if (end === undefined) return undefined;
+      j = end + 1;
+    } else {
+      if (c === "(") depth++;
+      else if (c === ")" && --depth === 0) return j;
+      j++;
+    }
+  }
+  return undefined;
+}
+
+function closingBacktick(command: string, start: number): number | undefined {
+  for (let j = start; j < command.length; j++) {
+    if (command[j] === "\\") j++;
+    else if (command[j] === "`") return j;
+  }
+  return undefined;
+}
+
+// Only HOME has a value that is known before anything runs. The others are recognised so a
+// harmless read like `echo "exit: $?"` can be judged, but their value is unknown: `$?` and friends
+// change per run, and an array element such as `${PIPESTATUS[5]}` is empty when out of range.
+// They are therefore represented by SUBSTITUTION, never by a made-up value.
+const UNKNOWN_PARAMETER = /^(?:(?:PIPESTATUS|pipestatus)(?:\[[0-9@*]+\])?)$/;
+
+/**
+ * Reads the expansion that starts at `command[at] === "$"`. Returns the text it stands for and the
+ * index after it, any command substitution body, or undefined for an expansion that is not
+ * understood.
+ */
+function expansion(
+  command: string,
+  at: number,
+): { text: string; next: number; inner?: string } | undefined {
+  const rest = command.slice(at + 1);
+  const home = (): string | undefined => {
+    const path = homedir();
+    // The text is inserted as-is and never re-parsed, so a backslash (a Windows separator) is
+    // harmless; whitespace and glob characters would split or expand when unquoted.
+    return /[\s*?[\]'"$`]/.test(path) ? undefined : path;
+  };
+  if (rest[0] === "(") {
+    if (rest[1] === "(") return undefined; // arithmetic expansion
+    const end = closingParen(command, at + 2);
+    if (end === undefined) return undefined;
+    return { text: SUBSTITUTION, next: end + 1, inner: command.slice(at + 2, end) };
+  }
+  if (rest[0] === "{") {
+    const close = rest.indexOf("}");
+    const name = close > 0 ? rest.slice(1, close) : "";
+    const next = at + close + 2;
+    if (name === "HOME") {
+      const text = home();
+      return text === undefined ? undefined : { text, next };
+    }
+    return UNKNOWN_PARAMETER.test(name) ? { text: SUBSTITUTION, next } : undefined;
+  }
+  if (rest[0] && "?#$".includes(rest[0])) return { text: SUBSTITUTION, next: at + 2 };
+  const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest)?.[0];
+  const next = at + 1 + (name?.length ?? 0);
+  if (name === "HOME") {
+    const text = home();
+    return text === undefined ? undefined : { text, next };
+  }
+  return name && UNKNOWN_PARAMETER.test(name) ? { text: SUBSTITUTION, next } : undefined;
+}
+
+/** Body of a backtick substitution: backslash escapes `\``, `\\` and `\$` are removed first. */
+function backtickBody(raw: string): string {
+  return raw.replace(/\\([`\\$])/g, "$1");
+}
+
 export function parseShell(command: string): Pipeline[] | undefined {
-  if (!command || command.includes("\0") || command.includes("\r")) return undefined;
+  if (
+    !command ||
+    command.includes("\0") ||
+    command.includes("\r") ||
+    command.includes(SUBSTITUTION)
+  )
+    return undefined;
   const pipelines: Pipeline[] = [];
   let pipeline: Pipeline = [];
   let words: Array<{ text: string; assignAt: number }> = [];
   let redirects: Redirect[] = [];
+  let subs: string[] = [];
   let pendingRedirect: { fd: string; op: Redirect["op"] } | undefined;
   let current = "";
   let active = false;
@@ -69,9 +190,10 @@ export function parseShell(command: string): Pipeline[] | undefined {
     // the next word. A program name never contains `=`, so a leading word that still has one is
     // an assignment this parser cannot represent: reject it instead of judging it as the program.
     if (argv[0]?.includes("=")) return false;
-    pipeline.push({ env, argv, redirects });
+    pipeline.push({ env, argv, redirects, subs });
     words = [];
     redirects = [];
+    subs = [];
     return true;
   };
   const endPipeline = (allowEmpty: boolean): boolean => {
@@ -97,7 +219,22 @@ export function parseShell(command: string): Pipeline[] | undefined {
           } else current += char;
           continue;
         }
-        if (char === "$" || char === "`") return undefined;
+        if (char === "$") {
+          const expanded = expansion(command, i);
+          if (!expanded) return undefined;
+          current += expanded.text;
+          if (expanded.inner !== undefined) subs.push(expanded.inner);
+          i = expanded.next - 1;
+          continue;
+        }
+        if (char === "`") {
+          const end = closingBacktick(command, i + 1);
+          if (end === undefined) return undefined;
+          subs.push(backtickBody(command.slice(i + 1, end)));
+          current += SUBSTITUTION;
+          i = end;
+          continue;
+        }
       }
       if (char === quote) quote = "";
       else current += char;
@@ -121,7 +258,27 @@ export function parseShell(command: string): Pipeline[] | undefined {
       i++;
       continue;
     }
-    if (/[`$(){}#!]/.test(char)) {
+    if (char === "$") {
+      const expanded = expansion(command, i);
+      if (!expanded) return undefined;
+      if (eqAt < 0) plain = false;
+      current += expanded.text;
+      active = true;
+      if (expanded.inner !== undefined) subs.push(expanded.inner);
+      i = expanded.next - 1;
+      continue;
+    }
+    if (char === "`") {
+      const end = closingBacktick(command, i + 1);
+      if (end === undefined) return undefined;
+      if (eqAt < 0) plain = false;
+      subs.push(backtickBody(command.slice(i + 1, end)));
+      current += SUBSTITUTION;
+      active = true;
+      i = end;
+      continue;
+    }
+    if (/[(){}#!]/.test(char)) {
       // `#` only starts a comment at a word boundary, but rejecting it everywhere is simpler.
       return undefined;
     }
