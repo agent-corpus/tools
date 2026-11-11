@@ -73,8 +73,7 @@ export function mergedEvidence(cwd: string, ref: string): MergedEvidence {
       },
     ).trim();
     const cherry = git(cwd, ["cherry", into, synthetic]);
-    // biome-ignore lint/complexity/useOptionalChain: shell syntax under test
-    if (cherry && cherry.split("\n").every((line) => line.startsWith("-")))
+    if (cherry?.split("\n").every((line) => line.startsWith("-")))
       return {
         merged: true,
         how: "patch-equivalent to a squash or rebase merge into origin default",
