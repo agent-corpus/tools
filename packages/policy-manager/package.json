@@ -1,6 +1,6 @@
 {
   "name": "@agent-corpus/policy-manager",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Deterministic, session-scoped permission decisions with audit logs and bounded AI classification.",
   "keywords": [
     "coding-agent",

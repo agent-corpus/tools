@@ -23,14 +23,19 @@ export function inside(root: string, path: string): boolean {
   const rel = relative(root, path);
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
+const CREDENTIAL_CONFIG_DIRS = /(?:^|[\\/])\.config[\\/](?:gh|gcloud|op|hub)(?:[\\/]|$)/i;
+
 export function sensitive(path: string): boolean {
-  return path
-    .split(/[\\/]/)
-    .some((part) =>
-      /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.kube|\.npmrc|\.netrc|credentials?|secrets?|id_rsa|id_ed25519|id_ecdsa|kubeconfig|terraform\.tfstate(?:\..*)?|.*\.(?:pem|key|pfx|p12))$/i.test(
-        part,
-      ),
-    );
+  return (
+    CREDENTIAL_CONFIG_DIRS.test(path) ||
+    path
+      .split(/[\\/]/)
+      .some((part) =>
+        /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gcloud|\.docker|\.gnupg|\.password-store|\.git-credentials|\.vault-token|\.pgpass|\.my\.cnf|\.pypirc|\.npmrc|\.netrc|\.kube|credentials?|secrets?|id_rsa|id_ed25519|id_ecdsa|kubeconfig|terraform\.tfstate(?:\..*)?|.*\.(?:pem|key|pfx|p12))$/i.test(
+          part,
+        ),
+      )
+  );
 }
 export function protectedPath(path: string): boolean {
   return path

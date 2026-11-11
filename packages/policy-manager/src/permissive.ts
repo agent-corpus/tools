@@ -11,7 +11,7 @@ import {
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result } from "./policy.js";
 import type { Profile } from "./profile.js";
-import { parseShell, type SimpleCommand } from "./shell.js";
+import { parseShell, type SimpleCommand, SUBSTITUTION } from "./shell.js";
 import type { Decision, Request } from "./types.js";
 
 /**
@@ -60,6 +60,22 @@ const WRITERS = new Set([
   "chown",
 ]);
 const WRAPPERS = new Set(["env", "nohup", "time", "command", "nice", "timeout", "xargs"]);
+/**
+ * Programs whose behaviour cannot be changed by an unknown argument: they only print or compare
+ * strings. The output of a command substitution may be an argument of these and of nothing else,
+ * because for any other program it could be a flag, a path or a subcommand the checks never saw.
+ */
+const SUBSTITUTION_OK = new Set([
+  "echo",
+  "printf",
+  "true",
+  "false",
+  "test",
+  "[",
+  "basename",
+  "dirname",
+]);
+const MAX_SUBSTITUTION_DEPTH = 3;
 const BANNED_ENV =
   /^(?:LD_|DYLD_|GIT_|PYTHON|NODE_OPTIONS$|PATH$|HOME$|BASH_ENV$|ENV$|SHELL$|PAGER$|EDITOR$|GH_TOKEN$|GITHUB_TOKEN$)/;
 const FORCE_PUSH = ["--force", "--force-with-lease", "--force-if-includes", "--mirror", "--prune"];
@@ -420,6 +436,13 @@ function simpleDecision(
   for (const [name] of command.env)
     if (BANNED_ENV.test(name))
       return human(request, "unknown", "Environment override requires human review");
+  for (const redirect of command.redirects)
+    if (redirect.target.includes(SUBSTITUTION))
+      return human(
+        request,
+        "unknown",
+        "Command substitution in a redirection requires human review",
+      );
   for (const redirect of command.redirects) {
     // `>& word` duplicates a descriptor only when word is a number or `-`; otherwise it names a file.
     if (
@@ -440,6 +463,15 @@ function simpleDecision(
       return human(request, "unknown", "Environment override requires human review");
   const argv = unwrapped.argv;
   const program = basename(argv[0] ?? "");
+  if (
+    argv.some((word) => word.includes(SUBSTITUTION)) &&
+    (argv[0]?.includes(SUBSTITUTION) || !SUBSTITUTION_OK.has(program))
+  )
+    return human(
+      request,
+      "unknown",
+      "Command substitution output is only accepted as an argument to echo, printf and similar",
+    );
   const args = argv.slice(1);
   const joined = argv.join(" ");
   if (profile.humanPatterns.some((pattern) => pattern.test(joined)))
@@ -576,12 +608,25 @@ export function commandDecision(
   let last: Decision | undefined;
   for (const pipeline of pipelines)
     for (const [index, simple] of pipeline.entries()) {
+      // Command substitutions run before the command, in the directories it could start from.
+      for (const inner of simple.subs) {
+        if (depth >= MAX_SUBSTITUTION_DEPTH)
+          return human(request, "unknown", "Command substitutions are nested too deeply");
+        const own = commandDecision(request, inner, profile, depth + 1, cwds);
+        if (own.decision !== "approve") return own;
+      }
       if (basename(simple.argv[0] ?? "") === "cd") {
         const target = simple.argv.slice(1).filter((word) => word !== "--");
         // A bare `cd` and `~` or `~/x` go to the home directory; `~user` and `-` stay with a human.
         const raw = target.length === 0 ? "~" : target[0];
         const word = raw === "~" || raw?.startsWith("~/") ? join(homedir(), raw.slice(1)) : raw;
-        if (target.length > 1 || !word || /^~|[*?[\]]/.test(word) || word.startsWith("-"))
+        if (
+          target.length > 1 ||
+          !word ||
+          word.includes(SUBSTITUTION) ||
+          /^~|[*?[\]]/.test(word) ||
+          word.startsWith("-")
+        )
           return human(request, "unknown", "Directory change requires human review");
         // The cd's own redirections, env assignments and organization patterns run first, in the
         // directories it could start from.
