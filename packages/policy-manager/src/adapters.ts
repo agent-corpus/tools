@@ -15,11 +15,75 @@ export function normalize(harness: Request["harness"], payload: Record<string, u
     input: args,
   };
 }
+export interface HookContext {
+  cliPath: string;
+  sessionId: string;
+}
+/**
+ * The exact command the model is told to run to record a classification. A here-string, not a
+ * pipe: `printf ... | node ...` is "piping into an interpreter" and is itself escalated, so the
+ * round trip could never finish. A test evaluates this exact string and requires `approve`.
+ */
+export function classifyCommand(
+  harness: Request["harness"],
+  context?: HookContext,
+  json = "<json>",
+): string {
+  // A Windows path (`D:\\a\\cli.js`) is written with forward slashes: Node accepts them, and a
+  // backslash inside double quotes is a shell escape the policy cannot judge, which would
+  // escalate the command that finishes the round trip.
+  const cliPath =
+    context && /^[A-Za-z]:\\/.test(context.cliPath)
+      ? context.cliPath.replace(/\\/g, "/")
+      : context?.cliPath;
+  const safe =
+    context &&
+    cliPath &&
+    /^[^"$`\\\n']+$/.test(cliPath) &&
+    /^[A-Za-z0-9_.-]+$/.test(context.sessionId);
+  return safe
+    ? `node "${cliPath}" classify ${harness} ${context.sessionId} <<< '${json}'`
+    : `policy-manager classify ${harness} <session-id> <<< '${json}'`;
+}
+/** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
+function classifyInstruction(
+  harness: Request["harness"],
+  decision: Decision,
+  context?: HookContext,
+): string {
+  const command = classifyCommand(harness, context);
+  return `Not run yet: this request needs classification before it can run (request ${decision.requestHash}; ${decision.reason}). Ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive. It answers with {"requestHash":"${decision.requestHash}","category":"code-read|worktree-write|cloud-read|git-read|impactful-write|destructive|sensitive|unknown","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record that answer with this command, replacing <json> with the answer and using no single quotes in it: ${command} Then retry the same command unchanged. If you cannot get a classification, retry once and the user will be asked.`;
+}
 export function hookResponse(
   harness: Request["harness"],
   phase: string,
   decision: Decision,
+  context?: HookContext,
 ): Record<string, unknown> {
+  if (decision.decision === "deny") {
+    const reason =
+      decision.classification === "requested"
+        ? classifyInstruction(harness, decision, context)
+        : decision.reason;
+    if (phase === "PermissionRequest")
+      return harness === "copilot"
+        ? {}
+        : {
+            hookSpecificOutput: {
+              hookEventName: phase,
+              decision: { behavior: "deny", message: reason },
+            },
+          };
+    return harness === "copilot"
+      ? { permissionDecision: "deny", permissionDecisionReason: reason }
+      : {
+          hookSpecificOutput: {
+            hookEventName: phase,
+            permissionDecision: "deny",
+            permissionDecisionReason: reason,
+          },
+        };
+  }
   if (harness === "copilot") {
     if (phase === "PermissionRequest")
       return decision.decision === "approve" ? { behavior: "allow" } : {};
@@ -41,7 +105,7 @@ export function hookResponse(
   // (PermissionRequest, above) still handles the requests it would ask about.
   if (harness === "codex") {
     const next =
-      decision.needsClassification === true
+      decision.needsClassification === true && decision.classification !== "fallback"
         ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, ask the user to run it themselves or to change the policy profile."
         : "Approving it in this session does not unblock it: ask the user to run it themselves or to change the policy profile.";
     return {

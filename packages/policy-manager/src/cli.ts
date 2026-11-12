@@ -7,6 +7,7 @@ import { executionReport, hookResponse, normalize } from "./adapters.js";
 import { hookConfig } from "./config.js";
 import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
 import { replayTranscripts } from "./replay.js";
+import { formatReview, reviewClassifications, sessionDirectories } from "./review.js";
 import { send, serve, start, stop } from "./service.js";
 import { SetupError, setupHook } from "./setup.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
@@ -22,6 +23,7 @@ policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
 policy-manager profile validate <file>   # check a policy profile without installing it
 policy-manager profile install <file>    # install it to the user config directory outside Git
 policy-manager replay <transcript-dir-or-file...> [--profile <file>] [--files <n>]  # approval rate over recorded Bash commands; nothing is executed
+policy-manager review-classifications [--since <iso-time>] [--dir <session-dir>...] [--json]  # risk review of AI-classified ambiguous requests
 policy-manager stop <claude|codex|copilot> <session-id>
 A per-session background service checks policy and writes private temporary audit.jsonl logs.
 AI classification comes from the session's policy-manager agent, never an external API.
@@ -97,10 +99,25 @@ try {
     console.log(
       `${report.commands} unique commands; approved ${pct(report.approved)} (strict ${pct(report.strictApproved)})`,
     );
+    const humans = report.commands - report.approved;
+    console.log(
+      `${report.classified} of ${humans} escalations go to AI classification instead of a person; ${humans - report.classified} stay with a human by rule`,
+    );
     for (const row of report.reasons.slice(0, 15)) {
       console.log(`${row.count}\t${row.reason}`);
       for (const example of row.examples) console.log(`\t  ${example}`);
     }
+  } else if (action === "review-classifications") {
+    const { values } = parseArgs({
+      args: args.slice(1),
+      options: {
+        since: { type: "string" },
+        dir: { type: "string", multiple: true },
+        json: { type: "boolean" },
+      },
+    });
+    const review = await reviewClassifications(sessionDirectories(values.dir ?? []), values.since);
+    console.log(values.json ? JSON.stringify(review, null, 2) : formatReview(review));
   } else if (action === "serve") await serve(harness, phase ?? "");
   else if (action === "stop")
     console.log(JSON.stringify(await send(harness, phase ?? "", { action: "stop" })));
@@ -126,7 +143,7 @@ try {
     } else {
       const directory = await start(harness, request.sessionId, cliPath);
       if (phase === "SessionStart") {
-        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. For ambiguous requests, use a configured policy-manager agent or retain native human approval. If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent. Never ask an agent to approve its own tools.`;
+        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. An ambiguous request is blocked once with instructions to have the policy-manager agent classify it and then retry; the person is asked only if classification fails. If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent. Never ask an agent to approve its own tools.`;
         console.log(
           JSON.stringify(
             harness === "copilot"
@@ -144,8 +161,13 @@ try {
         const decision = (await send(harness, request.sessionId, {
           action: "review",
           request,
+          phase,
         })) as Decision;
-        console.log(JSON.stringify(hookResponse(harness, phase, decision)));
+        console.log(
+          JSON.stringify(
+            hookResponse(harness, phase, decision, { cliPath, sessionId: request.sessionId }),
+          ),
+        );
       } else throw new Error("Unsupported hook event");
     }
   } else throw new Error(usage);
