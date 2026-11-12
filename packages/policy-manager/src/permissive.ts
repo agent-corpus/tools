@@ -115,8 +115,19 @@ const STATE_BUILTINS = new Set([
   "fc",
   "history",
   "hash",
+  // builtins that store into a variable the evaluator tracks, or run a command through a module
   "vared",
   "zparseopts",
+  "r",
+  "zformat",
+  "zstyle",
+  "zregexparse",
+  "getln",
+  "compgen",
+  "sysread",
+  "zselect",
+  "ztcp",
+  "zpty",
   "setopt",
   "unsetopt",
   "shopt",
@@ -625,6 +636,18 @@ export function simpleDecision(
     return human(request, "unknown", "A command named with = requires human review");
   // `[[` evaluates the operands of -eq, -lt and the like as arithmetic, including the value of a
   // bare variable name, and `a[$(cmd)]` runs the command. Only plain integers are safe.
+  // `-v` and `-R` take a variable name, and bash evaluates a subscript in it (`a[$(cmd)]`).
+  if (program === "[[" || program === "test" || program === "[")
+    for (const [index, word] of args.entries())
+      if (
+        (word === "-v" || word === "-R") &&
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(args[index + 1] ?? "")
+      )
+        return human(
+          request,
+          "unknown",
+          "A variable test with a subscript or computed name requires human review",
+        );
   if (program === "[[")
     for (const [index, word] of args.entries())
       if (/^(?:-eq|-ne|-lt|-le|-gt|-ge)$/.test(word)) {
@@ -719,7 +742,10 @@ export function simpleDecision(
     program === "xargs" &&
     args.some(
       (arg) =>
-        DESTRUCTIVE.has(basename(arg)) || SHELLS.has(basename(arg)) || basename(arg) === "git",
+        // zsh expands `=rm` to the path of rm.
+        DESTRUCTIVE.has(basename(arg.replace(/^=/, ""))) ||
+        SHELLS.has(basename(arg.replace(/^=/, ""))) ||
+        basename(arg.replace(/^=/, "")) === "git",
     )
   )
     return human(
