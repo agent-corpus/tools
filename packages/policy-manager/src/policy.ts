@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { type Profile, strictProfile } from "./profile.js";
+import { redactText } from "./redact.js";
 import type { Category, Classification, Decision, Request } from "./types.js";
 
 export function hash(value: unknown): string {
@@ -172,12 +173,71 @@ export function result(
     cached: false,
   };
 }
+/** Self-reported confidence needed for the AI to approve an ambiguous request. */
+export const AMBIGUOUS_CONFIDENCE = 0.95;
+/**
+ * Escalations that stay with a human in every profile. Categories `sensitive` (credentials,
+ * secrets, protected paths and configuration) and `destructive` (unrecoverable loss) are excluded
+ * by category; these are the remaining boundaries: the request itself cannot be trusted, an
+ * organization or the profile asked for a human, or a repository rule forbids the write.
+ */
+const HUMAN_BOUNDARIES: RegExp[] = [
+  /^Incomplete request/,
+  /^Invalid tool input/,
+  /^Execution directory differs/,
+  /^Unrecognized patch format/,
+  /^Patch has no verified target paths/,
+  /^Environment override requires human review/,
+  /^Custom execution environment requires human review/,
+  /^Matches an organization human-approval pattern/,
+  /^Write requires a linked worktree on a feature branch/,
+  /^Cloud operation is outside the verified inspection catalog/,
+];
+/**
+ * Under the permissive profile, every escalation that is not a boundary is ambiguous: the
+ * deterministic engine cannot decide it, so the session's AI classifier does. Strict mode is
+ * unchanged.
+ */
+function markAmbiguous(decision: Decision, profile: Profile): Decision {
+  if (
+    profile.mode !== "permissive" ||
+    decision.decision !== "human" ||
+    decision.needsClassification ||
+    decision.category === "sensitive" ||
+    decision.category === "destructive" ||
+    HUMAN_BOUNDARIES.some((pattern) => pattern.test(decision.reason))
+  )
+    return decision;
+  return { ...decision, needsClassification: true, tier: "ambiguous" };
+}
+function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
+  const safe =
+    ai.recoverable === true &&
+    ai.confidence >= AMBIGUOUS_CONFIDENCE &&
+    !["sensitive", "destructive", "unknown"].includes(ai.category);
+  const base = { ...decision, needsClassification: false, cache: "session" as const, ai };
+  if (safe)
+    return {
+      ...base,
+      decision: "approve",
+      category: ai.category,
+      classification: "approved",
+      reason: "Ambiguous request judged recoverable and non-sensitive by the same-session AI",
+    };
+  const why = ai.rationale ? ` Rationale: ${redactText(ai.rationale, 200)}` : "";
+  return {
+    ...base,
+    decision: "deny",
+    classification: "denied",
+    reason: `Not run: the classifier did not approve this request (category ${ai.category}, confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"}).${why} Use a recoverable, non-sensitive alternative, or explain to the user what is needed.`,
+  };
+}
 export function evaluate(
   request: Request,
   ai?: Classification,
   profile: Profile = strictProfile,
 ): Decision {
-  const decision = evaluateCore(request, profile);
+  const decision = markAmbiguous(evaluateCore(request, profile), profile);
   if (ai) {
     // Self-reported confidence is not a probability or a substitute for verified effects.
     if (
@@ -203,6 +263,7 @@ export function evaluate(
         reason: "Invalid or mismatched AI classification",
       };
     decision.ai = ai;
+    if (decision.tier === "ambiguous") return resolveAmbiguous(decision, ai);
     if (
       decision.category === "cloud-read" &&
       decision.needsClassification === true &&

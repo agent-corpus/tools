@@ -14,6 +14,7 @@ interface Message {
   request?: Request;
   classification?: Classification;
   report?: OutcomeReport;
+  phase?: string;
 }
 function endpoint(directory: string): string {
   return process.platform === "win32"
@@ -69,7 +70,7 @@ export async function serve(harness: string, sessionId: string): Promise<void> {
           result = { stopped: true };
           server.close();
         } else if (message.action === "review" && message.request)
-          result = session.review(message.request);
+          result = session.review(message.request, undefined, message.phase);
         else if (message.action === "classify" && message.classification)
           result = session.classify(message.classification);
         else if (message.action === "record" && message.report) {

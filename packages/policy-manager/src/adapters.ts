@@ -15,11 +15,51 @@ export function normalize(harness: Request["harness"], payload: Record<string, u
     input: args,
   };
 }
+export interface HookContext {
+  cliPath: string;
+  sessionId: string;
+}
+/** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
+function classifyInstruction(
+  harness: Request["harness"],
+  decision: Decision,
+  context?: HookContext,
+): string {
+  const command = context
+    ? `printf '%s' '<json>' | node "${context.cliPath}" classify ${harness} ${context.sessionId}`
+    : "policy-manager classify";
+  return `Not run yet: this request needs classification before it can run (request ${decision.requestHash}; ${decision.reason}). Ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive. It answers with {"requestHash":"${decision.requestHash}","category":"code-read|worktree-write|cloud-read|git-read|impactful-write|destructive|sensitive|unknown","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record that answer with: ${command} and then retry the same command unchanged. If you cannot get a classification, retry once and the user will be asked.`;
+}
 export function hookResponse(
   harness: Request["harness"],
   phase: string,
   decision: Decision,
+  context?: HookContext,
 ): Record<string, unknown> {
+  if (decision.decision === "deny") {
+    const reason =
+      decision.classification === "requested"
+        ? classifyInstruction(harness, decision, context)
+        : decision.reason;
+    if (phase === "PermissionRequest")
+      return harness === "copilot"
+        ? {}
+        : {
+            hookSpecificOutput: {
+              hookEventName: phase,
+              decision: { behavior: "deny", message: reason },
+            },
+          };
+    return harness === "copilot"
+      ? { permissionDecision: "deny", permissionDecisionReason: reason }
+      : {
+          hookSpecificOutput: {
+            hookEventName: phase,
+            permissionDecision: "deny",
+            permissionDecisionReason: reason,
+          },
+        };
+  }
   if (harness === "copilot") {
     if (phase === "PermissionRequest")
       return decision.decision === "approve" ? { behavior: "allow" } : {};

@@ -8,6 +8,8 @@ export interface ReplayReport {
   commands: number;
   approved: number;
   strictApproved: number;
+  /** Escalations the AI classifier handles instead of a person (permissive profile only). */
+  classified: number;
   reasons: Array<{ reason: string; count: number; examples: string[] }>;
 }
 
@@ -33,7 +35,13 @@ function transcriptFiles(paths: string[], limit: number): string[] {
 export function replayTranscripts(paths: string[], profile: Profile, files = 50): ReplayReport {
   const seen = new Set<string>();
   const reasons = new Map<string, { count: number; examples: string[] }>();
-  const report: ReplayReport = { commands: 0, approved: 0, strictApproved: 0, reasons: [] };
+  const report: ReplayReport = {
+    commands: 0,
+    approved: 0,
+    strictApproved: 0,
+    classified: 0,
+    reasons: [],
+  };
   for (const file of transcriptFiles(paths, files))
     for (const line of readFileSync(file, "utf8").split("\n")) {
       if (!line.includes('"tool_use"')) continue;
@@ -68,6 +76,7 @@ export function replayTranscripts(paths: string[], profile: Profile, files = 50)
           report.approved++;
           continue;
         }
+        if (decision.tier === "ambiguous") report.classified++;
         const bucket = reasons.get(decision.reason) ?? { count: 0, examples: [] };
         bucket.count++;
         if (bucket.examples.length < 3)

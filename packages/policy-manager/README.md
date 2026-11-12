@@ -70,6 +70,35 @@ The session's policy-manager agent returns the following object for an ambiguous
 
 Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Explicitly listed metadata operations with permitted selectors can qualify through AI classification. Endpoint overrides and cloud writes cannot qualify. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
 
+## AI classification of ambiguous requests (experiment)
+
+Under a `permissive` profile, a person is asked only for what code says must stay with a person. Every other escalation is _ambiguous_: the deterministic engine cannot decide it, so the session's AI decides it instead of the person. Strict mode, and calls made outside the hooks (`policy-manager review`), are unchanged.
+
+How a hook call flows (Claude Code, Codex and Copilot `PreToolUse`):
+
+1. **First call.** The command is _not run_ and the person is not asked. The hook blocks it with a reason that tells the model to ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive, to record the answer with `policy-manager classify`, and to retry the same command.
+2. **Classified.** `classify` takes `{requestHash, category, confidence, recoverable, rationale}`. The request is approved only when `recoverable` is `true`, `confidence` is at least 0.95, and the category is not `sensitive`, `destructive` or `unknown`. Anything else is a **deny with a reason** the model sees and works around. No person is involved either way. The outcome is remembered for five minutes for that exact request.
+3. **Fallback.** If the classifier is unavailable or its answer is invalid, the retry reaches a person through the normal prompt. This happens at most once per request, so there is never a loop and never a lost prompt. After 50 AI approvals in a session, further ambiguous requests go to a person.
+
+**What always stays with a person, in code, and is never AI-relaxable** (these are the owner's calls; they list exactly what this experiment does not change):
+
+- Credential and secret retrieval, protected paths and configuration such as the policy profile and hook settings (category `sensitive`).
+- Destructive operations: unrecoverable deletion, unmerged-work loss, cloud deletion (category `destructive`).
+- Commands matching the profile's `humanPatterns`.
+- Writes outside a linked feature worktree (main clones and protected branches).
+- Cloud operations outside the read catalog. The profile's `cloudWrites: "allow"` is the way to automate these.
+- Requests the engine cannot trust: incomplete or invalid requests, a different execution directory, unrecognized patches, and environment or loader overrides such as `LD_PRELOAD`.
+
+**Known weakness.** The classifier is the working model's own policy-manager agent, and the working model records its answer, so a model that wanted to approve itself could. Confidence is self-reported. This is why the experiment records everything and is reviewed after two days of use rather than trusted.
+
+**Recording.** The audit log gets `classification-requested` (with the command, redacted: secret-looking values, URL credentials and long tokens are replaced and the text is capped), `classification` (category, confidence, recoverable, redacted rationale), `decision` (with the stage `requested`, `approved`, `denied` or `fallback`), and `classification-fallback` (with the reason `unavailable`, `invalid-result` or `limit`). Review them across sessions:
+
+```sh
+policy-manager review-classifications [--since 2026-11-12T00:00:00Z] [--json]
+```
+
+The report shows how many ambiguous requests were approved, denied, fell back to a person (and why), and never resolved; a confidence histogram; every AI-approved command with its outcome; approved commands that then failed; and commands a person later denied. It reads the session logs under the temporary directory, which the operating system clears after a few days, so run it within two days of starting. `replay` prints how many escalations in recorded transcripts would go to the classifier instead of a person.
+
 ## Policy
 
 - Ordinary file reads must resolve inside a Git repository.

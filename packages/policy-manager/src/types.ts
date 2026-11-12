@@ -18,15 +18,27 @@ export interface Classification {
   category: Category;
   confidence: number;
   requestHash: string;
+  /** Whether the action can be undone (merged work, tracked files, anything a backup restores). */
+  recoverable?: boolean;
+  /** Short free-text reason from the classifier; capped and redacted before it is logged. */
+  rationale?: string;
 }
+/** Where an ambiguous request stands in the AI classification flow. */
+export type ClassificationStage = "requested" | "approved" | "denied" | "fallback";
 export interface Decision {
-  decision: "approve" | "human";
+  /** `deny` is a decision the model sees and works around; `human` asks the person. */
+  decision: "approve" | "human" | "deny";
   category: Category;
   reason: string;
   requestHash: string;
   cache: "none" | "session";
   cached: boolean;
   needsClassification?: boolean;
+  /** `ambiguous`: the deterministic engine could not decide and nothing in code forbids it. */
+  tier?: "ambiguous";
+  classification?: ClassificationStage;
+  /** Why a human was asked after classification could not decide. */
+  fallbackReason?: "unavailable" | "invalid-result" | "limit";
   ai?: Classification;
 }
 
