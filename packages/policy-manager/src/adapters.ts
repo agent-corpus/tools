@@ -19,16 +19,32 @@ export interface HookContext {
   cliPath: string;
   sessionId: string;
 }
+/**
+ * The exact command the model is told to run to record a classification. A here-string, not a
+ * pipe: `printf ... | node ...` is "piping into an interpreter" and is itself escalated, so the
+ * round trip could never finish. A test evaluates this exact string and requires `approve`.
+ */
+export function classifyCommand(
+  harness: Request["harness"],
+  context?: HookContext,
+  json = "<json>",
+): string {
+  const safe =
+    context &&
+    /^[^"$`\\\n']+$/.test(context.cliPath) &&
+    /^[A-Za-z0-9_.-]+$/.test(context.sessionId);
+  return safe
+    ? `node "${context.cliPath}" classify ${harness} ${context.sessionId} <<< '${json}'`
+    : `policy-manager classify ${harness} <session-id> <<< '${json}'`;
+}
 /** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
 function classifyInstruction(
   harness: Request["harness"],
   decision: Decision,
   context?: HookContext,
 ): string {
-  const command = context
-    ? `printf '%s' '<json>' | node "${context.cliPath}" classify ${harness} ${context.sessionId}`
-    : "policy-manager classify";
-  return `Not run yet: this request needs classification before it can run (request ${decision.requestHash}; ${decision.reason}). Ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive. It answers with {"requestHash":"${decision.requestHash}","category":"code-read|worktree-write|cloud-read|git-read|impactful-write|destructive|sensitive|unknown","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record that answer with: ${command} and then retry the same command unchanged. If you cannot get a classification, retry once and the user will be asked.`;
+  const command = classifyCommand(harness, context);
+  return `Not run yet: this request needs classification before it can run (request ${decision.requestHash}; ${decision.reason}). Ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive. It answers with {"requestHash":"${decision.requestHash}","category":"code-read|worktree-write|cloud-read|git-read|impactful-write|destructive|sensitive|unknown","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record that answer with this command, replacing <json> with the answer and using no single quotes in it: ${command} Then retry the same command unchanged. If you cannot get a classification, retry once and the user will be asked.`;
 }
 export function hookResponse(
   harness: Request["harness"],

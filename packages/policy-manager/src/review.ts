@@ -3,6 +3,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog, type AuditRecord } from "@agent-corpus/audit-log";
 
+/** One classification the AI gave for a request. A request can have several (a replay). */
+export interface Attempt {
+  time: string;
+  category?: string;
+  confidence?: number;
+  recoverable?: boolean;
+  rationale?: string;
+  /** `invalid` when the answer was rejected before it could decide anything. */
+  outcome: "approved" | "denied" | "invalid";
+}
+
 /** One ambiguous request, followed through classification to its outcome. */
 export interface ClassifiedRequest {
   session: string;
@@ -10,10 +21,8 @@ export interface ClassifiedRequest {
   time: string;
   command?: string;
   reason?: string;
-  category?: string;
-  confidence?: number;
-  recoverable?: boolean;
-  rationale?: string;
+  /** Every classification, in order. Later ones never overwrite earlier ones. */
+  attempts: Attempt[];
   /** What happened to the request: `approved`/`denied` by the AI, `human` after a fallback. */
   outcome: "approved" | "denied" | "fallback" | "unresolved";
   fallbackReason?: string;
@@ -36,6 +45,10 @@ export interface ClassificationReview {
   aiDenied: ClassifiedRequest[];
   approvedButFailed: ClassifiedRequest[];
   humanDenied: ClassifiedRequest[];
+  /** Requests classified more than once. A replay is the signal a risk review looks for first. */
+  reclassified: ClassifiedRequest[];
+  /** Requests the AI denied and later approved. */
+  deniedThenApproved: ClassifiedRequest[];
 }
 
 const BUCKETS: Array<[string, number, number]> = [
@@ -102,6 +115,7 @@ export async function reviewClassifications(
           session: record.sessionId,
           requestHash: record.requestId,
           time: record.timestamp,
+          attempts: [],
           outcome: "unresolved",
         };
         byRequest.set(record.requestId, value);
@@ -125,19 +139,25 @@ export async function reviewClassifications(
       } else if (record.eventName === "classification") {
         const value = entry(record);
         if (!value) continue;
+        const attempt: Attempt = { time: record.timestamp, outcome: "invalid" };
         const category = text(a.category);
-        if (category) value.category = category;
+        if (category) attempt.category = category;
         const confidence = num(a.confidence);
-        if (confidence !== undefined) value.confidence = confidence;
-        if (typeof a.recoverable === "boolean") value.recoverable = a.recoverable;
+        if (confidence !== undefined) attempt.confidence = confidence;
+        if (typeof a.recoverable === "boolean") attempt.recoverable = a.recoverable;
         const rationale = text(a.rationale);
-        if (rationale) value.rationale = rationale;
+        if (rationale) attempt.rationale = rationale;
+        value.attempts.push(attempt);
       } else if (record.eventName === "decision") {
         const value = entry(record);
         if (!value) continue;
-        if (a.classification === "approved") value.outcome = "approved";
-        else if (a.classification === "denied") value.outcome = "denied";
-        else if (a.classification === "fallback") value.outcome = "fallback";
+        const latest = value.attempts.at(-1);
+        if (a.classification === "approved" || a.classification === "denied") {
+          // The decision that follows a classification settles that attempt; a retry's decision
+          // repeats the same outcome and changes nothing.
+          if (latest?.outcome === "invalid") latest.outcome = a.classification;
+          value.outcome = a.classification;
+        } else if (a.classification === "fallback") value.outcome = "fallback";
       } else if (record.eventName === "classification-fallback") {
         const value = entry(record);
         if (!value) continue;
@@ -176,9 +196,10 @@ export async function reviewClassifications(
     fallbackRate: requests.length ? fallback.length / requests.length : 0,
     histogram: BUCKETS.map(([range, low, high]) => ({
       range,
-      count: requests.filter(
-        (r) => r.confidence !== undefined && r.confidence >= low && r.confidence < high,
-      ).length,
+      count: requests
+        .flatMap((r) => r.attempts)
+        .filter((t) => t.confidence !== undefined && t.confidence >= low && t.confidence < high)
+        .length,
     })),
     aiApproved: approved,
     aiDenied: denied,
@@ -189,6 +210,11 @@ export async function reviewClassifications(
           (r.execution.exitCode !== undefined && r.execution.exitCode !== 0)),
     ),
     humanDenied: requests.filter((r) => r.humanResponse === "denied"),
+    reclassified: requests.filter((r) => r.attempts.length > 1),
+    deniedThenApproved: requests.filter((r) => {
+      const first = r.attempts.findIndex((t) => t.outcome === "denied");
+      return first >= 0 && r.attempts.slice(first + 1).some((t) => t.outcome === "approved");
+    }),
   };
 }
 
@@ -196,7 +222,13 @@ function row(r: ClassifiedRequest): string {
   const outcome = r.execution
     ? ` -> ${r.execution.status ?? "ran"}${r.execution.exitCode !== undefined ? ` (exit ${r.execution.exitCode})` : ""}`
     : "";
-  return `  ${r.time}  ${r.category ?? "?"} ${r.confidence ?? "?"} recoverable=${r.recoverable ?? "?"}\n    ${r.command ?? r.requestHash}${outcome}${r.rationale ? `\n    why: ${r.rationale}` : ""}`;
+  const attempts = r.attempts
+    .map(
+      (t, i) =>
+        `    ${r.attempts.length > 1 ? `attempt ${i + 1}: ` : ""}${t.outcome} ${t.category ?? "?"} ${t.confidence ?? "?"} recoverable=${t.recoverable ?? "?"}${t.rationale ? ` why: ${t.rationale}` : ""}`,
+    )
+    .join("\n");
+  return `  ${r.time}  ${r.command ?? r.requestHash}${outcome}${attempts ? `\n${attempts}` : ""}`;
 }
 
 export function formatReview(review: ClassificationReview): string {
@@ -215,6 +247,12 @@ export function formatReview(review: ClassificationReview): string {
     "",
     "Confidence histogram (classifier self-report):",
     ...review.histogram.map((b) => `  ${b.range}  ${b.count}`),
+    "",
+    `Requests classified more than once (${review.reclassified.length}):`,
+    ...review.reclassified.map(row),
+    "",
+    `AI-denied, then approved on a later classification (${review.deniedThenApproved.length}):`,
+    ...review.deniedThenApproved.map(row),
     "",
     `AI-approved commands that failed (${review.approvedButFailed.length}):`,
     ...review.approvedButFailed.map(row),

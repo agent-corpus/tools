@@ -1,9 +1,10 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { hookResponse } from "../src/adapters.js";
+import { classifyCommand, hookResponse } from "../src/adapters.js";
+import { audit } from "../src/audit.js";
 import { evaluate, hash } from "../src/policy.js";
 import { parseProfile } from "../src/profile.js";
 import { redactText } from "../src/redact.js";
@@ -140,13 +141,33 @@ describe("hint and retry flow", () => {
   test("a session cap on AI approvals sends the rest to a human", () => {
     const { session: s } = session();
     let last = s.review(ambiguous(), undefined);
+    let limited = ambiguous();
     for (let i = 0; i <= MAX_AI_APPROVALS; i++) {
       const r = ambiguous();
+      limited = r;
       s.review(r, undefined, "PreToolUse");
       last = s.classify(verdict(r));
     }
     expect(last.decision).toBe("human");
     expect(last.fallbackReason).toBe("limit");
+    // The limit is part of the remembered outcome: the retry must not run without a person.
+    const retried = s.review(limited, undefined, "PreToolUse");
+    expect(retried.decision).toBe("human");
+    expect(retried.fallbackReason).toBe("limit");
+  });
+
+  test("a verdict is final: a deny cannot be reclassified, and an approval cannot be replaced", () => {
+    const { session: s } = session();
+    const denied = ambiguous();
+    s.review(denied, undefined, "PreToolUse");
+    expect(s.classify(verdict(denied, { recoverable: false })).decision).toBe("deny");
+    expect(() => s.classify(verdict(denied, { confidence: 0.99 }))).toThrow();
+    expect(s.review(denied, undefined, "PreToolUse").decision).toBe("deny");
+    const approved = ambiguous();
+    s.review(approved, undefined, "PreToolUse");
+    s.classify(verdict(approved));
+    expect(() => s.classify(verdict(approved, { recoverable: false }))).toThrow();
+    expect(s.review(approved, undefined, "PreToolUse").decision).toBe("approve");
   });
 
   test("calls outside a hook, and strict mode, behave as before", () => {
@@ -222,6 +243,23 @@ describe("recording", () => {
     expect(redactText("tool --api-key abc123 run")).toBe("tool --api-key [REDACTED] run");
     expect(redactText("DB_PASSWORD=x run")).toBe("DB_PASSWORD=[REDACTED] run");
     expect(redactText(`echo ${"a".repeat(40)}`)).toBe("echo [REDACTED]");
+    expect(redactText('curl -H "X-Api-Key: abc123" x')).toBe('curl -H "X-Api-Key: [REDACTED]" x');
+    expect(redactText('curl -H "Authorization: Bearer abc123" x')).toBe(
+      'curl -H "Authorization: [REDACTED]" x',
+    );
+    expect(redactText("curl -H Authorization: Bearer abc123 x")).toBe(
+      "curl -H Authorization: Bearer [REDACTED] x",
+    );
+    expect(redactText("mysql -pS3cretPass db")).toBe("mysql -p[REDACTED] db");
+    expect(redactText("curl -u user:pass https://h/x")).toBe("curl -u [REDACTED] https://h/x");
+    expect(redactText('tool --password "two words" run')).toBe("tool --password [REDACTED] run");
+    expect(redactText('tool --password="two words" run')).toBe("tool --password=[REDACTED] run");
+    expect(redactText("git commit --author=x --message hi")).toBe(
+      "git commit --author=x --message hi",
+    );
+    expect(redactText("tool --auth-token=abc --auth=def")).toBe(
+      "tool --auth-token=[REDACTED] --auth=[REDACTED]",
+    );
     expect(redactText("curl https://u:p@host.example/a/b?token=1#f")).toBe(
       "curl https://[REDACTED]@host.example/a/b?[REDACTED]",
     );
@@ -271,6 +309,100 @@ describe("recording", () => {
     const text = formatReview(review);
     expect(text).toContain("AI approved:        1");
     expect(text).toContain("echo $APPROVED");
+  });
+});
+
+describe("the classify round trip", () => {
+  const installed = join(
+    homedir(),
+    ".local/share/agent-corpus/policy-manager/0.5.0/lib/node_modules/@agent-corpus/policy-manager/dist/cli.js",
+  );
+  const answer =
+    '{"requestHash":"abc","category":"code-read","confidence":0.97,"recoverable":true,"rationale":"prints a variable"}';
+  for (const harness of ["claude", "codex", "copilot"] as const)
+    for (const cliPath of ["/opt/cli.js", installed]) {
+      test(`the instructed command is approved by the policy itself (${harness}, ${cliPath.slice(-24)})`, () => {
+        const command = classifyCommand(harness, { cliPath, sessionId: "s1" }, answer);
+        expect(command).toContain("classify");
+        const d = evaluate({ ...request(command), harness }, undefined, permissive);
+        expect(d.decision).toBe("approve");
+        expect(d.tier).toBeUndefined();
+      });
+    }
+  test("the hook's instruction contains exactly that command", () => {
+    const { session: s } = session();
+    const d = s.review(ambiguous(), undefined, "PreToolUse");
+    const out = JSON.stringify(
+      hookResponse("claude", "PreToolUse", d, { cliPath: installed, sessionId: "s1" }),
+    );
+    const command = classifyCommand("claude", { cliPath: installed, sessionId: "s1" });
+    expect(out).toContain(JSON.stringify(command).slice(1, -1));
+  });
+  test("a path or session id that cannot be quoted safely falls back to a generic command", () => {
+    expect(classifyCommand("claude", { cliPath: '/x"y/cli.js', sessionId: "s1" })).toContain(
+      "policy-manager classify",
+    );
+    expect(classifyCommand("claude", { cliPath: "/ok/cli.js", sessionId: "a b;rm" })).toContain(
+      "<session-id>",
+    );
+  });
+});
+
+describe("review history", () => {
+  test("a deny that was later approved is reported, with both attempts kept", async () => {
+    const directory = join(root, `history-${counter++}`);
+    mkdirSync(directory, { mode: 0o700 });
+    const requestHash = "d".repeat(64);
+    audit(directory, {
+      event: "classification-requested",
+      requestHash,
+      redactedCommand: "echo $X",
+      reason: "r",
+    });
+    audit(directory, {
+      event: "classification",
+      requestHash,
+      category: "impactful-write",
+      confidence: 0.8,
+      recoverable: false,
+    });
+    audit(directory, {
+      event: "decision",
+      requestHash,
+      decision: "deny",
+      classification: "denied",
+    });
+    audit(directory, {
+      event: "classification",
+      requestHash,
+      category: "code-read",
+      confidence: 0.99,
+      recoverable: true,
+    });
+    audit(directory, {
+      event: "decision",
+      requestHash,
+      decision: "approve",
+      classification: "approved",
+    });
+    audit(directory, {
+      event: "decision",
+      requestHash,
+      decision: "approve",
+      classification: "approved",
+    });
+    const review = await reviewClassifications([directory]);
+    const [only] = review.aiApproved;
+    expect(only?.attempts.map((t) => [t.outcome, t.confidence])).toEqual([
+      ["denied", 0.8],
+      ["approved", 0.99],
+    ]);
+    expect(review.deniedThenApproved).toHaveLength(1);
+    expect(review.reclassified).toHaveLength(1);
+    expect(review.histogram.reduce((n, b) => n + b.count, 0)).toBe(2);
+    expect(formatReview(review)).toContain(
+      "AI-denied, then approved on a later classification (1)",
+    );
   });
 });
 

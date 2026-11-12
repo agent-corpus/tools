@@ -15,6 +15,8 @@ interface ClassificationState {
   requested: boolean;
   invalid: boolean;
   fallback: boolean;
+  /** The session cap on AI approvals was reached when this request was classified. */
+  limited: boolean;
   ai?: Classification;
 }
 
@@ -22,7 +24,8 @@ export class PolicySession {
   private cache = new Map<string, { expires: number; ai?: Classification }>();
   private pending = new Map<string, Request>();
   private states = new Map<string, ClassificationState>();
-  private aiApprovals = 0;
+  /** Requests the AI approved, counted once each however often they are retried. */
+  private approvedByAi = new Set<string>();
   constructor(
     readonly directory: string,
     readonly harness: string,
@@ -43,6 +46,7 @@ export class PolicySession {
       requested: false,
       invalid: false,
       fallback: false,
+      limited: false,
       ...this.states.get(requestHash),
       ...change,
       expires: Date.now() + CLASSIFICATION_TTL_MS,
@@ -101,9 +105,14 @@ export class PolicySession {
     let decision = evaluate(request, ai ?? cachedAi ?? known?.ai, this.profile);
     if (decision.tier === "ambiguous") {
       if (ai && !decision.classification) this.remember(requestHash, { invalid: true });
-      else if (ai) this.remember(requestHash, { ai });
-      if (decision.classification === "approved" && ai) {
-        if (this.aiApprovals >= MAX_AI_APPROVALS)
+      else if (ai) {
+        // The cap is checked when the approval is first given and stored with the outcome, so a
+        // retry cannot turn a limited request into an approval.
+        if (
+          decision.classification === "approved" &&
+          !this.approvedByAi.has(requestHash) &&
+          this.approvedByAi.size >= MAX_AI_APPROVALS
+        ) {
           decision = {
             ...decision,
             decision: "human",
@@ -111,7 +120,11 @@ export class PolicySession {
             fallbackReason: "limit",
             reason: "Session limit on AI approvals reached; a human decides",
           };
-        else this.aiApprovals++;
+          this.remember(requestHash, { limited: true });
+        } else {
+          if (decision.classification === "approved") this.approvedByAi.add(requestHash);
+          this.remember(requestHash, { ai });
+        }
       }
       if (decision.needsClassification && !ai && phase === "PreToolUse") {
         if (!known?.requested) {
@@ -128,7 +141,11 @@ export class PolicySession {
           });
           decision = { ...decision, decision: "deny", classification: "requested" };
         } else {
-          const fallbackReason = known.invalid ? "invalid-result" : "unavailable";
+          const fallbackReason = known.limited
+            ? "limit"
+            : known.invalid
+              ? "invalid-result"
+              : "unavailable";
           if (!known.fallback) {
             this.remember(requestHash, { fallback: true });
             audit(this.directory, {
@@ -153,8 +170,10 @@ export class PolicySession {
         });
       }
     }
+    // A denied request is final for its remembered state: only a human decision or a request
+    // still waiting for its first classification can be classified.
     if (
-      decision.decision !== "approve" &&
+      (decision.decision === "human" || decision.classification === "requested") &&
       (["unknown", "cloud-read"].includes(decision.category) || decision.needsClassification) &&
       !ai
     ) {
@@ -217,6 +236,9 @@ export class PolicySession {
   classify(classification: Classification): Decision {
     const request = this.pending.get(classification.requestHash);
     if (!request) throw new Error("No pending request matches the classification");
+    // One classification per request: a verdict, deny or approve, cannot be replaced.
+    if (this.state(classification.requestHash)?.ai)
+      throw new Error("The request is already classified");
     this.pending.delete(classification.requestHash);
     try {
       return this.review(request, classification);
