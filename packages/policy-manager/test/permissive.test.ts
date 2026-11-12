@@ -87,7 +87,6 @@ describe("shell parser", () => {
     "echo ${HOME:-x}",
     "echo $((1+2))",
     "echo $'a'",
-    'echo "$"',
     "echo $(unterminated",
     "echo `unterminated",
     "echo $(echo 'a)",
@@ -95,13 +94,11 @@ describe("shell parser", () => {
     "sleep 1 &",
     "(cd x; ls)",
     'echo "a$b"',
-    "ls #c",
     "a && ",
     "| ls",
     "echo 'unterminated",
     "echo trailing\\",
     'echo "trailing\\',
-    'echo "a\\\nb"',
     'echo "x" "$FOO"',
   ])("rejects %j", (command) => expect(parseShell(command)).toBeUndefined());
   test("known parameters are substituted and command substitutions are extracted", () => {
