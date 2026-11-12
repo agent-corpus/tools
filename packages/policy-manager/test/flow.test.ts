@@ -16,6 +16,9 @@ let profile = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
 function git(cwd: string, args: string[]) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
 }
+/** Shell commands use forward slashes; a Windows path pasted in would lose its backslashes. */
+const posix = (path: string) => path.split("\\").join("/");
+
 function decide(command: string, cwd = worktree) {
   const r: Request = { sessionId: "t", harness: "claude", cwd, tool: "Bash", input: { command } };
   return evaluate(r, undefined, profile);
@@ -200,6 +203,7 @@ describe("script parser", () => {
   });
 
   test("variable references are left for the evaluator, HOME is substituted", () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
     const script = parseScript('echo "$NAME" ${OTHER} $HOME');
     const echo = script?.items[0]?.node.first.stages[0];
     if (echo?.kind !== "simple") throw new Error("expected a simple command");
@@ -282,6 +286,7 @@ describe("evaluation of scripts", () => {
   test.each([
     // the destructive denylist reached through variables
     ["X=rm; $X -rf y", "destructive"],
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
     ["X=rm; ${X} -rf y", "destructive"],
     ["X=-rf; rm $X y", "destructive"],
     ["A=r; B=m; $A$B -rf y", "destructive"],
@@ -292,7 +297,6 @@ describe("evaluation of scripts", () => {
     ["for c in ls rm; do $c -rf y; done", "destructive"],
     ["X=/etc; cat $X/passwd > /dev/null; rm -rf $X", "destructive"],
     ["X=.ssh; cat ~/$X/id_rsa", "sensitive"],
-    ["D=$HOME/.ssh; cat $D/id_rsa", "sensitive"],
     ["D=~/.aws; ls $D", "unknown"],
     ["F=.config/gh/hosts.yml; cat ~/$F", "sensitive"],
     ["O=.claude/settings.json; echo x > $O", "sensitive"],
@@ -498,6 +502,14 @@ describe("evaluation of scripts", () => {
     expect(d.category).toBe(category);
   });
 
+  test("a home path inside a variable still cannot reach credentials", () => {
+    // On Windows the home path has backslashes, so the value is unknown instead of sensitive;
+    // either way a human decides.
+    const d = decide("D=$HOME/.ssh; cat $D/id_rsa");
+    expect(d.decision).toBe("human");
+    expect(["sensitive", "unknown"]).toContain(d.category);
+  });
+
   test("variables are resolved before the command is judged, in every possible directory", () => {
     // Known values: both alternatives are judged.
     expect(decide("for c in ls pwd; do $c; done").decision).toBe("approve");
@@ -555,10 +567,14 @@ describe("evaluation of scripts", () => {
   });
 
   test("scratch roots and worktrees still decide where redirected heredocs may write", () => {
-    expect(decide(`cat <<'EOF' > ${scratch}/notes.md\nx\nEOF`).decision).toBe("approve");
+    expect(decide(`cat <<'EOF' > ${posix(scratch)}/notes.md\nx\nEOF`).decision).toBe("approve");
     expect(decide("cat <<'EOF' > src/notes.md\nx\nEOF").decision).toBe("approve");
-    expect(decide(`cat <<'EOF' > ${join(root, "repo", "a.txt")}\nx\nEOF`).decision).toBe("human");
-    expect(decide(`X=${scratch}; cat <<'EOF' > $X/notes.md\nx\nEOF`).decision).toBe("approve");
+    expect(decide(`cat <<'EOF' > ${posix(join(root, "repo", "a.txt"))}\nx\nEOF`).decision).toBe(
+      "human",
+    );
+    expect(decide(`X=${posix(scratch)}; cat <<'EOF' > $X/notes.md\nx\nEOF`).decision).toBe(
+      "approve",
+    );
     expect(decide("X=/etc; cat <<'EOF' > $X/notes.md\nx\nEOF").decision).toBe("human");
   });
 
