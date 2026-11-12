@@ -8,19 +8,34 @@ const TOKEN_PREFIX =
   /^(?:gh[pousr]_|github_pat_|sk-|xox[baprs]-|AKIA|ASIA|AIza|eyJ|glpat-|npm_|shpat_)/;
 const LONG_OPAQUE = /^[A-Za-z0-9+/=_-]{32,}$/;
 
-function redactWord(word: string): string {
-  if (TOKEN_PREFIX.test(word) || LONG_OPAQUE.test(word)) return "[REDACTED]";
+function redactUrl(word: string): string {
   // `https://user:pass@host/x?token=1` keeps the host and path but loses userinfo and query values.
-  const url = word.match(/^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*@)?([^?#]*)(\?[^#]*)?(#.*)?$/i);
-  if (url) return `${url[1]}${url[2] ? "[REDACTED]@" : ""}${url[3]}${url[4] ? "?[REDACTED]" : ""}`;
+  // Parsed by position rather than one regular expression, so hostile input cannot backtrack.
+  const scheme = word.match(/^[a-z][a-z0-9+.-]*:\/\//i)?.[0];
+  if (scheme) {
+    const rest = word.slice(scheme.length);
+    const cut = rest.search(/[?#]/);
+    const head = cut < 0 ? rest : rest.slice(0, cut);
+    const slash = head.indexOf("/");
+    const authority = slash < 0 ? head : head.slice(0, slash);
+    const path = slash < 0 ? "" : head.slice(slash);
+    const at = authority.lastIndexOf("@");
+    const host = at < 0 ? authority : `[REDACTED]@${authority.slice(at + 1)}`;
+    return `${scheme}${host}${path}${cut >= 0 && rest[cut] === "?" ? "?[REDACTED]" : ""}`;
+  }
   return word;
+}
+function redactWord(word: string): string {
+  return TOKEN_PREFIX.test(word) || LONG_OPAQUE.test(word) ? "[REDACTED]" : word;
 }
 
 /** Redacts a shell command or other free text, keeping it recognisable and at most `max` long. */
 export function redactText(text: string, max = 300): string {
   const words = text.split(/(\s+)/);
   let hideNext = false;
-  const out = words.map((piece) => {
+  const out = words.map((raw) => {
+    // URL credentials first: a `?token=` in the query must not hide userinfo before it.
+    const piece = redactUrl(raw);
     if (/^\s*$/.test(piece)) return piece;
     if (hideNext) {
       // `Authorization: Bearer abc` carries the secret in the word after the scheme.

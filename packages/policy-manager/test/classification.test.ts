@@ -222,6 +222,13 @@ describe("recording", () => {
     expect(redactText("tool --api-key abc123 run")).toBe("tool --api-key [REDACTED] run");
     expect(redactText("DB_PASSWORD=x run")).toBe("DB_PASSWORD=[REDACTED] run");
     expect(redactText(`echo ${"a".repeat(40)}`)).toBe("echo [REDACTED]");
+    expect(redactText("curl https://u:p@host.example/a/b?token=1#f")).toBe(
+      "curl https://[REDACTED]@host.example/a/b?[REDACTED]",
+    );
+    const hostile = `a://${'@"'.repeat(20000)}`;
+    const started = Date.now();
+    redactText(hostile, 100);
+    expect(Date.now() - started).toBeLessThan(500);
     expect(redactText("ab ".repeat(100), 50)).toHaveLength(51);
   });
 
