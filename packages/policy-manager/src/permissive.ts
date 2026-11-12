@@ -1,17 +1,18 @@
-import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import {
   branchEvidence,
   canonical,
   inside,
   isProtectedPath,
   pathEvidence,
+  protectedPath,
   sensitive,
 } from "./evidence.js";
+import { commandDecision } from "./flow.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result } from "./policy.js";
 import type { Profile } from "./profile.js";
-import { parseShell, type SimpleCommand, SUBSTITUTION } from "./shell.js";
+import { type Redirect, type SimpleCommand, SUBSTITUTION } from "./shell.js";
 import type { Decision, Request } from "./types.js";
 
 /**
@@ -75,12 +76,78 @@ const SUBSTITUTION_OK = new Set([
   "basename",
   "dirname",
 ]);
-const MAX_SUBSTITUTION_DEPTH = 3;
-const BANNED_ENV =
-  /^(?:LD_|DYLD_|GIT_|PYTHON|NODE_OPTIONS$|PATH$|HOME$|BASH_ENV$|ENV$|SHELL$|PAGER$|EDITOR$|GH_TOKEN$|GITHUB_TOKEN$)/;
+// Variables that change how later commands are found, split or started. Assigning one, as a prefix
+// or on its own, needs a human.
+export const BANNED_ENV =
+  /^(?:LD_|DYLD_|GIT_|PYTHON|NODE_OPTIONS$|PATH$|HOME$|BASH_ENV$|ENV$|SHELL$|PAGER$|EDITOR$|GH_TOKEN$|GITHUB_TOKEN$|IFS$|PS4$|PROMPT_COMMAND$|CDPATH$|GLOBIGNORE$|BASHOPTS$|SHELLOPTS$|BASH_XTRACEFD$|FPATH$|ZDOTDIR$|BASH_FUNC_)/;
+/** Runs arbitrary statements on another machine or database, so its argument is not judged. */
+const REMOTE_EXECUTORS = new Set([
+  "ssh",
+  "psql",
+  "mysql",
+  "mariadb",
+  "sqlite3",
+  "sqlcmd",
+  "mongo",
+  "mongosh",
+  "redis-cli",
+  "cqlsh",
+  "sqlplus",
+]);
+/** Builtins that run a string later or change how later commands behave. */
+const STATE_BUILTINS = new Set([
+  "trap",
+  "alias",
+  "unalias",
+  "builtin",
+  "enable",
+  "declare",
+  "typeset",
+  "local",
+  "readonly",
+  "let",
+  "mapfile",
+  "readarray",
+  "getopts",
+  "coproc",
+  "fc",
+  "history",
+  // zsh precommand modifiers and builtins that run a command or string
+  "noglob",
+  "nocorrect",
+  "repeat",
+  "emulate",
+  "sched",
+  "zmodload",
+  "autoload",
+  "integer",
+  "float",
+  "functions",
+  "-",
+]);
+/**
+ * Options whose next word is a value, not a flag or path, so an unknown (but single, quoted) word
+ * there cannot change what the command does: commit and PR messages built with `$(cat <<EOF ...)`.
+ */
+const VALUE_OPTIONS: Record<string, Record<string, string[]>> = {
+  git: {
+    commit: ["-m", "--message"],
+    tag: ["-m", "--message"],
+    stash: ["-m", "--message"],
+  },
+  gh: {
+    "pr create": ["--title", "-t", "--body", "-b"],
+    "pr edit": ["--title", "-t", "--body", "-b"],
+    "pr comment": ["--body", "-b"],
+    "pr review": ["--body", "-b"],
+    "issue create": ["--title", "-t", "--body", "-b"],
+    "issue edit": ["--title", "-t", "--body", "-b"],
+    "issue comment": ["--body", "-b"],
+  },
+};
 const FORCE_PUSH = ["--force", "--force-with-lease", "--force-if-includes", "--mirror", "--prune"];
 
-function human(request: Request, category: Decision["category"], reason: string): Decision {
+export function human(request: Request, category: Decision["category"], reason: string): Decision {
   return result(request, category, reason);
 }
 
@@ -141,7 +208,7 @@ interface Unwrapped {
   refusal?: string;
 }
 
-function unwrap(argv: string[]): Unwrapped {
+export function unwrap(argv: string[]): Unwrapped {
   let current = argv;
   const env: string[] = [];
   for (let depth = 0; depth < 4; depth++) {
@@ -425,7 +492,84 @@ function cloudDecision(request: Request, argv: string[], profile: Profile): Deci
   return strict;
 }
 
-function simpleDecision(
+/** Judges one redirection's target in `cwd`; undefined means it is acceptable. */
+export function redirectDecision(
+  request: Request,
+  redirect: Redirect,
+  profile: Profile,
+  cwd: string,
+): Decision | undefined {
+  if (redirect.target.includes(SUBSTITUTION))
+    return human(request, "unknown", "Command substitution in a redirection requires human review");
+  // `>& word` duplicates a descriptor only when word is a number or `-`; otherwise it names a file.
+  if (
+    redirect.target === "/dev/null" ||
+    (redirect.op === ">&" && /^(?:[0-9]+|-)$/.test(redirect.target))
+  )
+    return undefined;
+  const check =
+    redirect.op === "<"
+      ? permissiveRead(cwd, redirect.target)
+      : permissiveWrite(cwd, redirect.target, profile);
+  return check.allowed ? undefined : human(request, check.category, check.reason);
+}
+
+/** printf formats with only %s, %b, %q and %%: no argument is evaluated as arithmetic. */
+function printfOnlyPrintsStrings(args: string[]): boolean {
+  const rest = args[0] === "-v" ? args.slice(2) : args;
+  const format = rest[0] === "--" ? rest[1] : rest[0];
+  if (format === undefined) return true;
+  if (format.includes(SUBSTITUTION) || format.includes("*")) return false;
+  for (const match of format.matchAll(/%[-+ #0-9.]*([A-Za-z%])/g))
+    if (!"sbq%".includes(match[1] as string)) return false;
+  return true;
+}
+
+/** The unknown words of `argv` that sit in a value position (see VALUE_OPTIONS), made literal. */
+function withOpaqueValues(argv: string[], loose: boolean[] | undefined): string[] {
+  const program = basename(argv[0] ?? "");
+  const table = VALUE_OPTIONS[program];
+  if (!table) return argv;
+  const first = program === "git" ? argv.findIndex((w, i) => i > 0 && !w.startsWith("-")) : 1;
+  const key = program === "git" ? (argv[first] ?? "") : `${argv[1] ?? ""} ${argv[2] ?? ""}`;
+  const options = table[key];
+  if (!options) return argv;
+  return argv.map((word, index) => {
+    if (index === 0 || !word.includes(SUBSTITUTION) || loose?.[index]) return word;
+    const previous = argv[index - 1] ?? "";
+    const valueOfPrevious =
+      !previous.includes(SUBSTITUTION) &&
+      (options.includes(previous) ||
+        (program === "git" && key === "commit" && /^-[A-Za-z]*m$/.test(previous)));
+    const inline = options.some(
+      (option) => option.startsWith("--") && word.startsWith(`${option}=`),
+    );
+    if (!valueOfPrevious && !(inline && !word.split("=")[0]?.includes(SUBSTITUTION))) return word;
+    return word.split(SUBSTITUTION).join("OPAQUE");
+  });
+}
+
+/**
+ * A best-effort scan of code an interpreter is about to run, which this policy cannot otherwise
+ * read: deleting files, starting processes, evaluating strings, and touching credential or
+ * protected paths. It is a denylist, not a proof, so anything it flags goes to a human.
+ */
+const DANGEROUS_CODE =
+  /\b(?:rmtree|removedirs|unlink|unlinkSync|rmdir|rmdirSync|rmSync|os\.remove|os\.removedirs|shutil\.move|child_process|execSync|spawnSync|spawn|subprocess|os\.system|os\.popen|os\.exec[a-z]*|eval|exec|compile|__import__|importlib|ctypes|socket|urlopen|requests\.(?:post|put|delete|patch)|fetch)\b|\bfs\.rm\b|\bPath\([^)]*\)\.(?:unlink|rmdir)|\brm\s+-/;
+
+function interpreterCodeRefusal(code: string): string | undefined {
+  if (DANGEROUS_CODE.test(code))
+    return "Interpreter code that deletes files, starts processes or evaluates strings requires human review";
+  for (const token of code.split(/[\s"'`()[\]{},;=<>|&]+/))
+    if (
+      (token.includes("/") || token.startsWith(".")) &&
+      (sensitive(token) || protectedPath(token))
+    )
+      return "Interpreter code that names a protected or credential path requires human review";
+  return undefined;
+}
+
+export function simpleDecision(
   request: Request,
   command: SimpleCommand,
   profile: Profile,
@@ -436,32 +580,17 @@ function simpleDecision(
   for (const [name] of command.env)
     if (BANNED_ENV.test(name))
       return human(request, "unknown", "Environment override requires human review");
-  for (const redirect of command.redirects)
-    if (redirect.target.includes(SUBSTITUTION))
-      return human(
-        request,
-        "unknown",
-        "Command substitution in a redirection requires human review",
-      );
   for (const redirect of command.redirects) {
-    // `>& word` duplicates a descriptor only when word is a number or `-`; otherwise it names a file.
-    if (
-      redirect.target === "/dev/null" ||
-      (redirect.op === ">&" && /^(?:[0-9]+|-)$/.test(redirect.target))
-    )
-      continue;
-    const check =
-      redirect.op === "<"
-        ? permissiveRead(cwd, redirect.target)
-        : permissiveWrite(cwd, redirect.target, profile);
-    if (!check.allowed) return human(request, check.category, check.reason);
+    const refusal = redirectDecision(request, redirect, profile, cwd);
+    if (refusal) return refusal;
   }
   const unwrapped = unwrap(command.argv);
   if (unwrapped.refusal) return human(request, "unknown", unwrapped.refusal);
   for (const name of unwrapped.env)
     if (BANNED_ENV.test(name))
       return human(request, "unknown", "Environment override requires human review");
-  const argv = unwrapped.argv;
+  const looseAfterWrappers = command.loose?.slice(command.argv.length - unwrapped.argv.length);
+  const argv = withOpaqueValues(unwrapped.argv, looseAfterWrappers);
   const program = basename(argv[0] ?? "");
   // Words a wrapper consumed (env assignments, options, durations) are gone from `argv`, but an
   // unquoted substitution in them can still split into extra words and pick a different program.
@@ -483,6 +612,25 @@ function simpleDecision(
       "Command substitution output is only accepted as an argument to echo, printf and similar",
     );
   const args = argv.slice(1);
+  // zsh and bash evaluate arithmetic in some builtins' operands, and a name such as `a[$(cmd)]`
+  // runs the command. An unknown value is therefore only safe where nothing is evaluated.
+  if (argv.some((word) => word.includes(SUBSTITUTION))) {
+    if (
+      (program === "test" || program === "[") &&
+      args.some((word) => /^(?:-eq|-ne|-lt|-le|-gt|-ge|-v|-R)$/.test(word))
+    )
+      return human(
+        request,
+        "unknown",
+        "An unknown value in a numeric or variable test requires human review",
+      );
+    if (program === "printf" && !printfOnlyPrintsStrings(args))
+      return human(
+        request,
+        "unknown",
+        "An unknown value in a printf with numeric conversions requires human review",
+      );
+  }
   const joined = argv.join(" ");
   if (profile.humanPatterns.some((pattern) => pattern.test(joined)))
     return human(request, "destructive", "Matches an organization human-approval pattern");
@@ -496,22 +644,49 @@ function simpleDecision(
   }
   if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
     return human(request, "destructive", "Destructive operation requires human approval");
+  if (REMOTE_EXECUTORS.has(program))
+    return human(request, "unknown", "Remote or database command execution requires human review");
+  if (STATE_BUILTINS.has(program))
+    return human(
+      request,
+      "unknown",
+      "A shell builtin that runs a string later or changes later commands requires human review",
+    );
+  // These print the whole environment, which can hold credentials.
+  if (program === "printenv" || program === "env" || (program === "set" && args.length === 0))
+    return human(request, "sensitive", "Printing the environment requires human review");
+  if (program === "set" && !args.every((word) => /^[-+][A-Za-z]+$|^pipefail$/.test(word)))
+    return human(request, "unknown", "Changing shell settings requires human review");
   if (SHELLS.has(program) || INTERPRETERS.has(program)) {
     if (stageIndex > 0)
       return human(request, "unknown", "Piping into a shell or interpreter requires human review");
     if (SHELLS.has(program)) {
       const inline = args.indexOf("-c");
-      const script = inline >= 0 ? args[inline + 1] : undefined;
+      // A shell fed by a heredoc runs exactly that text, so judge it as a script.
+      const script =
+        inline >= 0
+          ? args[inline + 1]
+          : (args.length === 0 || args.every((arg) => arg === "-" || arg === "-s")) &&
+              command.stdin !== undefined
+            ? command.stdin
+            : undefined;
       if (script === undefined || depth >= 2)
         return human(request, "unknown", "Shell invocation requires human review");
       return commandDecision(request, script, profile, depth + 1, [cwd]);
     }
-    if (args.length === 0 || args[0] === "-")
+    // Inline code and a heredoc body are both literal text, so both can be read. Code piped in
+    // from elsewhere cannot.
+    const fromStdin = args.length === 0 || args[0] === "-";
+    const inlineAt = args.findIndex((arg) => ["-c", "-e", "-p", "--eval", "--print"].includes(arg));
+    const code = fromStdin ? command.stdin : inlineAt >= 0 ? args[inlineAt + 1] : undefined;
+    if (fromStdin && code === undefined)
       return human(
         request,
         "unknown",
         "Interpreter reading code from standard input requires human review",
       );
+    const unsafe = code === undefined ? undefined : interpreterCodeRefusal(code);
+    if (unsafe) return human(request, "unknown", unsafe);
   }
   if (
     program === "xargs" &&
@@ -593,67 +768,4 @@ function simpleDecision(
   );
 }
 
-const MAX_DIRECTORIES = 8;
-
-/**
- * Evaluates a compound command. `cd <literal>` is tracked: every later command is judged in each
- * directory it could run in (before and after the `cd`, since `cd x || ...` may fail), so a command
- * that only looks safe relative to the starting directory cannot hide behind a `cd`.
- */
-export function commandDecision(
-  request: Request,
-  command: string,
-  profile: Profile,
-  depth = 0,
-  start: string[] = [request.cwd],
-): Decision {
-  const pipelines = parseShell(command);
-  if (!pipelines)
-    return human(
-      request,
-      "unknown",
-      "Unsupported shell syntax; expansions and subshells need human review",
-    );
-  let cwds = [...start];
-  let last: Decision | undefined;
-  for (const pipeline of pipelines)
-    for (const [index, simple] of pipeline.entries()) {
-      // Command substitutions run before the command, in the directories it could start from.
-      for (const inner of simple.subs) {
-        if (depth >= MAX_SUBSTITUTION_DEPTH)
-          return human(request, "unknown", "Command substitutions are nested too deeply");
-        const own = commandDecision(request, inner, profile, depth + 1, cwds);
-        if (own.decision !== "approve") return own;
-      }
-      if (basename(simple.argv[0] ?? "") === "cd") {
-        const target = simple.argv.slice(1).filter((word) => word !== "--");
-        // A bare `cd` and `~` or `~/x` go to the home directory; `~user` and `-` stay with a human.
-        const raw = target.length === 0 ? "~" : target[0];
-        const word = raw === "~" || raw?.startsWith("~/") ? join(homedir(), raw.slice(1)) : raw;
-        if (
-          target.length > 1 ||
-          !word ||
-          word.includes(SUBSTITUTION) ||
-          /^~|[*?[\]]/.test(word) ||
-          word.startsWith("-")
-        )
-          return human(request, "unknown", "Directory change requires human review");
-        // The cd's own redirections, env assignments and organization patterns run first, in the
-        // directories it could start from.
-        for (const cwd of cwds) {
-          const own = simpleDecision(request, simple, profile, depth, index, cwd);
-          if (own.decision !== "approve") return own;
-        }
-        cwds = [...new Set([...cwds, ...cwds.map((cwd) => resolve(cwd, word))])];
-        if (cwds.length > MAX_DIRECTORIES)
-          return human(request, "unknown", "Too many directory changes to verify");
-        last = result(request, "code-read", "Directory change", true);
-        continue;
-      }
-      for (const cwd of cwds) {
-        last = simpleDecision(request, simple, profile, depth, index, cwd);
-        if (last.decision !== "approve") return last;
-      }
-    }
-  return last ?? human(request, "unknown", "Empty command");
-}
+export { commandDecision };
