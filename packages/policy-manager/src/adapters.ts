@@ -81,7 +81,7 @@ export function hookResponse(
   // (PermissionRequest, above) still handles the requests it would ask about.
   if (harness === "codex") {
     const next =
-      decision.needsClassification === true
+      decision.needsClassification === true && decision.classification !== "fallback"
         ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, ask the user to run it themselves or to change the policy profile."
         : "Approving it in this session does not unblock it: ask the user to run it themselves or to change the policy profile.";
     return {

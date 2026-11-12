@@ -275,6 +275,18 @@ describe("recording", () => {
 });
 
 describe("adapters", () => {
+  test("Codex cannot ask, so a fallback is a deny that does not invite another classification", () => {
+    const { session: s } = session();
+    const r = ambiguous();
+    s.review(r, undefined, "PreToolUse");
+    const fallback = s.review(r, undefined, "PreToolUse");
+    expect(fallback.classification).toBe("fallback");
+    const text = JSON.stringify(hookResponse("codex", "PreToolUse", fallback));
+    expect(text).toContain('"permissionDecision":"deny"');
+    expect(text).not.toContain("Classify it");
+    expect(text).toContain("run it themselves");
+  });
+
   test("Copilot gets a deny with a reason; approvals and ordinary asks are unchanged", () => {
     const { session: s } = session();
     const d = s.review(ambiguous(), undefined, "PreToolUse");
