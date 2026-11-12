@@ -45,8 +45,33 @@ describe("Codex PreToolUse", () => {
     });
     const reason = (out.hookSpecificOutput as { permissionDecisionReason: string })
       .permissionDecisionReason;
-    expect(reason).toContain("approval");
+    expect(reason).toContain("was not run");
     expect(reason).toContain("abc123");
+  });
+  // Approving in chat cannot change a deterministic decision: the retry is denied again. The reason
+  // must not invite that loop.
+  test("the reason says approving in chat does not unblock the command", () => {
+    const reason = (
+      hookResponse("codex", "PreToolUse", decision("human")).hookSpecificOutput as {
+        permissionDecisionReason: string;
+      }
+    ).permissionDecisionReason;
+    expect(reason).toContain("does not unblock it");
+    expect(reason).toContain("run it themselves");
+    expect(reason).toContain("policy profile");
+    expect(reason).not.toMatch(/ask the user to approve/i);
+    expect(reason).not.toMatch(/classif/i);
+  });
+  test("an ambiguous cloud request keeps the classification route", () => {
+    const reason = (
+      hookResponse("codex", "PreToolUse", {
+        ...decision("human", "cloud-read"),
+        needsClassification: true,
+      }).hookSpecificOutput as { permissionDecisionReason: string }
+    ).permissionDecisionReason;
+    expect(reason).toContain("Classify it with the session policy-manager agent and retry");
+    expect(reason).toContain("run it themselves");
+    expect(reason).not.toContain("does not unblock it");
   });
   test("an approval is an allow", () =>
     expect(hookResponse("codex", "PreToolUse", decision("approve"))).toEqual({
@@ -220,12 +245,15 @@ describe("setup output", () => {
       rmSync(directory, { recursive: true, force: true });
     }
   };
-  test("Codex setup explains hook trust, re-trust after an upgrade, and the deny", () => {
+  test("Codex setup explains that trust is tied to the command text, and the deny", () => {
     const text = preview("codex");
     expect(text).toContain("/hooks");
     expect(text).toContain("does not grant hook trust");
-    expect(text).toContain("trust them again");
+    expect(text).toContain("trusts the command text, not the code behind it");
+    expect(text).toContain("review a new version before upgrading in place");
+    expect(text).toContain("trust it again");
     expect(text).toContain("returned as a deny");
+    expect(text).toContain("approving it in chat does not unblock it");
   });
   test("Claude and Copilot setup output has no Codex-only text", () => {
     for (const harness of ["claude", "copilot"] as const) {

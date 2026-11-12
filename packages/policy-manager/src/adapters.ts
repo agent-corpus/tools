@@ -35,16 +35,23 @@ export function hookResponse(
     return { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
   // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
   // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
-  // so a decision that needs a human is a deny that tells the model to ask the user. Codex's own
-  // approval prompt (PermissionRequest, above) still handles the requests it would ask about.
-  if (harness === "codex")
+  // so a decision that needs a human is a deny. Approving it in chat does not change the decision,
+  // so the reason says so; the one in-session way through is classifying an ambiguous cloud
+  // request (needsClassification), which a retry then sees as approved. Codex's own approval prompt
+  // (PermissionRequest, above) still handles the requests it would ask about.
+  if (harness === "codex") {
+    const next =
+      decision.needsClassification === true
+        ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, ask the user to run it themselves or to change the policy profile."
+        : "Approving it in this session does not unblock it: ask the user to run it themselves or to change the policy profile.";
     return {
       hookSpecificOutput: {
         hookEventName: phase,
         permissionDecision: "deny",
-        permissionDecisionReason: `Policy manager: ${decision.reason}. This needs the user's approval and was not run. Ask the user to approve it or run it themselves. Request ${decision.requestHash}.`,
+        permissionDecisionReason: `Policy manager: ${decision.reason}. This needs a human decision and was not run. ${next} Request ${decision.requestHash}.`,
       },
     };
+  }
   return {
     hookSpecificOutput: {
       hookEventName: phase,
