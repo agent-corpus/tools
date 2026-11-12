@@ -1,5 +1,17 @@
 # @agent-corpus/policy-manager
 
+## 0.4.0
+
+### Minor Changes
+
+- The permissive profile now understands whole shell scripts, not just chains of simple commands, and judges every command that could run. New syntax: quoted-delimiter heredocs and here-strings (`git commit -m "$(cat <<'EOF' ... EOF)"`, `cat <<'EOF' > file`), comments, line continuation, `&`, `&>`, `|&`, `<(...)`, `( ... )`, `{ ...; }`, `for`, `while`, `until`, `if`, `case`, and a literal `$` at the end of a regex.
+  
+  Variables: `NAME=value`, `export NAME=value` and `for NAME in a b c` give a variable a known value, and the command is judged with it substituted, in every directory and for every value it could take (so `X=rm; $X -rf y` is destructive). Variables assigned in only some branches, in a loop, or from a command, and environment variables the script did not assign (which can hold credentials), are unknown; an unknown value is accepted only as an argument to `echo`, `printf` with string conversions, `test`/`[` without numeric operators, `true`, `false`, `basename` and `dirname`, or as the value of a commit or PR message option, and never as a program, option, path, `cd` target or redirection target.
+  
+  Heredocs and interpreters: a shell fed by a heredoc has its body judged as a script. An interpreter fed by a heredoc, here-string or `-c` is treated like inline code: the code is scanned for file deletion, process creation, string evaluation and protected paths, which now also applies to `-c` and `-e` code that was previously not read. Code piped into an interpreter still needs a human.
+  
+  Tightened: `ssh` and database clients (`psql`, `mysql`, `sqlite3`, ...), `trap`, `alias`, `declare` and similar builtins, `printenv`, bare `env` and `set`, assigning `IFS`, `PS4`, `CDPATH` and similar through any route (prefix, plain assignment, `export`, `for`, `read`, `unset`, `printf -v`), a glob in a command name or option (`r[m] -rf x`), and `cd` or `export` behind `command` or `time`. Unquoted `$[`, `$=`, `$^`, `$~` and `$((`, which zsh and bash evaluate, are still rejected.
+
 ## 0.3.0
 
 ### Minor Changes
