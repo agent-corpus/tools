@@ -190,7 +190,9 @@ export class PolicySession {
         summary: "Harness-reported human response",
       });
     } else if (report.event === "execution-result") {
-      if (!["completed", "succeeded", "failed", "cancelled"].includes(report.status ?? ""))
+      if (
+        !["completed", "succeeded", "failed", "cancelled", "unknown"].includes(report.status ?? "")
+      )
         throw new Error("Invalid execution status");
       if (
         report.exitCode !== undefined &&

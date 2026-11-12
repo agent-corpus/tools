@@ -73,13 +73,25 @@ export function hookResponse(
       : {};
   if (decision.decision === "approve")
     return { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
-  if (harness === "codex")
+  // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
+  // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
+  // so a decision that needs a human is a deny. Approving it in chat does not change the decision,
+  // so the reason says so; the one in-session way through is classifying an ambiguous cloud
+  // request (needsClassification), which a retry then sees as approved. Codex's own approval prompt
+  // (PermissionRequest, above) still handles the requests it would ask about.
+  if (harness === "codex") {
+    const next =
+      decision.needsClassification === true
+        ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, ask the user to run it themselves or to change the policy profile."
+        : "Approving it in this session does not unblock it: ask the user to run it themselves or to change the policy profile.";
     return {
       hookSpecificOutput: {
         hookEventName: phase,
-        additionalContext: `${decision.reason}. Request ${decision.requestHash}. The policy manager grants no approval. Classify ambiguous requests with the session policy-manager agent. Preserve the native human approval flow.`,
+        permissionDecision: "deny",
+        permissionDecisionReason: `Policy manager: ${decision.reason}. This needs a human decision and was not run. ${next} Request ${decision.requestHash}.`,
       },
     };
+  }
   return {
     hookSpecificOutput: {
       hookEventName: phase,
@@ -103,6 +115,10 @@ export function executionReport(
     typeof code === "number" && Number.isSafeInteger(code) && Math.abs(code) <= 2147483647
       ? code
       : undefined;
+  // Codex sends a Bash result as the output text alone: no exit code and no duration, even for a
+  // command that exited non-zero. That is not "completed"; the outcome is unknown. Claude and
+  // Copilot keep their existing behaviour.
+  const unknown = exitCode === undefined && request.harness === "codex";
   const duration = payload.duration_ms ?? payload.durationMs;
   return {
     requestHash: hash(request),
@@ -113,7 +129,9 @@ export function executionReport(
           ? "cancelled"
           : "failed"
         : exitCode === undefined
-          ? "completed"
+          ? unknown
+            ? "unknown"
+            : "completed"
           : exitCode === 0
             ? "succeeded"
             : "failed",

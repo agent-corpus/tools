@@ -46,6 +46,18 @@ Setup merges only the managed hook definitions. Existing custom hooks, permissio
 
 Start a new session after setup. Codex still requires explicit review and trust through `/hooks`; setup does not grant that trust. Existing sandbox controls and host permission rules continue to apply. Ambiguous requests retain the documented classification or human fallback; setup does not enable automatic AI fallback across unsupported native interfaces.
 
+### Codex hook trust
+
+Codex runs a non-managed hook only after you review and trust its exact definition, and setup never grants that trust. After `setup-hook-codex`, start Codex and open `/hooks`, review the five policy-manager hooks, and trust them. Until then Codex skips them and prints a warning at startup, so no policy decision is made.
+
+Trust is recorded per hook in `config.toml` under `[hooks.state."<hooks.json path>:<event>:0:0"]` as `trusted_hash = "sha256:<hex>"`. The hash covers the event, the matcher, and the hook's command and timeout, so:
+
+- Trust is tied to the command text only: Codex hashes the command line, not the script behind it. An upgrade that keeps the same CLI path (for example an in-place `npm install -g` upgrade) keeps trust while the code behind the hooks changes, so review a new version before upgrading in place. An upgrade that changes the command, such as installing into a per-version directory or a Node upgrade that changes `process.execPath` (it is part of the command), makes Codex mark all five hooks as changed and skip them until you trust them again. Re-running `setup-hook-codex` for the same installed version changes nothing and keeps trust.
+- Codex hashes the effective timeout, which it limits to 1 to 3 seconds for `SessionEnd`. The generated `SessionEnd` timeout is 3 seconds, the same effective value as the earlier 8, so changing it did not by itself invalidate trust.
+- `--dangerously-bypass-hook-trust` runs enabled hooks without persisted trust for one invocation. Use it only for automation that already vets the hook source.
+
+Codex hook trust was checked against Codex CLI 0.167.1; see the [Codex hooks reference](https://developers.openai.com/codex/hooks) for the release behavior.
+
 ## Request protocol
 
 Pass one JSON object on standard input:
@@ -132,7 +144,17 @@ policy-manager profile install policy.json   # writes ~/.config/agent-corpus/pol
 
 The service reads the profile only from that user directory (`$XDG_CONFIG_HOME` honored). It must be a regular, non-symlink file owned by the user, not group/world writable, and outside every Git checkout, so an agent cannot rewrite its own rules from a worktree. On Windows, POSIX owner and mode bits do not exist, so only the regular-file, non-symlink and outside-Git checks apply and the user-profile ACL is the trust boundary. `cd <literal>` is tracked, and each later command is judged in every directory it could run in. Git long-option abbreviations are treated as the full option. An invalid or untrusted profile logs `profile ... invalid-using-strict` and the session stays strict. Each session records the profile mode and SHA-256 digest in `audit.jsonl`.
 
-`permissive` approves compound commands (`;`, `&&`, `||`, `|`, quotes, redirects, `VAR=x` prefixes) when every simple command is acceptable, and approves unknown executables and interpreters with inline code. It still sends these to a human: deletion (`rm`, `find -delete`, `xargs rm`), `sudo`, `git reset --hard`, `git clean`, forced or mirror pushes, discarding checkouts and restores, stash and reflog destruction, `gh` deletions and security endpoints, cloud deletion and credential retrieval, infrastructure destroy, `npm publish`, destructive HTTP verbs, piping into a shell, expansions and subshells, writes outside linked feature worktrees and `scratchRoots`, and protected or credential paths. `humanPatterns` adds organization-specific expressions. `cloudWrites: "allow"` also approves non-destructive cloud changes.
+`permissive` approves compound commands (`;`, `&&`, `||`, `|`, quotes, redirects, `VAR=x` prefixes) when every simple command is acceptable, and approves unknown executables and interpreters with inline code. It still sends these to a human: deletion (`rm`, `find -delete`, `xargs rm`), `sudo`, `git reset --hard`, `git clean`, forced or mirror pushes, discarding checkouts and restores, stash and reflog destruction, `gh` deletions and security endpoints, cloud deletion and credential retrieval, infrastructure destroy, `npm publish`, destructive HTTP verbs, piping into a shell, ssh and database clients, builtins that run a string later (`eval`, `source`, `trap`, `alias`), printing the environment, writes outside linked feature worktrees and `scratchRoots`, and protected or credential paths. `humanPatterns` adds organization-specific expressions.
+
+#### Shell syntax in permissive mode
+
+Every command that could run is judged, not only the first. Understood: `;`, newlines, `&&`, `||`, `|`, `&`, comments, quoting and escapes, line continuation, redirections (including `&>`, `|&`, here-strings and quoted-delimiter heredocs), `( ... )`, `{ ...; }`, `for`, `while`, `until`, `if`, `case`, `$(...)`, backticks and `<(...)`.
+
+- **Variables.** `NAME=value`, `export NAME=value` and `for NAME in a b c` give a variable a known value; the command is then judged with the value substituted, in every directory and for every value it could take. A variable assigned in only some branches, in a loop, or from a command, glob or `read` has an unknown value, as does any environment variable the script did not assign. An unknown value is accepted only as an argument to `echo`, `printf` with string conversions, `test`/`[` without numeric tests, `true`, `false`, `basename` and `dirname`, and as the value of a commit or PR message option (`git commit -m "$(...)"`, `gh pr create --body "$(...)"`). It is never a program, option, path, `cd` target or redirection target. Environment variables other than a short list (`PWD`, `USER`, `TMPDIR`, ...) need a human, because they can hold credentials.
+- **Command substitution** and process substitution run first: the inner command is judged with the same rules.
+- **Heredocs.** A quoted delimiter (`<<'EOF'`) is literal text. An unquoted delimiter is accepted only when the body has no `$`, backtick or backslash. A shell fed by a heredoc (`bash <<'EOF'`) has its body judged as a script. An interpreter fed by a heredoc or `-c` is treated like inline code: the code is scanned for file deletion, process creation, string evaluation and protected paths, and anything flagged goes to a human; code piped in from elsewhere always does.
+- **Compound commands.** Branches are judged on copies of the state and merged; a loop's assigned variables are unknown inside it and afterwards, and a `cd` inside a loop or pipeline needs a human.
+- **Still sent to a human:** brace expansion, arithmetic (`$((`, `$[`, `(( ))`), `${X:-y}` and other parameter forms, `$'...'`, function definitions, unquoted heredocs whose body expands, and scripts that expand to more than a few hundred commands. `cloudWrites: "allow"` also approves non-destructive cloud changes.
 
 Measure a profile against real usage with `policy-manager replay ~/.claude/projects --profile policy.json`: it replays the Bash commands recorded in Claude Code transcripts through the evaluator (nothing is executed) and prints the approval rate with and without the profile, plus the most common reasons that still need a human. Reports include short command excerpts, so keep them local.
 
@@ -148,7 +170,7 @@ The cache belongs to the service process and is scoped to harness plus session I
 
 `SessionStart` reports the private temporary directory containing `audit.jsonl`. Each request and decision is recorded before an approval is returned. The log stores versioned event envelopes, readable action summaries, opaque session identifiers, request hashes, and hashed targets. It excludes paths, argument values, source text, credentials, and model explanations. Compare request hashes against the original request in the harness transcript during an investigation. Logs rotate at 10 MiB per segment and stop accepting writes at 100 MiB total. Earlier segments remain available through `audit-log query` and `audit-log export`; no records are automatically deleted. Logs remain after normal shutdown and can disappear during operating-system cleanup. Copy them before cleanup when needed.
 
-Logging failure, malformed requests, service failure, and unknown semantics never produce an automatic approval. Permission hooks fall through to native human handling. Pre-tool failures exit 2. Host timeout behavior differs: Copilot command-hook timeouts fall through to its normal permission flow. Codex does not support `ask` in `PreToolUse`, so human recommendations add context and leave native permission handling unchanged.
+Logging failure, malformed requests, service failure, and unknown semantics never produce an automatic approval. Permission hooks fall through to native human handling. Pre-tool failures exit 2. Host timeout behavior differs: Copilot command-hook timeouts fall through to its normal permission flow. Codex does not support `ask` in `PreToolUse`: it parses the value, marks the hook failed and runs the tool anyway. A decision that needs a human is therefore returned to Codex as a `deny` whose reason says the command was not run and that approving it in chat does not unblock it (the decision is deterministic, so a retry is denied again); there is no in-Codex button to approve it. The user runs the command themselves or changes the policy profile. An ambiguous cloud request is the one exception: its reason points to the session policy-manager agent, and a classification of approved is accepted for the session, so a retry passes. Codex's own approval prompt (`PermissionRequest`) is left to Codex for the requests it would ask about, and an approval is returned as `allow`.
 
 ## Audit API and reported outcomes
 
@@ -178,9 +200,9 @@ Or an execution report:
 }
 ```
 
-Human responses are `approved` or `denied`. Execution statuses are `completed`, `succeeded`, `failed`, or `cancelled`. Reports use the source `policy-manager.adapter-report`. They are observations declared by the caller and never modify permission decisions or caches. The API does not authenticate a human identity. A denial policy remains a human decision even after an approval report is recorded.
+Human responses are `approved` or `denied`. Execution statuses are `completed`, `succeeded`, `failed`, `cancelled`, or `unknown`. `unknown` is recorded for Codex when the hook payload exposes no exit status, which is the usual case for a Bash result. Reports use the source `policy-manager.adapter-report`. They are observations declared by the caller and never modify permission decisions or caches. The API does not authenticate a human identity. A denial policy remains a human decision even after an approval report is recorded.
 
-Generated post-tool hooks record execution reports for the supported tool matcher. Claude and Copilot also get failure hooks. Codex uses `PostToolUse`, which can carry nonzero exit codes. When an exit code is absent, the adapter records `completed` rather than inventing success. Output text and error bodies are discarded. Human responses require an explicit report from the host; the native hooks do not provide a universal human-response signal.
+Generated post-tool hooks record execution reports for the supported tool matcher. Claude and Copilot also get failure hooks. Codex uses `PostToolUse`, which also runs after commands that exit non-zero. Codex sends a Bash result as the command's output text only, with no exit code and no duration, so the adapter records `unknown` for Codex rather than `completed` or `succeeded`; a structured `exit_code` is used when one is present. Claude and Copilot record `completed` when an exit code is absent. Output text and error bodies are discarded. Human responses require an explicit report from the host; the native hooks do not provide a universal human-response signal.
 
 The shared logger redacts structured sensitive fields, validates events, locks concurrent access, and flushes each append. Queries cover active and rotated segments. Busy storage, a stale lock, incomplete records, capacity limits, or write failures prevent automatic approval. The initial API is a library plus CLI; an additional resident logging server is deferred until another consumer needs one.
 
@@ -191,7 +213,7 @@ Tests exercise real service processes and native-shaped hook payloads for all th
 Verified documentation, November 5, 2026:
 
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- [Codex hooks](https://learn.chatgpt.com/docs/hooks)
+- [Codex hooks](https://developers.openai.com/codex/hooks)
 - [Copilot hooks](https://docs.github.com/en/copilot/reference/hooks-reference)
 
 Exit codes: 0 means a protocol response was returned; inspect `decision` before acting. 1 means invalid input or service failure. Pre-tool hook failures use 2. Diagnostics use stderr and contain no raw request data.

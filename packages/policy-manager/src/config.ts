@@ -17,6 +17,8 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
     "SessionEnd",
   ];
   for (const phase of phases) {
+    // Codex limits SessionEnd to 1 to 3 seconds and warns about anything longer.
+    const timeout = harness === "codex" && phase === "SessionEnd" ? 3 : 8;
     if (harness === "copilot") {
       const event = phase[0]?.toLowerCase() + phase.slice(1);
       hooks[event] = [
@@ -25,7 +27,7 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
           ...(phase === "PreToolUse" || phase.startsWith("PostToolUse") ? { matcher } : {}),
           exec: process.execPath,
           args: [cliPath, "hook", harness, phase, managedHookFlag],
-          timeoutSec: 8,
+          timeoutSec: timeout,
         },
       ];
     } else
@@ -36,7 +38,7 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
             {
               type: "command",
               command: `"${process.execPath}" "${cliPath}" hook ${harness} ${phase} ${managedHookFlag}`,
-              timeout: 8,
+              timeout,
             },
           ],
         },
