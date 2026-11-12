@@ -512,6 +512,11 @@ function tokenize(src: string): Token[] {
       operator(")");
       continue;
     }
+    if ((char === ">" || char === "<") && active && !quotedAny && assignName === undefined) {
+      // bash reads `12>file` as a redirection of descriptor 12; zsh reads `12` as a command. Either
+      // way the next word is the command, so a multi-digit prefix is not worth modelling.
+      if (parts.length === 0 && /^[0-9]{2,}$/.test(lit)) reject();
+    }
     if (char === "{" || char === "}") braceChar = true;
     if (char === "*" || char === "?" || char === "[") globChar = true;
     if (char === ">" || char === "<") {

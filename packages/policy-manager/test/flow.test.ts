@@ -89,6 +89,10 @@ describe("script parser", () => {
     "a && ",
     "& ls",
     "ls >",
+    "12>/dev/null rm -rf x",
+    "12>&1 git push --force origin x",
+    "100<<'E' cat\nx\nE",
+    "echo hi 12>file",
     "> f while true { rm -rf x }",
     "> f if true { rm -rf x }",
     "A=1 while true { rm -rf x }",
@@ -439,6 +443,9 @@ describe("evaluation of scripts", () => {
     // subshell and substitution scoping: assignments do not leak, but judged anyway
     ["(X=rm); $X -rf y", "unknown"],
     ["X=$(Y=rm; echo $Y); $X -rf y", "unknown"],
+    // a one-digit descriptor prefix is a redirection; the command after it is still judged
+    ["3>/dev/null rm -rf x", "destructive"],
+    ["2>&1 git push --force origin x", "destructive"],
     // zsh runs the rest of the line (verified: these execute rm under zsh 5.9)
     ["repeat 1 rm -rf x", "unknown"],
     ["noglob rm -rf x", "unknown"],
@@ -572,9 +579,11 @@ describe("evaluation of scripts", () => {
     expect(decide(`cat <<'EOF' > ${posix(join(root, "repo", "a.txt"))}\nx\nEOF`).decision).toBe(
       "human",
     );
-    expect(decide(`X=${posix(scratch)}; cat <<'EOF' > $X/notes.md\nx\nEOF`).decision).toBe(
-      "approve",
-    );
+    // A value with `~` (a Windows 8.3 short name such as RUNNER~1) is never a simple value.
+    if (!posix(scratch).includes("~"))
+      expect(decide(`X=${posix(scratch)}; cat <<'EOF' > $X/notes.md\nx\nEOF`).decision).toBe(
+        "approve",
+      );
     expect(decide("X=/etc; cat <<'EOF' > $X/notes.md\nx\nEOF").decision).toBe("human");
   });
 
