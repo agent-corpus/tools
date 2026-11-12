@@ -29,12 +29,20 @@ export function classifyCommand(
   context?: HookContext,
   json = "<json>",
 ): string {
+  // A Windows path (`D:\\a\\cli.js`) is written with forward slashes: Node accepts them, and a
+  // backslash inside double quotes is a shell escape the policy cannot judge, which would
+  // escalate the command that finishes the round trip.
+  const cliPath =
+    context && /^[A-Za-z]:\\/.test(context.cliPath)
+      ? context.cliPath.replace(/\\/g, "/")
+      : context?.cliPath;
   const safe =
     context &&
-    /^[^"$`\\\n']+$/.test(context.cliPath) &&
+    cliPath &&
+    /^[^"$`\\\n']+$/.test(cliPath) &&
     /^[A-Za-z0-9_.-]+$/.test(context.sessionId);
   return safe
-    ? `node "${context.cliPath}" classify ${harness} ${context.sessionId} <<< '${json}'`
+    ? `node "${cliPath}" classify ${harness} ${context.sessionId} <<< '${json}'`
     : `policy-manager classify ${harness} <session-id> <<< '${json}'`;
 }
 /** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */

@@ -13,6 +13,8 @@ const AUTH_NAME = /(?:^|[^a-z])auth(?:orization)?(?:[^a-z]|$)/i;
 const TOKEN_PREFIX =
   /^(?:gh[pousr]_|github_pat_|sk-|xox[baprs]-|AKIA|ASIA|AIza|eyJ|glpat-|npm_|shpat_)/;
 const LONG_OPAQUE = /^[A-Za-z0-9+/=_-]{32,}$/;
+/** Programs whose `-pPASSWORD` attaches the password to the flag. Elsewhere `-p…` is not secret. */
+const ATTACHED_PASSWORD = /^(?:mysql|mysqldump|mysqladmin|mysqlcheck|mariadb|mariadb-dump)$/;
 /** Flags whose next word is a credential, whatever the word looks like. */
 const CREDENTIAL_FLAG = /^(?:-u|-U|--user|--proxy-user|--oauth2-bearer)$/;
 
@@ -77,8 +79,22 @@ function redactHeader(word: string): string | undefined {
 /** Redacts a shell command or other free text, keeping it recognisable and at most `max` long. */
 export function redactText(text: string, max = 300): string {
   let hideNext = false;
+  let program = "";
+  let atStart = true;
   const out = words(text).map((raw) => {
     if (/^\s$/.test(raw)) return raw;
+    if (/^(?:\||\|\||&&|;|&)$/.test(raw)) {
+      atStart = true;
+      return raw;
+    }
+    if (atStart && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(raw)) {
+      program =
+        raw
+          .replace(/^["']|["']$/g, "")
+          .split(/[\\/]/)
+          .pop() ?? "";
+      atStart = false;
+    }
     if (hideNext) {
       // `Authorization: Bearer abc` carries the secret in the word after the scheme.
       hideNext = /^["']?(?:bearer|basic|token)["']?$/i.test(raw);
@@ -100,7 +116,7 @@ export function redactText(text: string, max = 300): string {
     const eq = piece.indexOf("=");
     const name = eq >= 0 ? piece.slice(0, eq) : piece;
     // `mysql -pSECRET`: a short option with its value attached.
-    if (/^-p./.test(piece) && eq < 0) return "-p[REDACTED]";
+    if (/^-p./.test(piece) && eq < 0 && ATTACHED_PASSWORD.test(program)) return "-p[REDACTED]";
     if (/^-[A-Za-z]./.test(piece) && eq < 0 && isSecretName(piece))
       return `${piece.slice(0, 2)}[REDACTED]`;
     if (isSecretName(name)) {
@@ -109,7 +125,9 @@ export function redactText(text: string, max = 300): string {
       if (/^-{1,2}[A-Za-z]/.test(piece) || /:["']?$/.test(piece)) hideNext = true;
       return piece;
     }
-    return TOKEN_PREFIX.test(piece) || LONG_OPAQUE.test(piece) ? "[REDACTED]" : piece;
+    // A quoted token is still a token: judge the word without its surrounding quote.
+    const bare = piece.replace(/^["']|["']$/g, "");
+    return TOKEN_PREFIX.test(bare) || LONG_OPAQUE.test(bare) ? "[REDACTED]" : piece;
   });
   const joined = out.join("");
   return joined.length > max ? `${joined.slice(0, max)}…` : joined;

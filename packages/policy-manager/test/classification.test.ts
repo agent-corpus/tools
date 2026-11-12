@@ -251,6 +251,12 @@ describe("recording", () => {
       "curl -H Authorization: Bearer [REDACTED] x",
     );
     expect(redactText("mysql -pS3cretPass db")).toBe("mysql -p[REDACTED] db");
+    expect(redactText("cd x && mysql -pabc db")).toBe("cd x && mysql -p[REDACTED] db");
+    expect(redactText("find . -path ./x -print -perm 644")).toBe(
+      "find . -path ./x -print -perm 644",
+    );
+    expect(redactText('echo "ghp_abcdefghijklmnopqrstuvwxyz0123456789"')).toBe("echo [REDACTED]");
+    expect(redactText(`echo '${"a1".repeat(20)}' ok`)).toBe("echo [REDACTED] ok");
     expect(redactText("curl -u user:pass https://h/x")).toBe("curl -u [REDACTED] https://h/x");
     expect(redactText('tool --password "two words" run')).toBe("tool --password [REDACTED] run");
     expect(redactText('tool --password="two words" run')).toBe("tool --password=[REDACTED] run");
@@ -329,6 +335,18 @@ describe("the classify round trip", () => {
         expect(d.tier).toBeUndefined();
       });
     }
+  // Simulated Windows paths run on every platform, so the round trip is proven on Windows
+  // without depending on the runner's own home directory.
+  for (const cliPath of [
+    "D:\\a\\tools\\tools\\packages\\policy-manager\\dist\\cli.js",
+    "C:\\Users\\me\\.local\\share\\agent-corpus\\policy-manager\\0.5.0\\lib\\node_modules\\@agent-corpus\\policy-manager\\dist\\cli.js",
+  ])
+    test(`a Windows-style path still yields a command the policy approves (${cliPath.slice(0, 12)})`, () => {
+      const command = classifyCommand("claude", { cliPath, sessionId: "s1" }, answer);
+      expect(command).not.toContain("\\");
+      expect(command).toContain("classify claude s1");
+      expect(evaluate(request(command), undefined, permissive).decision).toBe("approve");
+    });
   test("the hook's instruction contains exactly that command", () => {
     const { session: s } = session();
     const d = s.review(ambiguous(), undefined, "PreToolUse");
