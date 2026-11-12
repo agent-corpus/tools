@@ -79,7 +79,9 @@ const SUBSTITUTION_OK = new Set([
 // Variables that change how later commands are found, split or started. Assigning one, as a prefix
 // or on its own, needs a human.
 export const BANNED_ENV =
-  /^(?:LD_|DYLD_|GIT_|PYTHON|NODE_OPTIONS$|PATH$|HOME$|BASH_ENV$|ENV$|SHELL$|PAGER$|EDITOR$|GH_TOKEN$|GITHUB_TOKEN$|IFS$|PS4$|PROMPT_COMMAND$|CDPATH$|GLOBIGNORE$|BASHOPTS$|SHELLOPTS$|BASH_XTRACEFD$|FPATH$|ZDOTDIR$|BASH_FUNC_)/;
+  /^(?:LD_|DYLD_|GIT_|PYTHON|NODE_OPTIONS$|PATH$|HOME$|BASH_ENV$|ENV$|SHELL$|PAGER$|EDITOR$|GH_TOKEN$|GITHUB_TOKEN$|IFS$|PS4$|PROMPT_COMMAND$|CDPATH$|GLOBIGNORE$|BASHOPTS$|SHELLOPTS$|BASH_XTRACEFD$|FPATH$|ZDOTDIR$|BASH_FUNC_|path$|cdpath$|fpath$|manpath$|module_path$)/;
+// zsh ties the lowercase arrays path, cdpath, fpath, manpath and module_path to PATH, CDPATH, FPATH,
+// MANPATH and MODULE_PATH, so those names are covered too (they are matched case-sensitively).
 /** Runs arbitrary statements on another machine or database, so its argument is not judged. */
 const REMOTE_EXECUTORS = new Set([
   "ssh",
@@ -112,6 +114,12 @@ const STATE_BUILTINS = new Set([
   "coproc",
   "fc",
   "history",
+  "hash",
+  "vared",
+  "zparseopts",
+  "setopt",
+  "unsetopt",
+  "shopt",
   // zsh precommand modifiers and builtins that run a command or string
   "noglob",
   "nocorrect",
@@ -612,6 +620,22 @@ export function simpleDecision(
       "Command substitution output is only accepted as an argument to echo, printf and similar",
     );
   const args = argv.slice(1);
+  // zsh expands `=name` to the path of a command, so `command =rm` runs rm.
+  if (argv[0]?.startsWith("=") && argv[0].length > 1)
+    return human(request, "unknown", "A command named with = requires human review");
+  // `[[` evaluates the operands of -eq, -lt and the like as arithmetic, including the value of a
+  // bare variable name, and `a[$(cmd)]` runs the command. Only plain integers are safe.
+  if (program === "[[")
+    for (const [index, word] of args.entries())
+      if (/^(?:-eq|-ne|-lt|-le|-gt|-ge)$/.test(word)) {
+        const operands = [args[index - 1], args[index + 1]];
+        if (operands.some((operand) => operand === undefined || !/^-?[0-9]+$/.test(operand)))
+          return human(
+            request,
+            "unknown",
+            "A numeric test with a non-integer operand requires human review",
+          );
+      }
   // zsh and bash evaluate arithmetic in some builtins' operands, and a name such as `a[$(cmd)]`
   // runs the command. An unknown value is therefore only safe where nothing is evaluated.
   if (argv.some((word) => word.includes(SUBSTITUTION))) {
@@ -655,7 +679,10 @@ export function simpleDecision(
   // These print the whole environment, which can hold credentials.
   if (program === "printenv" || program === "env" || (program === "set" && args.length === 0))
     return human(request, "sensitive", "Printing the environment requires human review");
-  if (program === "set" && !args.every((word) => /^[-+][A-Za-z]+$|^pipefail$/.test(word)))
+  // `set -A name values` assigns an array, and `wait -p VAR` assigns a variable.
+  if (program === "wait" && args.some((word) => word.startsWith("-")))
+    return human(request, "unknown", "wait with options requires human review");
+  if (program === "set" && !args.every((word) => /^[-+][B-Za-z]+$|^pipefail$/.test(word)))
     return human(request, "unknown", "Changing shell settings requires human review");
   if (SHELLS.has(program) || INTERPRETERS.has(program)) {
     if (stageIndex > 0)

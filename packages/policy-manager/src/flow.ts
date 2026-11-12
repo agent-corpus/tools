@@ -212,6 +212,54 @@ function runRedirects(ctx: Ctx, redirs: Redir[], state: State): Decision | undef
 
 // --- assigned names ---------------------------------------------------------------------------
 
+/**
+ * Special builtins keep a prefix assignment in the shell afterwards when it runs as sh, dash or
+ * bash in POSIX mode (and zsh with posixbuiltins), so `X=rm :` assigns X.
+ */
+const SPECIAL_BUILTINS = new Set([
+  ":",
+  ".",
+  "eval",
+  "exec",
+  "exit",
+  "export",
+  "readonly",
+  "return",
+  "set",
+  "shift",
+  "times",
+  "trap",
+  "unset",
+  "break",
+  "continue",
+]);
+
+/**
+ * The variable `printf -v` or zsh `print -v` stores into: `-v NAME` or `-vNAME`. A cluster that
+ * contains `v` in any other form (`-rv`, `-vr`), or a computed option or name, is unreadable.
+ */
+function printTargets(args: Array<string | undefined>): { names: string[]; unreadable: boolean } {
+  const names: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === undefined) return { names, unreadable: true };
+    if (arg === "--" || !arg.startsWith("-") || arg === "-") break;
+    if (!arg.includes("v")) continue;
+    const next = args[i + 1];
+    if (arg === "-v") {
+      if (next && NAME.test(next)) {
+        names.push(next);
+        i++;
+      } else return { names, unreadable: true };
+    } else if (/^-v[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) {
+      // `-vNAME`, or a cluster whose last option takes the next word: both are possible targets.
+      names.push(arg.slice(2));
+      if (next && NAME.test(next)) names.push(next);
+    } else return { names, unreadable: true };
+  }
+  return { names, unreadable: false };
+}
+
 function assignedInSimple(node: Simple, out: Set<string>): void {
   if (!node.argv.length) {
     for (const a of node.assigns) out.add(a.name);
@@ -219,6 +267,7 @@ function assignedInSimple(node: Simple, out: Set<string>): void {
   }
   const name = basename(plainText(node.argv[0]) ?? "");
   const args = node.argv.slice(1).map(plainText);
+  if (SPECIAL_BUILTINS.has(name)) for (const a of node.assigns) out.add(a.name);
   if (name === "export")
     for (const arg of args) {
       const head = arg?.split("=")[0];
@@ -229,7 +278,11 @@ function assignedInSimple(node: Simple, out: Set<string>): void {
       if (arg && NAME.test(arg)) out.add(arg);
       else if (arg === undefined) out.add("*");
     }
-  else if (name === "printf" && args[0] === "-v" && args[1]) out.add(args[1]);
+  else if (name === "printf" || name === "print") {
+    const targets = printTargets(args);
+    for (const target of targets.names) out.add(target);
+    if (targets.unreadable) out.add("*");
+  }
   if (name === "read") out.add("REPLY");
 }
 
@@ -278,7 +331,18 @@ function forget(state: State, names: Set<string>): void {
 
 // --- simple commands --------------------------------------------------------------------------
 
-const STATEFUL = new Set(["cd", "pushd", "popd", "export", "unset", "read", "set", "shift"]);
+const STATEFUL = new Set([
+  "cd",
+  "pushd",
+  "popd",
+  "export",
+  "unset",
+  "read",
+  "set",
+  "shift",
+  "printf",
+  "print",
+]);
 
 function splitAssignment(word: Word): { name: string; value: Word } | undefined {
   const first = word.parts[0];
@@ -351,13 +415,16 @@ function runSimple(
       const redirect = toRedirect(redir, instantiate(redir.target, known, env).text);
       if (redirect) redirects.push(redirect);
     }
+    // Standard input is the heredoc or here-string only when nothing else also feeds it: a later
+    // `<file` replaces it, and zsh's multios runs both.
     let stdin: string | undefined;
-    for (const redir of node.redirects) {
-      if (redir.fd !== "0") continue;
-      if (redir.op === "<<") stdin = redir.body ?? "";
-      else if (redir.op === "<<<" && redir.target)
-        stdin = `${instantiate(redir.target, known, env).text}\n`;
-    }
+    const inputs = node.redirects.filter(
+      (redir) => redir.fd === "0" && (redir.op === "<<" || redir.op === "<<<" || redir.op === "<"),
+    );
+    const only = inputs.length === 1 ? inputs[0] : undefined;
+    if (only?.op === "<<") stdin = only.body ?? "";
+    else if (only?.op === "<<<" && only.target)
+      stdin = `${instantiate(only.target, known, env).text}\n`;
     return {
       env: node.assigns.map((a) => [a.name, instantiate(a.value, known, env).text]),
       argv,
@@ -423,11 +490,20 @@ function runSimple(
     }
   }
 
+  // A prefix assignment before a special builtin outlives the command in some shells.
+  if (name && SPECIAL_BUILTINS.has(name))
+    for (const a of node.assigns) state.vars.set(a.name, null);
   if (name === "cd") return changeDirectory(ctx, state, piped, envs, build);
   if (name === "export") return exportVariables(ctx, node, state, piped, known, envs);
-  if (name === "unset" || name === "read" || name === "printf") {
+  if (name === "unset" || name === "read" || name === "printf" || name === "print") {
     const forgotten = new Set<string>();
     assignedInSimple(node, forgotten);
+    if (forgotten.has("*"))
+      return human(
+        request,
+        "unknown",
+        `${name} naming a variable it cannot be read from requires human review`,
+      );
     if (name === "read" || name === "unset") {
       const flags = node.argv
         .slice(1)
