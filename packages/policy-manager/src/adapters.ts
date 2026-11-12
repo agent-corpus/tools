@@ -33,11 +33,16 @@ export function hookResponse(
       : {};
   if (decision.decision === "approve")
     return { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
+  // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
+  // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
+  // so a decision that needs a human is a deny that tells the model to ask the user. Codex's own
+  // approval prompt (PermissionRequest, above) still handles the requests it would ask about.
   if (harness === "codex")
     return {
       hookSpecificOutput: {
         hookEventName: phase,
-        additionalContext: `${decision.reason}. Request ${decision.requestHash}. The policy manager grants no approval. Classify ambiguous requests with the session policy-manager agent. Preserve the native human approval flow.`,
+        permissionDecision: "deny",
+        permissionDecisionReason: `Policy manager: ${decision.reason}. This needs the user's approval and was not run. Ask the user to approve it or run it themselves. Request ${decision.requestHash}.`,
       },
     };
   return {
@@ -63,6 +68,10 @@ export function executionReport(
     typeof code === "number" && Number.isSafeInteger(code) && Math.abs(code) <= 2147483647
       ? code
       : undefined;
+  // Codex sends a Bash result as the output text alone: no exit code and no duration, even for a
+  // command that exited non-zero. That is not "completed"; the outcome is unknown. Claude and
+  // Copilot keep their existing behaviour.
+  const unknown = exitCode === undefined && request.harness === "codex";
   const duration = payload.duration_ms ?? payload.durationMs;
   return {
     requestHash: hash(request),
@@ -73,7 +82,9 @@ export function executionReport(
           ? "cancelled"
           : "failed"
         : exitCode === undefined
-          ? "completed"
+          ? unknown
+            ? "unknown"
+            : "completed"
           : exitCode === 0
             ? "succeeded"
             : "failed",

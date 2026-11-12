@@ -34,7 +34,7 @@ export interface OutcomeReport {
   requestHash: string;
   event: "human-response" | "execution-result";
   response?: "approved" | "denied";
-  status?: "completed" | "succeeded" | "failed" | "cancelled";
+  status?: "completed" | "succeeded" | "failed" | "cancelled" | "unknown";
   exitCode?: number;
   durationMs?: number;
 }

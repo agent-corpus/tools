@@ -165,7 +165,9 @@ export function setupHook(
     "Start a new harness session to load the hooks.",
     ...(harness === "codex"
       ? [
-          "Open /hooks and explicitly review and trust the installed hooks. Setup does not grant hook trust.",
+          "Open /hooks and explicitly review and trust the installed hooks. Setup does not grant hook trust, and Codex skips hooks it has not trusted.",
+          "After any upgrade that changes the install path, Codex marks the hooks as changed and skips them until you trust them again.",
+          "Codex does not support ask in PreToolUse, so a decision that needs a human is returned as a deny and the command does not run.",
         ]
       : []),
     "Native sandbox controls and existing permission rules remain in effect.",
