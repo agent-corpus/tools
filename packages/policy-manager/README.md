@@ -46,6 +46,18 @@ Setup merges only the managed hook definitions. Existing custom hooks, permissio
 
 Start a new session after setup. Codex still requires explicit review and trust through `/hooks`; setup does not grant that trust. Existing sandbox controls and host permission rules continue to apply. Ambiguous requests retain the documented classification or human fallback; setup does not enable automatic AI fallback across unsupported native interfaces.
 
+### Codex hook trust
+
+Codex runs a non-managed hook only after you review and trust its exact definition, and setup never grants that trust. After `setup-hook-codex`, start Codex and open `/hooks`, review the five policy-manager hooks, and trust them. Until then Codex skips them and prints a warning at startup, so no policy decision is made.
+
+Trust is recorded per hook in `config.toml` under `[hooks.state."<hooks.json path>:<event>:0:0"]` as `trusted_hash = "sha256:<hex>"`. The hash covers the event, the matcher, and the hook's command and timeout, so:
+
+- Trust is tied to the command text only: Codex hashes the command line, not the script behind it. An upgrade that keeps the same CLI path (for example an in-place `npm install -g` upgrade) keeps trust while the code behind the hooks changes, so review a new version before upgrading in place. An upgrade that changes the command, such as installing into a per-version directory or a Node upgrade that changes `process.execPath` (it is part of the command), makes Codex mark all five hooks as changed and skip them until you trust them again. Re-running `setup-hook-codex` for the same installed version changes nothing and keeps trust.
+- Codex hashes the effective timeout, which it limits to 1 to 3 seconds for `SessionEnd`. The generated `SessionEnd` timeout is 3 seconds, the same effective value as the earlier 8, so changing it did not by itself invalidate trust.
+- `--dangerously-bypass-hook-trust` runs enabled hooks without persisted trust for one invocation. Use it only for automation that already vets the hook source.
+
+Codex hook trust was checked against Codex CLI 0.167.1; see the [Codex hooks reference](https://developers.openai.com/codex/hooks) for the release behavior.
+
 ## Request protocol
 
 Pass one JSON object on standard input:
@@ -129,7 +141,7 @@ The cache belongs to the service process and is scoped to harness plus session I
 
 `SessionStart` reports the private temporary directory containing `audit.jsonl`. Each request and decision is recorded before an approval is returned. The log stores versioned event envelopes, readable action summaries, opaque session identifiers, request hashes, and hashed targets. It excludes paths, argument values, source text, credentials, and model explanations. Compare request hashes against the original request in the harness transcript during an investigation. Logs rotate at 10 MiB per segment and stop accepting writes at 100 MiB total. Earlier segments remain available through `audit-log query` and `audit-log export`; no records are automatically deleted. Logs remain after normal shutdown and can disappear during operating-system cleanup. Copy them before cleanup when needed.
 
-Logging failure, malformed requests, service failure, and unknown semantics never produce an automatic approval. Permission hooks fall through to native human handling. Pre-tool failures exit 2. Host timeout behavior differs: Copilot command-hook timeouts fall through to its normal permission flow. Codex does not support `ask` in `PreToolUse`, so human recommendations add context and leave native permission handling unchanged.
+Logging failure, malformed requests, service failure, and unknown semantics never produce an automatic approval. Permission hooks fall through to native human handling. Pre-tool failures exit 2. Host timeout behavior differs: Copilot command-hook timeouts fall through to its normal permission flow. Codex does not support `ask` in `PreToolUse`: it parses the value, marks the hook failed and runs the tool anyway. A decision that needs a human is therefore returned to Codex as a `deny` whose reason says the command was not run and that approving it in chat does not unblock it (the decision is deterministic, so a retry is denied again); there is no in-Codex button to approve it. The user runs the command themselves or changes the policy profile. An ambiguous cloud request is the one exception: its reason points to the session policy-manager agent, and a classification of approved is accepted for the session, so a retry passes. Codex's own approval prompt (`PermissionRequest`) is left to Codex for the requests it would ask about, and an approval is returned as `allow`.
 
 ## Audit API and reported outcomes
 
@@ -159,9 +171,9 @@ Or an execution report:
 }
 ```
 
-Human responses are `approved` or `denied`. Execution statuses are `completed`, `succeeded`, `failed`, or `cancelled`. Reports use the source `policy-manager.adapter-report`. They are observations declared by the caller and never modify permission decisions or caches. The API does not authenticate a human identity. A denial policy remains a human decision even after an approval report is recorded.
+Human responses are `approved` or `denied`. Execution statuses are `completed`, `succeeded`, `failed`, `cancelled`, or `unknown`. `unknown` is recorded for Codex when the hook payload exposes no exit status, which is the usual case for a Bash result. Reports use the source `policy-manager.adapter-report`. They are observations declared by the caller and never modify permission decisions or caches. The API does not authenticate a human identity. A denial policy remains a human decision even after an approval report is recorded.
 
-Generated post-tool hooks record execution reports for the supported tool matcher. Claude and Copilot also get failure hooks. Codex uses `PostToolUse`, which can carry nonzero exit codes. When an exit code is absent, the adapter records `completed` rather than inventing success. Output text and error bodies are discarded. Human responses require an explicit report from the host; the native hooks do not provide a universal human-response signal.
+Generated post-tool hooks record execution reports for the supported tool matcher. Claude and Copilot also get failure hooks. Codex uses `PostToolUse`, which also runs after commands that exit non-zero. Codex sends a Bash result as the command's output text only, with no exit code and no duration, so the adapter records `unknown` for Codex rather than `completed` or `succeeded`; a structured `exit_code` is used when one is present. Claude and Copilot record `completed` when an exit code is absent. Output text and error bodies are discarded. Human responses require an explicit report from the host; the native hooks do not provide a universal human-response signal.
 
 The shared logger redacts structured sensitive fields, validates events, locks concurrent access, and flushes each append. Queries cover active and rotated segments. Busy storage, a stale lock, incomplete records, capacity limits, or write failures prevent automatic approval. The initial API is a library plus CLI; an additional resident logging server is deferred until another consumer needs one.
 
@@ -172,7 +184,7 @@ Tests exercise real service processes and native-shaped hook payloads for all th
 Verified documentation, November 5, 2026:
 
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks)
-- [Codex hooks](https://learn.chatgpt.com/docs/hooks)
+- [Codex hooks](https://developers.openai.com/codex/hooks)
 - [Copilot hooks](https://docs.github.com/en/copilot/reference/hooks-reference)
 
 Exit codes: 0 means a protocol response was returned; inspect `decision` before acting. 1 means invalid input or service failure. Pre-tool hook failures use 2. Diagnostics use stderr and contain no raw request data.

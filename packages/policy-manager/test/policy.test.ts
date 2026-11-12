@@ -281,9 +281,15 @@ test("audit failure prevents an automatic approval", () => {
 test("post-tool reports preserve uncertainty and discard raw tool output", () => {
   const r = request("az resource list");
   expect(
+    executionReport({ ...r, harness: "copilot" }, "PostToolUse", {
+      toolResult: { textResultForLlm: "private-output" },
+    }).status,
+  ).toBe("completed");
+  // Codex sends no exit code at all, so the outcome is unknown rather than completed.
+  expect(
     executionReport(r, "PostToolUse", { toolResult: { textResultForLlm: "private-output" } })
       .status,
-  ).toBe("completed");
+  ).toBe("unknown");
   const failed = executionReport(r, "PostToolUse", {
     tool_response: { exit_code: 1, stderr: "private-error" },
   });
