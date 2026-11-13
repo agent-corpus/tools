@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { tempRoots } from "../src/evidence.js";
 import { evaluate, hash } from "../src/policy.js";
@@ -256,6 +256,32 @@ describe("deletion in scratch and temp directories", () => {
       if (!command.includes("~root") && !command.includes("~+")) refused(command, "/");
     }
     expect(write("~/policy-test-x").decision).toBe("human");
+  });
+
+  test("`..` after a symlink leaves the link's target, as the kernel does", () => {
+    // `away/inner` is a link to a directory inside the main checkout: `away/inner/..` is `main`.
+    mkdirSync(join(main, "inner"), { recursive: true });
+    const away = join(outside, "dotdot");
+    mkdirSync(away, { recursive: true });
+    link(join(main, "inner"), join(away, "inner"), true);
+    for (const command of [
+      "rm -rf inner/../a.txt",
+      "rmdir inner/../x",
+      "find inner/../x -delete",
+      "echo x > inner/../a.txt",
+      "touch inner/../x",
+      "mkdir -p inner/../x",
+      "echo x | tee inner/../x",
+      `cp ${posix(join(outside, "notes.md"))} inner/../x`,
+      "cd inner && rm -rf ../a.txt",
+      "cd inner && echo x > ../a.txt",
+      `rm -rf ${posix(away)}/inner/../a.txt`,
+    ])
+      refused(command, away);
+    expect(write(`${join(away, "inner")}${sep}..${sep}a.txt`).decision).toBe("human");
+    // Without a symlink, `..` stays inside the temp directory.
+    mkdirSync(join(away, "plain"), { recursive: true });
+    approved("rm -rf plain/../plain", away);
   });
 
   test("functions, loops and cd do not launder a target", () => {

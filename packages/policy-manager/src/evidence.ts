@@ -9,16 +9,38 @@ import {
   statSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 /**
  * A shell word as an absolute path, with a leading `~` expanded as the shell does. `~user`, `~+`,
  * `~-` and zsh's `=name` (the path of an executable) cannot be resolved here and throw.
+ *
+ * `..` is applied the way the kernel does, to the directory a symlink points to: `link/../x` names
+ * `x` beside the link's target, not beside the link.
  */
 export function resolveWord(cwd: string, word: string): string {
-  if (/^~(?:[\\/]|$)/.test(word)) return join(homedir(), word.slice(1));
-  if (word.startsWith("~") || word.startsWith("=")) throw new Error("Unresolvable expansion");
-  return resolve(cwd, word);
+  let base: string;
+  let rest: string;
+  if (/^~(?:[\\/]|$)/.test(word)) {
+    base = homedir();
+    rest = word.slice(2);
+  } else if (word.startsWith("~") || word.startsWith("=")) {
+    throw new Error("Unresolvable expansion");
+  } else if (isAbsolute(word)) {
+    base = parse(word).root;
+    rest = word.slice(base.length);
+  } else {
+    base = cwd;
+    rest = word;
+  }
+  const parts = rest.split(/[\\/]+/);
+  if (!parts.includes("..")) return resolve(base, rest);
+  let current = resolve(base);
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    current = part === ".." ? dirname(canonical(current)) : join(current, part);
+  }
+  return current;
 }
 
 export function git(cwd: string, args: string[]): string {

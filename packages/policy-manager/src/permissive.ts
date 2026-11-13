@@ -180,12 +180,18 @@ export function human(request: Request, category: Decision["category"], reason: 
 const GH_TEXT = new Set(["--body", "-b", "--title", "-t", "--jq", "-q", "--template", "--notes"]);
 /** Short options that take a value, per program; the value is never the pattern or script. */
 const SHORT_VALUES: Record<string, string> = {
-  sed: "fl",
-  grep: "ABCDdfm",
-  egrep: "ABCDdfm",
-  fgrep: "ABCDdfm",
+  sed: "f",
+  grep: "ABDdfm",
+  egrep: "ABDdfm",
+  fgrep: "ABDdfm",
   rg: "ABCEfgjMmrTt",
 };
+/**
+ * Options that take a separate value in GNU but none in BSD (`sed -l`, BSD `grep -C[num]` and
+ * `--context[=num]`). Which word is the value is unknowable, so every operand is checked.
+ */
+const DUAL_SHORT: Record<string, string> = { sed: "l", grep: "C", egrep: "C", fgrep: "C" };
+const DUAL_LONG = new Set(["grep", "egrep", "fgrep"]); // `--context`
 const GREP_LONG_VALUES = [
   "--after-context",
   "--before-context",
@@ -344,6 +350,7 @@ function textOperands(
       const eq = word.indexOf("=");
       const name = longOption(program, eq < 0 ? word : word.slice(0, eq));
       if (name === undefined) return everyWord;
+      if (name === "--context" && eq < 0 && DUAL_LONG.has(program)) return everyWord;
       if (name === "--expression" || name === "--regexp") {
         explicit = true;
         if (eq >= 0) scripts.push([index, word.slice(eq + 1)]);
@@ -363,6 +370,7 @@ function textOperands(
       for (let at = 1; at < word.length; at++) {
         const flag = word[at] ?? "";
         if (program === "sed" && flag === "i") break; // the rest is a backup suffix
+        if (DUAL_SHORT[program]?.includes(flag)) return everyWord;
         if (flag === "e") {
           explicit = true;
           if (at + 1 < word.length) scripts.push([index, word.slice(at + 1)]);

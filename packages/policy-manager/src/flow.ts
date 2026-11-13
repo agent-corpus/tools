@@ -1,6 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, posix, resolve } from "node:path";
+import { basename, join, posix } from "node:path";
+import { resolveWord } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -742,7 +743,14 @@ function changeDirectory(
       word.startsWith("-")
     )
       return human(request, "unknown", "Directory change requires human review");
-    cwds = [...new Set([...cwds, ...state.cwds.map((cwd) => resolve(cwd, word))])];
+    // `..` after a symlink leaves the link's target, not the link, as the kernel does.
+    let next: string[];
+    try {
+      next = state.cwds.map((cwd) => resolveWord(cwd, raw as string));
+    } catch {
+      return human(request, "unknown", "Directory change requires human review");
+    }
+    cwds = [...new Set([...cwds, ...next])];
   }
   if (!cwds.length || cwds.length + state.cwds.length > MAX_DIRECTORIES)
     return human(request, "unknown", "Too many directory changes to verify");
