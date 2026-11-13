@@ -35,17 +35,22 @@ export const strictProfile: Profile = {
 };
 
 export const MAX_MCP_READ_ONLY = 200;
-/** Server segment literal; `*` only as the suffix of a non-empty tool segment. */
-const MCP_ENTRY = /^mcp__[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]+\*?$/;
+/**
+ * `mcp__<server>__<tool>` where neither segment contains `__` (so the split is unambiguous); `*`
+ * only as the suffix of a non-empty tool segment.
+ */
+const MCP_ENTRY =
+  /^mcp__[A-Za-z0-9.-]+(?:_[A-Za-z0-9.-]+)*__[A-Za-z0-9.-]+(?:_[A-Za-z0-9.-]+)*(?:_?\*)?$/;
 
 /** Whether `tool` is listed in the profile's `mcpReadOnly`. */
 export function mcpReadOnly(profile: Profile, tool: string): boolean {
   if (!tool.startsWith("mcp__")) return false;
-  return profile.mcpReadOnly.some((entry) =>
-    entry.endsWith("*")
-      ? tool.startsWith(entry.slice(0, -1)) && !tool.slice(entry.length - 1).includes("__")
-      : tool === entry,
-  );
+  return profile.mcpReadOnly.some((entry) => {
+    if (!entry.endsWith("*")) return tool === entry;
+    // The whole tool segment, not just the wildcard's part, must be free of `__`.
+    const server = entry.slice(0, entry.lastIndexOf("__") + 2);
+    return tool.startsWith(entry.slice(0, -1)) && !tool.slice(server.length).includes("__");
+  });
 }
 
 export function defaultProfilePath(): string {

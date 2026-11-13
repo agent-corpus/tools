@@ -40,6 +40,9 @@ describe("mcpReadOnly validation", () => {
     ["a regular expression", ["^mcp__github__.*$"]],
     ["a non-MCP tool", ["Bash"]],
     ["a missing tool segment", ["mcp__github"]],
+    ["an ambiguous server/tool split", ["mcp__a__b__c"]],
+    ["a tool segment starting with _", ["mcp__a___b"]],
+    ["a server segment ending with _", ["mcp__a___b*"]],
     ["a non-string", [1]],
     ["an overlong name", [`mcp__a__${"x".repeat(130)}`]],
     ["too many names", Array.from({ length: MAX_MCP_READ_ONLY + 1 }, (_, i) => `mcp__a__t${i}`)],
@@ -58,6 +61,8 @@ describe("MCP decisions", () => {
     ["mcp__github__get", "native"],
     // A wildcard never reaches past the tool segment into another server's name.
     ["mcp__github__get__evil__tool", "native"],
+    // Server `github__get`, tool `x`: the `__` straddles the wildcard's prefix.
+    ["mcp__github__get__x", "native"],
     ["mcp__github_get_issue", "native"],
   ])("%s -> %s", (tool, expected) => {
     expect(evaluate(request(tool), undefined, listed).decision).toBe(expected);

@@ -134,7 +134,7 @@ Without a profile the engine is strict (everything above). An organization can i
   "cloudWrites": "human",
   "humanPatterns": ["^npm install"],
   "scratchRoots": ["/tmp"],
-  "mcpReadOnly": ["mcp__github__get_issue", "mcp__github__list_*"]
+  "mcpReadOnly": ["mcp__github__get_issue", "mcp__github__list_pull_requests"]
 }
 ```
 
@@ -159,7 +159,9 @@ Every command that could run is judged, not only the first. Understood: `;`, new
 
 #### MCP read-only tools
 
-`mcpReadOnly` lists MCP tools that run without a prompt, in any `mode`. Each entry is an exact `mcp__<server>__<tool>` name, or a name whose tool segment ends in `*` (`mcp__github__list_*`); a wildcard never matches `__`, so it cannot reach another server. Whole-server wildcards (`mcp__github__*`), regular expressions and other tool names are rejected, and the list holds at most 200 entries of 128 characters. List only tools that cannot change anything and cannot return credentials: the tool name is all the engine checks, not the arguments.
+`mcpReadOnly` lists MCP tools that run without a prompt, in any `mode`. Each entry is an exact `mcp__<server>__<tool>` name, or a name whose tool segment ends in `*` (`mcp__docs__search_*`). Neither segment may contain `__`, and a wildcard approves only a tool whose whole tool segment (after `mcp__<server>__`) is free of `__`, so it cannot reach another server such as `github__get`. Whole-server wildcards (`mcp__github__*`), regular expressions and other tool names are rejected, and the list holds at most 200 entries of 128 characters. List only tools that cannot change anything and cannot return credentials: the tool name is all the engine checks, not the arguments. Prefer exact names. A prefix also covers tools that a server adds later, and read-looking prefixes can include secret readers: the GitHub server's `get_*` and `list_*` cover its secret-scanning alert tools, which return the detected secret.
+
+The server segment is whatever name the harness configuration gives the server, and the engine cannot tell where it came from. In Claude Code, a project `.mcp.json` server overrides a user server of the same name, so a repository can register its own `github`. Once the user enables it, its listed tools run without a prompt. List only servers defined in managed or user configuration, and pair the list with the harness's MCP server allowlists (Claude Code `enabledMcpjsonServers`, or managed MCP settings).
 
 A listed tool is approved. Any other MCP tool gets no decision from the policy manager: the harness's own permission flow (allow rules, prompts) handles it exactly as without the hook, so nothing that worked before needs a classification or a new prompt. The audit log records an MCP request with the tool name and argument keys hashed, never argument values.
 
