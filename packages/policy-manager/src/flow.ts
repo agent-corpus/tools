@@ -1522,7 +1522,8 @@ const SHELL_SPECIAL =
   /^(?:BASH\w*|ZSH\w*|SHELLOPTS|EUID|UID|EGID|GID|GROUPS|PPID|USERNAME|ARGC|HISTCMD|LINENO|SECONDS|EPOCH\w*|S?RANDOM|ERRNO|OPTIND|OPTARG|TTYIDLE|SHLVL|COLUMNS|LINES|HISTSIZE|HISTFILESIZE|SAVEHIST|DIRSTACKSIZE|KEYTIMEOUT|LISTMAX|LOGCHECK|MAILCHECK|PERIOD|TMOUT|TRY_BLOCK_\w+|FUNCNAME|FUNCNEST|COMP_\w+|READLINE_\w+)$/;
 
 /**
- * True when the pipeline always succeeds: a literal assignment, `true`, `:`, or `cd` to an absolute directory that exists
+ * True when the pipeline always succeeds: a literal assignment, `true`, `:`,
+ * or `cd` to an absolute directory that exists
  * and can be entered now. Only used to know that an `&&` chain goes on past it; the directory it
  * started from is still kept as possible.
  */

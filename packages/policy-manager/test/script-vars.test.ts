@@ -65,6 +65,7 @@ describe("same-script variables", () => {
     ["{ X=src; } && H=a; ls $H", "unknown"],
     // an assignment that can fail does not let the chain go on
     ["S=$(ls) && H=a.txt; ls $H", "unknown"],
+    ["S=`ls` && H=a.txt; ls $H", "unknown"],
     ["S=src >/dev/null && H=a.txt; ls $H", "unknown"],
     ["UID=src && H=a.txt; ls $H", "unknown"],
     ["SECONDS=src && H=a.txt; ls $H", "unknown"],
