@@ -525,14 +525,19 @@ describe("files this session created", () => {
         cleanup("st.txt");
       }
     }
-    // The plain forms, and a system path to them, still count.
-    for (const command of ["touch st.txt", "/usr/bin/touch st.txt", "echo hi | tee -a st.txt"]) {
+    // The plain forms, and a system path to them, still count. Each uses a fresh name: NTFS
+    // restores a recently deleted name's creation time, which (correctly) fails the birth check.
+    for (const [command, file] of [
+      ["touch p1.txt", "p1.txt"],
+      ["/usr/bin/touch p2.txt", "p2.txt"],
+      ["echo hi | tee -a p3.txt", "p3.txt"],
+    ] as const) {
       const s = session();
-      attempt(s, command, make);
+      attempt(s, command, () => write(join(wt, file), "made by the session"));
       try {
-        expect(rm(s, "rm st.txt").decision, command).toBe("approve");
+        expect(rm(s, `rm ${file}`).decision, command).toBe("approve");
       } finally {
-        cleanup("st.txt");
+        cleanup(file);
       }
     }
   });
