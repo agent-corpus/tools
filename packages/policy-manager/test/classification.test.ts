@@ -520,16 +520,32 @@ describe("the session approves only its own record command", () => {
     ["a non-object answer", own("[1]")],
     ["a non-JSON answer", own("not json")],
     ["an empty answer", own("")],
-  ])("never approved: %s", (_, command) => {
+    ["npx", "npx -y @agent-corpus/policy-manager classify claude s1 <<< '{}'"],
+    ["a node path", `/usr/local/bin/node "${cliPath}" classify claude s1 <<< '{}'`],
+    ["a substitution", `echo $(node "${cliPath}" classify claude s1 <<< '{}')`],
+  ])("goes to a person: %s", (_, command) => {
     const d = recording().review(request(command), undefined, "PreToolUse");
-    expect(d.decision).not.toBe("approve");
+    expect(d.decision).toBe("human");
+    expect(d.reason).toContain("classification record");
   });
 
-  test("never approved with a custom environment or another directory", () => {
+  test("goes to a person with a custom environment or another directory", () => {
     for (const extra of [{ env: { A: "1" } }, { workdir: "/elsewhere" }, { stdin: "x" }]) {
       const r = { ...request(own()), input: { command: own(), ...extra } };
-      expect(recording().review(r, undefined, "PreToolUse").decision).not.toBe("approve");
+      expect(recording().review(r, undefined, "PreToolUse").decision).toBe("human");
     }
+  });
+
+  test.each([
+    'grep -rn "classify claude" src',
+    `grep -rn 'node "${cliPath}" classify claude s1' src`,
+    'git log --oneline --grep "policy-manager classify codex"',
+    "echo policy-manager classify claude",
+  ])("a command that only mentions a record keeps the normal decision: %s", (command) => {
+    const r = request(command);
+    const d = recording().review(r, undefined, "PermissionRequest");
+    expect(d.reason).not.toContain("classification record");
+    expect(d.decision).toBe(evaluate(r, undefined, permissive).decision);
   });
 
   test("without a known CLI path nothing is approved by this check", () => {

@@ -70,12 +70,22 @@ export function isClassifyRecord(
     return false;
   }
 }
-/** A command that looks like a policy-manager classification record, for any session or CLI. */
+const WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s;&|]+)`;
+const CLI = String.raw`(?:"[^"]*cli\.js"|'[^']*cli\.js'|[^\s"';&|]*cli\.js)`;
+/**
+ * A command segment that runs a policy-manager CLI's `classify`, for any session or CLI: `node`
+ * with a `cli.js`, or `policy-manager` (also through `npx`), at the start of the script or after
+ * an operator, with optional assignments before it. Text that only mentions such a command
+ * (a `grep` pattern, a commit message) does not match.
+ */
+const CLASSIFY_INVOCATION = new RegExp(
+  String.raw`(?:^|[;&|({` +
+    "`" +
+    String.raw`\n]|\$\()\s*(?:[A-Za-z_]\w*=${WORD}?\s+)*(?:(?:\S*[/\\])?node(?:\.exe)?\s+(?:-${WORD}\s+)*${CLI}|(?:npx\s+(?:-\S+\s+)*)?(?:@agent-corpus\/)?policy-manager(?:@\S+)?)\s+["']?classify\b`,
+);
+/** A command that runs a policy-manager classification record, for any session or CLI. */
 export function looksLikeClassifyRecord(command: string): boolean {
-  return (
-    /\bclassify\s+["']?(?:claude|codex|copilot)\b/.test(command) &&
-    /policy-manager|cli\.js/.test(command)
-  );
+  return CLASSIFY_INVOCATION.test(command);
 }
 /** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
 function classifyInstruction(
