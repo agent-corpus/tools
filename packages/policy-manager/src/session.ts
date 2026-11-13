@@ -1,5 +1,12 @@
 import { audit, requestSummary } from "./audit.js";
-import { type CreatedFiles, creationTargets, pathKey, stamp, withCreated } from "./created.js";
+import {
+  type CreatedFiles,
+  creationTargets,
+  pathKey,
+  settle,
+  type Target,
+  withCreated,
+} from "./created.js";
 import { evaluate, hash } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
@@ -29,7 +36,7 @@ export class PolicySession {
   private approvedByAi = new Set<string>();
   /** Files this session created, and the paths each approved request may create. */
   private created: CreatedFiles = new Map();
-  private creating = new Map<string, string[]>();
+  private creating = new Map<string, { targets: Target[]; approvedAt: number }>();
   constructor(
     readonly directory: string,
     readonly harness: string,
@@ -191,7 +198,7 @@ export class PolicySession {
       if (targets.length) {
         if (this.creating.size >= 256)
           this.creating.delete(this.creating.keys().next().value ?? "");
-        this.creating.set(decision.requestHash, targets);
+        this.creating.set(decision.requestHash, { targets, approvedAt: Date.now() });
       }
     }
     const { ai: classification, ...safe } = decision;
@@ -245,14 +252,15 @@ export class PolicySession {
         ...(report.durationMs === undefined ? {} : { durationMs: report.durationMs }),
         summary: "Harness-reported execution result",
       });
-      // A path that was new (or already this session's) before the tool ran, and is a regular file
-      // now, is this session's, with the identity it has now.
-      for (const path of this.creating.get(report.requestHash) ?? []) {
-        const now = stamp(path);
-        if (!now) this.created.delete(pathKey(path));
+      // A target is the session's only if `settle` proves the file there is its own inode or a new
+      // one born after the approval; otherwise any earlier claim on the path is dropped.
+      const pending = this.creating.get(report.requestHash);
+      for (const target of pending?.targets ?? []) {
+        const now = settle(target, pending?.approvedAt ?? Number.POSITIVE_INFINITY);
+        if (!now) this.created.delete(pathKey(target.path));
         else {
           if (this.created.size >= 4096) this.created.clear();
-          this.created.set(pathKey(path), now);
+          this.created.set(pathKey(target.path), now);
         }
       }
       this.creating.delete(report.requestHash);

@@ -3,6 +3,7 @@ import { lstatSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createdBySession } from "./created.js";
 import { canonical, inside, isProtectedPath, protectedPath, sensitive } from "./evidence.js";
+import { type Command, parseScript, type Word } from "./script.js";
 import { parseShell } from "./shell.js";
 import type { Request } from "./types.js";
 
@@ -20,6 +21,52 @@ const DESTRUCTIVE_GIT = new Set(["rm", "reset", "checkout", "restore"]);
  * The script may contain these deletions plus `cd` and a few inert commands, without redirections,
  * assignments, wrappers, variables or substitutions.
  */
+/** Words of a plain simple command: no assignment, redirection, variable or substitution. */
+function plainWords(command: Command | undefined): string[] | undefined {
+  if (command?.kind !== "simple" || command.assigns.length || command.redirects.length)
+    return undefined;
+  const text = (word: Word) =>
+    word.subs.length || !word.parts.every((part) => typeof part === "string")
+      ? undefined
+      : word.parts.join("");
+  const words = command.argv.map(text);
+  return words.every((word) => word !== undefined) ? (words as string[]) : undefined;
+}
+
+/**
+ * The one directory a script deletes in when its whole effect is `rm` inside linked feature
+ * worktrees, or undefined. The script may hold only `rm` and inert commands, with no redirection,
+ * assignment, variable or substitution, and at most a leading `cd <dir>` whose list is joined by
+ * `&&` alone: if the cd fails nothing else runs. Every `rm` must be a worktree deletion, so one
+ * classifier verdict on the first cannot carry an unjudged later command.
+ */
+export function deletionScriptCwd(request: Request): string | undefined {
+  const text = request.input.command ?? request.input.cmd;
+  const script = typeof text === "string" ? parseScript(text) : undefined;
+  if (!script?.items.length) return undefined;
+  let cwd = request.cwd;
+  const deletions: string[][] = [];
+  for (const [i, item] of script.items.entries()) {
+    if (item.background) return undefined;
+    const nodes = [item.node.first, ...item.node.rest.map((r) => r.node)];
+    for (const [j, node] of nodes.entries()) {
+      if (node.negated || node.stages.length !== 1) return undefined;
+      const [program, ...args] = plainWords(node.stages[0]) ?? [];
+      if (program === "cd") {
+        const only = i === 0 && j === 0 && script.items.length === 1;
+        const anded = item.node.rest.every((r) => r.op === "&&");
+        if (!only || !anded || args.length !== 1 || /^[~-]/.test(args[0] as string))
+          return undefined;
+        cwd = resolve(cwd, args[0] as string);
+      } else if (program === "rm") deletions.push(args);
+      else if (!program || !INERT.has(program)) return undefined;
+    }
+  }
+  return deletions.length && deletions.every((args) => worktreeDeletion(cwd, args))
+    ? cwd
+    : undefined;
+}
+
 export function soleEffect(request: Request): boolean {
   const command = request.input.command ?? request.input.cmd;
   if (typeof command !== "string") return false;

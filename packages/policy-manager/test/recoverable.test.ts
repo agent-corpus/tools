@@ -103,6 +103,13 @@ beforeAll(() => {
   write(join(wt, "ign", "x.log"), "ignored");
   write(join(wt, "new.txt"), "untracked");
   if (links) symlinkSync("a.txt", join(wt, "newlink"));
+  // Untracked user files, born well before any approval in the tests.
+  for (const name of ["user1.md", "user2.md", "user3.md", "user4.md"])
+    write(join(wt, "user", name), `user notes ${name}`);
+  const born = Date.now() + 300;
+  while (Date.now() < born) {
+    /* let the user files' birth times fall outside the approval slack */
+  }
 });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
@@ -392,6 +399,96 @@ describe("files this session created", () => {
       const r = bash(s, command, cwd);
       expect(s.review(r, undefined, "PreToolUse").tier).toBeUndefined();
       expect(evaluate(r, verdict(r, true, 0.99), profile).decision).toBe("human");
+    }
+  });
+
+  /** Approves, runs and reports a Bash command whose effect `effect` performs. */
+  function run(s: PolicySession, command: string, effect: () => void) {
+    const r = bash(s, command);
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
+    effect();
+    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+  }
+  const user = (name: string) => join(wt, "user", name);
+  const restore = (name: string, from: string) => {
+    renameSync(join(wt, from), user(name));
+  };
+
+  test("a renamed user file is not the session's, whatever touches it next", () => {
+    for (const [command, append] of [
+      ["mv user/user1.md x.txt && touch x.txt", () => {}],
+      ["mv user/user1.md x.txt; echo >> x.txt", () => appendFileSync(join(wt, "x.txt"), "\n")],
+      ["mv user/user1.md x.txt && tee -a x.txt < /dev/null", () => {}],
+    ] as const) {
+      const s = session();
+      run(s, command, () => {
+        renameSync(user("user1.md"), join(wt, "x.txt"));
+        append();
+      });
+      try {
+        expect(rm(s, "rm x.txt").decision).not.toBe("approve");
+      } finally {
+        restore("user1.md", "x.txt");
+      }
+    }
+  });
+
+  test("a path stays the session's only while its stamp still matches", () => {
+    const s = session();
+    create(s, "g.txt");
+    try {
+      run(s, "mv user/user2.md g.txt", () => renameSync(user("user2.md"), join(wt, "g.txt")));
+      expect(rm(s, "rm g.txt").decision).not.toBe("approve");
+      run(s, "echo done >> g.txt", () => appendFileSync(join(wt, "g.txt"), "done\n"));
+      expect(rm(s, "rm g.txt").decision).not.toBe("approve");
+    } finally {
+      restore("user2.md", "g.txt");
+    }
+    create(s, "f.txt");
+    try {
+      rmSync(join(wt, "f.txt"));
+      write(join(wt, "f.txt"), "a person's replacement");
+      run(s, "touch f.txt", () => {});
+      expect(rm(s, "rm f.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("f.txt");
+    }
+  });
+
+  test("worktree deletion is classified only when it is the script's whole effect", () => {
+    const classified = (command: string, cwd = wt) => {
+      const s = session();
+      return s.review(bash(s, command, cwd), undefined, "PreToolUse").tier === "ambiguous";
+    };
+    expect(classified("rm new.txt")).toBe(true);
+    expect(classified("ls && rm new.txt; echo done")).toBe(true);
+    if (links) expect(classified(`cd ${wt} && rm new.txt`, repo)).toBe(true);
+    const masked = [
+      "rm new.txt && git push --force origin feature",
+      "rm new.txt; git clean -fdx",
+      "rm new.txt; git branch -D withf",
+      "rm new.txt; npm publish",
+      "rm new.txt; sudo true",
+      "rm new.txt; az group delete --yes -n x",
+      "rm new.txt; curl -X DELETE https://example.com/x",
+      "rm new.txt; rm -rf ~/Documents",
+      "rm new.txt; cat ~/.ssh/id_rsa",
+      "rm new.txt > ~/.zshrc",
+      "rm new.txt && git reset --hard HEAD~1",
+      "cd dir; rm b.txt",
+      "cd dir || rm new.txt",
+    ];
+    if (links) masked.push(`cd ${repo}; rm new.txt`);
+    for (const command of masked) {
+      expect(classified(command), command).toBe(false);
+      const r = bash(session(), command);
+      const verdict = {
+        requestHash: hash(r),
+        category: "destructive" as const,
+        confidence: 0.99,
+        recoverable: true,
+      };
+      expect(evaluate(r, verdict, profile).decision, command).not.toBe("approve");
     }
   });
 

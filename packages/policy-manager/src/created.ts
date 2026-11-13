@@ -17,7 +17,20 @@ export interface Stamp {
 }
 export type CreatedFiles = Map<string, Stamp>;
 
+/**
+ * A path an approved request may create or rewrite. `prior` is the identity that may carry over:
+ * the session's own file being edited in place, or its own file being moved there. Any other file
+ * found there afterwards must be a new inode.
+ */
+export interface Target {
+  path: string;
+  prior?: Stamp;
+}
+
 export const pathKey = (path: string) => createHash("sha256").update(path).digest("hex");
+
+/** Coarse filesystem clocks can stamp a new file slightly before the approval was given. */
+const BIRTH_SLACK_MS = 100;
 
 /** `path` with its parent symlinks resolved; the last component stays as written. */
 export function located(cwd: string, path: string): string | undefined {
@@ -66,32 +79,37 @@ export function createdBySession(path: string): boolean {
   return current !== undefined && owns(current, path);
 }
 
-function owns(created: CreatedFiles, path: string | undefined): boolean {
+/** The session's recorded stamp for `path`, if the file there still matches it exactly. */
+function owned(created: CreatedFiles, path: string | undefined): Stamp | undefined {
   const recorded = path === undefined ? undefined : created.get(pathKey(path));
   const now = recorded && stamp(path as string);
-  return (
-    !!recorded &&
-    !!now &&
+  return recorded &&
+    now &&
     now.dev === recorded.dev &&
     now.ino === recorded.ino &&
     now.size === recorded.size &&
     now.mtimeMs === recorded.mtimeMs
-  );
+    ? recorded
+    : undefined;
+}
+
+function owns(created: CreatedFiles, path: string | undefined): boolean {
+  return owned(created, path) !== undefined;
 }
 
 const WRITE_TOOLS = new Set(["Write", "create", "write_file", "Edit", "edit"]);
 
 /**
- * Paths an approved request may create or rewrite: those that do not exist yet, or that this
- * session created before (so its own later edits keep them its own). Best effort; a path it misses
- * only means a later deletion is classified instead of approved.
+ * Paths an approved request may create or rewrite: those that do not exist yet, or that are still
+ * the session's own file. Best effort; a path it misses only means a later deletion is classified
+ * instead of approved.
  */
-export function creationTargets(request: Request, created: CreatedFiles): string[] {
+export function creationTargets(request: Request, created: CreatedFiles): Target[] {
   const input = request.input;
-  const found: string[] = [];
-  const add = (cwd: string, path: string) => {
+  const found: Target[] = [];
+  const add = (cwd: string, path: string, prior?: Stamp) => {
     const at = located(cwd, path);
-    if (at) found.push(at);
+    if (at) found.push({ path: at, ...(prior ? { prior } : {}) });
   };
   if (WRITE_TOOLS.has(request.tool)) {
     const file = input.file_path ?? input.path;
@@ -102,11 +120,11 @@ export function creationTargets(request: Request, created: CreatedFiles): string
       if (line.startsWith("*** Add File: ")) add(request.cwd, line.slice(14));
       if (line.startsWith("*** Update File: ")) {
         source = located(request.cwd, line.slice(17));
-        if (source) found.push(source);
+        if (source) found.push({ path: source });
       }
       // A move keeps the source's content, so the target is the session's only if the source was.
-      if (line.startsWith("*** Move to: ") && owns(created, source))
-        add(request.cwd, line.slice(13));
+      const moved = owned(created, source);
+      if (line.startsWith("*** Move to: ") && moved) add(request.cwd, line.slice(13), moved);
     }
   } else {
     const command = input.command ?? input.cmd;
@@ -126,13 +144,39 @@ export function creationTargets(request: Request, created: CreatedFiles): string
         if (program === "cp" && words.length >= 2) add(cwd, words.at(-1) as string);
         // `mv` keeps the source's inode and content: the target is the session's only when the
         // source was, or `mv notes.md x; rm x` would delete someone else's file unprompted.
-        if (
+        const moved =
           program === "mv" &&
           words.length === 2 &&
-          owns(created, located(cwd, words[0] as string))
-        )
-          add(cwd, words[1] as string);
+          owned(created, located(cwd, words[0] as string));
+        if (moved) add(cwd, words[1] as string, moved);
       }
   }
-  return [...new Set(found)].filter((path) => !exists(path) || created.has(pathKey(path)));
+  const unique = new Map<string, Target>();
+  for (const target of found) {
+    // Only a path that is new, or still exactly the session's file, can become or stay its own.
+    const own = owned(created, target.path);
+    if (exists(target.path) && !own) continue;
+    const prior = target.prior ?? own ?? unique.get(target.path)?.prior;
+    unique.set(target.path, { path: target.path, ...(prior ? { prior } : {}) });
+  }
+  return [...unique.values()];
+}
+
+/**
+ * The session's stamp for a target after its tool ran, or undefined. A file is the session's only
+ * if it is the prior inode (its own file, edited or moved there) or a new inode born after the
+ * approval. A rename keeps the birth time, so `mv notes.md x && touch x` does not qualify. Without
+ * a birth time from the platform, nothing new is recorded.
+ */
+export function settle(target: Target, approvedAt: number): Stamp | undefined {
+  let s: ReturnType<typeof lstatSync>;
+  try {
+    s = lstatSync(target.path);
+  } catch {
+    return undefined;
+  }
+  if (!s.isFile()) return undefined;
+  const now = { dev: s.dev, ino: s.ino, size: s.size, mtimeMs: s.mtimeMs };
+  if (target.prior && now.dev === target.prior.dev && now.ino === target.prior.ino) return now;
+  return s.birthtimeMs > 0 && s.birthtimeMs >= approvedAt - BIRTH_SLACK_MS ? now : undefined;
 }

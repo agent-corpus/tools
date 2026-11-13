@@ -15,6 +15,7 @@ import { evaluateArgv, result } from "./policy.js";
 import type { Profile } from "./profile.js";
 import {
   deletesProtected,
+  deletionScriptCwd,
   gitRmRecoverable,
   resetRecoverable,
   restoreRecoverable,
@@ -824,7 +825,11 @@ export function simpleDecision(
         kind === "tracked" ? RECOVERABLE : SESSION_CREATED,
         true,
       );
-    if (worktreeDeletion(cwd, args)) return human(request, "destructive", WORKTREE_DELETION);
+    // Classified only when this `rm` is the script's whole effect, in its one known directory;
+    // otherwise this first refusal would hide every later command from the classifier's verdict.
+    const only = depth === 0 ? deletionScriptCwd(request) : undefined;
+    if (only !== undefined && resolve(only) === resolve(cwd) && worktreeDeletion(cwd, args))
+      return human(request, "destructive", WORKTREE_DELETION);
   }
   if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
     return human(request, "destructive", "Destructive operation requires human approval");
