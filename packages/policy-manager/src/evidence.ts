@@ -31,8 +31,10 @@ export function resolveWord(cwd: string, word: string): string {
   } else if (word.startsWith("~") || word.startsWith("=")) {
     throw new Error("Unresolvable expansion");
   } else if (isAbsolute(word)) {
-    base = parse(word).root;
-    rest = word.slice(base.length);
+    const root = parse(word).root;
+    // On Windows a drive-less root (`/etc`) is on the cwd's drive, not the process's.
+    base = resolve(cwd, root);
+    rest = word.slice(root.length);
   } else {
     base = cwd;
     rest = word;
