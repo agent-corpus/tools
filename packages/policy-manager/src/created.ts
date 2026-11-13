@@ -99,11 +99,72 @@ function owns(created: CreatedFiles, path: string | undefined): boolean {
 
 const WRITE_TOOLS = new Set(["Write", "create", "write_file", "Edit", "edit"]);
 /**
- * Commands whose output content is the session's own: echo/printf-style writers behind a
- * redirect, `touch`, `tee`, `cp` (the source survives), `mv` of the session's own file, and inert
- * commands. Anything else may move a user's data into a new file.
+ * The allowlist for shell scripts that record creations. A new inode proves nothing about its
+ * content (`gzip notes.md && touch notes.md.gz`, `git stash pop && touch x`), so every simple
+ * command must be one of these, in the form the checks below accept, or nothing is recorded.
  */
 const CREATING = new Set(["touch", "tee", "cp", "mv", "cd", "pwd", "echo", "printf", "ls", "true"]);
+/** Absolute directories whose `touch`, `cp`, ... are the system tools, not a lookalike script. */
+const SYSTEM_BIN = /^\/(?:usr\/(?:local\/)?)?bin\/[^/]+$|^\/opt\/homebrew\/bin\/[^/]+$/;
+
+/** The allowlisted program `word` names, or undefined (a relative path may be any script). */
+function program(word: string | undefined): string | undefined {
+  if (!word || (word.includes("/") && !SYSTEM_BIN.test(word))) return undefined;
+  const name = basename(word);
+  return CREATING.has(name) ? name : undefined;
+}
+
+/**
+ * Creation targets of a plain script, or undefined when any command is not provably on the
+ * allowlist. A substitution, process substitution, heredoc, assignment, wrapper (`env`, `xargs`,
+ * `time`, `nice`, `command`), nested shell or unknown option makes the whole script record
+ * nothing; so does `mv` or `cp` from a file the session does not own when the hook runs (an
+ * earlier command in the same script cannot confer ownership).
+ */
+function shellTargets(
+  pipelines: NonNullable<ReturnType<typeof parseShell>>,
+  start: string,
+  created: CreatedFiles,
+): Target[] | undefined {
+  const found: Target[] = [];
+  let cwd = start;
+  const add = (path: string, prior?: Stamp) => {
+    const at = located(cwd, path);
+    if (!at) return false;
+    found.push({ path: at, ...(prior ? { prior } : {}) });
+    return true;
+  };
+  for (const stages of pipelines)
+    for (const c of stages) {
+      if (c.subs.length || c.env.length || c.stdin !== undefined) return undefined;
+      const name = program(c.argv[0]);
+      if (!name) return undefined;
+      const args = c.argv.slice(1);
+      const flags = args.filter((word) => word.startsWith("-"));
+      const words = args.filter((word) => !word.startsWith("-"));
+      for (const r of c.redirects)
+        if ((r.op === ">" || r.op === ">>") && r.target !== "/dev/null" && !add(r.target))
+          return undefined;
+      if (name === "cd") {
+        if (args.length !== 1 || flags.length) return undefined;
+        cwd = resolve(cwd, args[0] as string);
+      } else if (name === "touch") {
+        if (flags.length) return undefined;
+        for (const word of words) if (!add(word)) return undefined;
+      } else if (name === "tee") {
+        if (flags.some((flag) => flag !== "-a")) return undefined;
+        for (const word of words) if (!add(word)) return undefined;
+      } else if (name === "cp" || name === "mv") {
+        if (flags.some((flag) => flag !== "-f" && flag !== "-v") || words.length !== 2)
+          return undefined;
+        // Only from a file the session owns now: `mv` keeps its inode, `cp` copies its content.
+        const source = owned(created, located(cwd, words[0] as string));
+        if (!source || !add(words[1] as string, name === "mv" ? source : undefined))
+          return undefined;
+      }
+    }
+  return found;
+}
 
 /**
  * Paths an approved request may create or rewrite: those that do not exist yet, or that are still
@@ -135,32 +196,9 @@ export function creationTargets(request: Request, created: CreatedFiles): Target
   } else {
     const command = input.command ?? input.cmd;
     const pipelines = typeof command === "string" ? parseShell(command) : undefined;
-    // A new inode proves nothing about its content: `gzip notes.md && touch notes.md.gz` or
-    // `git stash pop && touch x` put a user's data in a file born after the approval. So a script
-    // records creations only when every command in it is a known creating form or inert.
-    if (pipelines?.some((stages) => stages.some(({ argv }) => !CREATING.has(argv[0] ?? ""))))
-      return [];
-    let cwd = request.cwd;
-    for (const stages of pipelines ?? [])
-      for (const { argv, redirects } of stages) {
-        const [program, ...args] = argv;
-        if (program === "cd" && args.length === 1) {
-          cwd = resolve(cwd, args[0] as string);
-          continue;
-        }
-        for (const r of redirects)
-          if ((r.op === ">" || r.op === ">>") && r.target !== "/dev/null") add(cwd, r.target);
-        const words = args.filter((word) => !word.startsWith("-"));
-        if (program === "touch" || program === "tee") for (const word of words) add(cwd, word);
-        if (program === "cp" && words.length >= 2) add(cwd, words.at(-1) as string);
-        // `mv` keeps the source's inode and content: the target is the session's only when the
-        // source was, or `mv notes.md x; rm x` would delete someone else's file unprompted.
-        const moved =
-          program === "mv" &&
-          words.length === 2 &&
-          owned(created, located(cwd, words[0] as string));
-        if (moved) add(cwd, words[1] as string, moved);
-      }
+    const targets = pipelines && shellTargets(pipelines, request.cwd, created);
+    if (!targets) return [];
+    found.push(...targets);
   }
   const unique = new Map<string, Target>();
   for (const target of found) {

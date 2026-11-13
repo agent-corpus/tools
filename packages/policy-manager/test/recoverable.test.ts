@@ -105,7 +105,7 @@ beforeAll(() => {
   write(join(wt, "new.txt"), "untracked");
   if (links) symlinkSync("a.txt", join(wt, "newlink"));
   // Untracked user files, born well before any approval in the tests.
-  for (const name of ["user1.md", "user2.md", "user3.md", "user4.md"])
+  for (const name of ["user1.md", "user2.md", "user3.md", "user4.md", "user5.md"])
     write(join(wt, "user", name), `user notes ${name}`);
   const born = Date.now() + 300;
   while (Date.now() < born) {
@@ -487,6 +487,93 @@ describe("files this session created", () => {
       expect(rm(u, "rm made2.txt made3.txt").decision).toBe("approve");
     } finally {
       cleanup("made2.txt", "made3.txt");
+    }
+  });
+
+  /** Reviews, runs and reports a command, whatever the decision, as the hooks would. */
+  function attempt(s: PolicySession, command: string, effect: () => void) {
+    const r = bash(s, command);
+    s.review(r, undefined, "PreToolUse");
+    effect();
+    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+  }
+
+  test("every command in the script must be provably on the creation allowlist", () => {
+    const make = () => write(join(wt, "st.txt"), "a user's stashed data");
+    for (const command of [
+      "echo $(git stash pop) && touch st.txt",
+      "echo `git stash pop` && touch st.txt",
+      "cat <(git stash pop) > st.txt",
+      "bash -c 'git stash pop; touch st.txt'",
+      "sh -c 'touch st.txt'",
+      "env touch st.txt",
+      "echo st.txt | xargs touch",
+      "time touch st.txt",
+      "nice touch st.txt",
+      "command touch st.txt",
+      "./touch st.txt",
+      "/tmp/evil/touch st.txt",
+      "touch -r user/user4.md st.txt",
+      "X=1 touch st.txt",
+      "touch $HOME/../st.txt",
+    ]) {
+      const s = session();
+      attempt(s, command, make);
+      try {
+        expect(rm(s, "rm st.txt").decision, command).not.toBe("approve");
+      } finally {
+        cleanup("st.txt");
+      }
+    }
+    // The plain forms, and a system path to them, still count.
+    for (const command of ["touch st.txt", "/usr/bin/touch st.txt", "echo hi | tee -a st.txt"]) {
+      const s = session();
+      attempt(s, command, make);
+      try {
+        expect(rm(s, "rm st.txt").decision, command).toBe("approve");
+      } finally {
+        cleanup("st.txt");
+      }
+    }
+  });
+
+  test("mv and cp count only from a file the session owns when the hook runs", () => {
+    // Ownership cannot chain through earlier commands in the same script.
+    const s = session();
+    attempt(
+      s,
+      "mv user/user4.md x4.txt && cp x4.txt y4.txt && mv y4.txt x4.txt && touch x4.txt",
+      () => {
+        renameSync(user("user4.md"), join(wt, "x4.txt"));
+        write(join(wt, "y4.txt"), "user notes user4.md");
+        renameSync(join(wt, "y4.txt"), join(wt, "x4.txt"));
+      },
+    );
+    try {
+      expect(rm(s, "rm x4.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("x4.txt", "y4.txt");
+      write(user("user4.md"), "user notes user4.md");
+    }
+    // A copy of a user's file is not the session's.
+    const t = session();
+    attempt(t, "cp user/user5.md y.txt", () => write(join(wt, "y.txt"), "user notes user5.md"));
+    try {
+      expect(rm(t, "rm y.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("y.txt");
+    }
+    // From the session's own file, both still count, also via a system path.
+    const u = session();
+    create(u, "mine.txt");
+    attempt(u, "cp mine.txt copy.txt", () => write(join(wt, "copy.txt"), "probe"));
+    attempt(u, "/bin/mv mine.txt moved.txt", () =>
+      renameSync(join(wt, "mine.txt"), join(wt, "moved.txt")),
+    );
+    try {
+      expect(rm(u, "rm copy.txt moved.txt").decision).toBe("approve");
+    } finally {
+      cleanup("mine.txt", "copy.txt", "moved.txt");
     }
   });
 
