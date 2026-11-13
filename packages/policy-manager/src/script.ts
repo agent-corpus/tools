@@ -429,6 +429,8 @@ function expansion(command: string, at: number, quoted = false): Expansion | und
     const parsed = parameter(body);
     if (!parsed) return undefined;
     ({ name, op } = parsed);
+  } else if (rest[0] && /[0-9]/.test(rest[0]) && /[0-9]/.test(rest[1] ?? "")) {
+    return undefined; // `$10` is `$1` then `0` in bash and sh, the tenth parameter in zsh
   } else if (rest[0] && "?#$0".includes(rest[0])) {
     return { kind: "unknown", next: at + 2 };
   } else if (rest[0] && /[1-9@*]/.test(rest[0])) {

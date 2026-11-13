@@ -788,6 +788,24 @@ describe("functions, positional parameters, parameter operations and read loops"
     ['p="ok src"; f() { touch "$2$HOME/.probe"; }; f $p', "unknown"],
     // `set` with a non-option word replaces the positional parameters
     ['set -- ok; set -e pipefail; touch "$1"', "unknown"],
+    // `return` can stop a body anywhere, so what it assigns afterwards is unknown
+    ["f() { return; X=ok; }; X=$HOME/.probe; f; touch $X", "unknown"],
+    ['f() { [ -n "$1" ] || return 1; X=ok; }; X=$HOME/.probe; f ""; touch $X', "unknown"],
+    ['f() { if [ -z "$1" ]; then return; fi; X=ok; }; X=$HOME/.probe; f; touch $X', "unknown"],
+    ["f() { g; X=ok; }; g() { return; }; X=$HOME/.probe; f; touch $X", "unknown"],
+    ['f() { [ -n "$1" ] || return 0; cd src; }; f && echo x > probe-n.txt', "unknown"],
+    ["f() { X=return; $X; Y=ok; }; Y=$HOME/.probe; f; touch $Y", "unknown"],
+    // once a function is recorded, removing a definition could unshadow the real program
+    ["touch() { echo no; }; unset touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset X touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; \\unset touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; f() { unset touch; }; f; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unfunction touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unhash -f touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; disable -f touch; touch $HOME/.probe", "unknown"],
+    // zsh reads $10 as the tenth parameter, bash and sh as $1 then 0
+    ['f() { touch "$10$HOME/.probe"; }; f x', "unknown"],
+    ['set -- x; touch "$10$HOME/.probe"', "unknown"],
     // functions zsh and bash run with no call
     ["TRAPEXIT() { rm -rf x; }; echo hi", "unknown"],
     ["TRAPZERR() { rm -rf x; }; false", "unknown"],
@@ -891,6 +909,9 @@ describe("functions, positional parameters, parameter operations and read loops"
     "X=src; ls ${X:-other}",
     'f() { ls "$1"; }; f src',
     'f() { [ -n "$1" ] || return 1; echo $1; }; f a',
+    'f() { [ -n "$1" ] || return 1; X=src; }; f a; echo $X',
+    "f() { ls; }; X=1; unset -v X; f",
+    'f() { echo "${1}0"; }; f a',
     'f() { echo "$@"; }; f a b',
     "f() {\n  ls $1\n}\nf src; f .",
     'pid() { echo "$1"; }; echo "a $(pid x) b"',

@@ -600,6 +600,18 @@ function runSimple(
         "unknown",
         "A function behind a variable or wrapper requires human review",
       );
+    // `unset name` removes a function when no variable has that name, and zsh has its own
+    // removers, so a recorded function could stop shadowing the real program.
+    const args = unwrap(argv).argv.slice(1);
+    if (
+      state.funcs.size &&
+      (UNDEFINES.has(effective) || (effective === "unset" && !args.includes("-v")))
+    )
+      return human(
+        request,
+        "unknown",
+        "Removing a definition after defining a function requires human review",
+      );
   }
   if (literal !== undefined && state.funcs.has(literal)) {
     const fn = state.funcs.get(literal);
@@ -846,13 +858,79 @@ function callFunction(
   const slots = argumentSlots(node.argv.slice(1), state, known, envs);
   const saved = clearPositional(state);
   bindPositional(ctx, state, slots);
+  // `return` can stop the body anywhere, so the state after the call is any point in it: what the
+  // body assigns is unknown, and a directory change in between cannot be followed.
+  const returns = mayRun(fn.body.body, new Set(["return"]), state.funcs);
+  const moves = mayRun(fn.body.body, new Set(["cd", "pushd", "popd"]), state.funcs);
   const inner = { ...ctx, calls: ctx.calls + 1 };
   const target = fn.body.kind === "subshell" ? copy(state) : state;
   const body = runList(inner, fn.body.body, target);
   if (body) return body;
+  if (returns && moves && fn.body.kind === "group")
+    return human(
+      request,
+      "unknown",
+      "A function that can return early and change directory requires human review",
+    );
+  if (returns) {
+    const changed = new Set<string>();
+    assignedInList(fn.body.body, changed, state.funcs);
+    forget(state, changed);
+  }
   clearPositional(state);
   for (const [name, values] of saved) state.vars.set(name, values);
   return undefined;
+}
+
+/**
+ * True when a command named in `names`, or one whose name is not a literal, may run in the list,
+ * including in the bodies of known functions it calls. Substitutions run in a subshell and are
+ * not searched.
+ */
+function mayRun(
+  list: ListNode,
+  names: Set<string>,
+  funcs: Funcs,
+  seen = new Set<string>(),
+): boolean {
+  const lists = (ls: ListNode[]) => ls.some((l) => mayRun(l, names, funcs, seen));
+  const command = (c: Command): boolean => {
+    switch (c.kind) {
+      case "simple": {
+        if (!c.argv.length) return false;
+        const program = plainText(c.argv[0]);
+        if (program === undefined || names.has(basename(program))) return true;
+        const fn = funcs.get(program);
+        if (fn === null) return true;
+        if (fn && !seen.has(program)) {
+          seen.add(program);
+          return mayRun(fn.body.body, names, funcs, seen);
+        }
+        return c.argv.slice(1).some((w) => names.has(plainText(w) ?? ""));
+      }
+      case "function":
+        return false;
+      case "subshell":
+        return false;
+      case "group":
+        return lists([c.body]);
+      case "for":
+        return lists([c.body]);
+      case "while":
+        return lists([c.cond, c.body]);
+      case "if":
+        return lists([
+          ...c.clauses.flatMap((cl) => [cl.cond, cl.body]),
+          ...(c.otherwise ? [c.otherwise] : []),
+        ]);
+      case "case":
+        return lists(c.branches.map((b) => b.body));
+    }
+  };
+  return list.items.some((item) =>
+    // zsh runs a pipeline's last stage in this shell, so every stage is searched.
+    [item.node.first, ...item.node.rest.map((r) => r.node)].some((p) => p.stages.some(command)),
+  );
 }
 
 /**
@@ -881,6 +959,9 @@ const NOT_A_FUNCTION = new Set([
   "unfunction",
   "alias",
 ]);
+
+/** Builtins that can remove or replace a function definition. */
+const UNDEFINES = new Set(["unfunction", "unhash", "disable", "enable", "functions", "autoload"]);
 
 /**
  * Functions a shell runs with no call: zsh's special functions (zshmisc "Special Functions": the
