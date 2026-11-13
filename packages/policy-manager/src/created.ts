@@ -102,8 +102,10 @@ const WRITE_TOOLS = new Set(["Write", "create", "write_file", "Edit", "edit"]);
  * The allowlist for shell scripts that record creations. A new inode proves nothing about its
  * content (`gzip notes.md && touch notes.md.gz`, `git stash pop && touch x`), so every simple
  * command must be one of these, in the form the checks below accept, or nothing is recorded.
+ * No `cd` (nor `pushd`, `popd`, `chdir`): whether a skipped `true || cd sub` runs cannot be told
+ * from the text, so a directory change makes the script record nothing.
  */
-const CREATING = new Set(["touch", "tee", "cp", "mv", "cd", "pwd", "echo", "printf", "ls", "true"]);
+const CREATING = new Set(["touch", "tee", "cp", "mv", "pwd", "echo", "printf", "ls", "true"]);
 /** Absolute directories whose `touch`, `cp`, ... are the system tools, not a lookalike script. */
 const SYSTEM_BIN = /^\/(?:usr\/(?:local\/)?)?bin\/[^/]+$|^\/opt\/homebrew\/bin\/[^/]+$/;
 
@@ -142,7 +144,7 @@ function shellTargets(
   created: CreatedFiles,
 ): Target[] | undefined {
   const found: Target[] = [];
-  let cwd = start;
+  const cwd = start;
   const add = (path: string, prior?: Stamp) => {
     const at = literal(path) ? located(cwd, path) : undefined;
     if (!at) return false;
@@ -164,10 +166,7 @@ function shellTargets(
         if (r.op !== ">" && r.op !== ">>") return undefined;
         if (r.target !== "/dev/null" && !add(r.target)) return undefined;
       }
-      if (name === "cd") {
-        if (args.length !== 1 || flags.length || !literal(args[0] as string)) return undefined;
-        cwd = resolve(cwd, args[0] as string);
-      } else if (name === "touch") {
+      if (name === "touch") {
         if (flags.length) return undefined;
         for (const word of words) if (!add(word)) return undefined;
       } else if (name === "tee") {

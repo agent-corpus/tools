@@ -599,6 +599,37 @@ describe("files this session created", () => {
     }
   });
 
+  test("a script with any cd records nothing: a skipped cd cannot be told from the text", () => {
+    // The gate would read cdnotes.md in cdtest/, where the session owns it; the shell skips the cd
+    // and copies the user's cdnotes.md beside it, then overwrites that with the session's file.
+    const y = join(wt, "cd-y.txt");
+    for (const prefix of ["true || cd cdtest", "ls nosuch && cd cdtest"]) {
+      const s = session();
+      create(s, "cdtest/cdnotes.md");
+      create(s, "cdtest/cdmine.txt");
+      write(join(wt, "cdnotes.md"), "user notes beside cdtest");
+      const command = `${prefix}; cp cdnotes.md ${y}; mv cdmine.txt cdnotes.md`;
+      attempt(s, command, () => {
+        write(y, "user notes beside cdtest");
+        write(join(wt, "cdnotes.md"), "session text");
+      });
+      try {
+        expect(rm(s, "rm cd-y.txt").decision, prefix).not.toBe("approve");
+      } finally {
+        cleanup("cdtest", "cdnotes.md", "cd-y.txt");
+      }
+    }
+    // Control: the same copy with no cd still records.
+    const s = session();
+    create(s, "cd-own.txt");
+    attempt(s, "cp cd-own.txt cd-copy.txt", () => write(join(wt, "cd-copy.txt"), "probe"));
+    try {
+      expect(rm(s, "rm cd-copy.txt").decision).toBe("approve");
+    } finally {
+      cleanup("cd-own.txt", "cd-copy.txt");
+    }
+  });
+
   test("mv and cp count only from a file the session owns when the hook runs", () => {
     // Ownership cannot chain through earlier commands in the same script.
     const s = session();
