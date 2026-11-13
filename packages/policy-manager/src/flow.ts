@@ -771,8 +771,20 @@ const GIT_SYMLINK_FREE = new Set([
   ...["branch", "config", "fetch", "remote", "describe", "push", "rev-list", "merge-base"],
   ...["ls-remote", "cat-file", "for-each-ref", "symbolic-ref", "shortlog", "blame", "grep"],
 ]);
-/** gh words that put files on disk: clones, checkouts, downloads, extensions, codespace copies. */
-const GH_WRITES = /^(?:clone|checkout|co|download|extension|ext|codespace|cs|sync|--clone.*)$/;
+/** git options that run another program. */
+const GIT_RUNS = /^(?:-O|--open-files-in-pager|--upload-pack|--receive-pack|--exec|--ext-diff)/;
+/** gh commands that only talk to GitHub or print: `api`, or a group with one of its verbs. */
+const GH_SYMLINK_FREE: Record<string, Set<string>> = {
+  pr: new Set(["view", "list", "diff", "checks", "status", "create", "comment", "edit", "ready"]),
+  issue: new Set(["view", "list", "status", "create", "comment", "edit", "close", "reopen"]),
+  run: new Set(["view", "list", "watch", "rerun", "cancel"]),
+  repo: new Set(["view", "list"]),
+  release: new Set(["view", "list"]),
+  workflow: new Set(["view", "list"]),
+  label: new Set(["list"]),
+  auth: new Set(["status"]),
+  search: new Set(["prs", "issues", "repos", "code", "commits"]),
+};
 /**
  * Whether a command is known to create no symlink. Anything else may plant one anywhere, so
  * later temp paths in the script are no longer trusted. `cp` without options that copy links
@@ -783,19 +795,34 @@ function symlinkFree(argv: string[]): boolean {
   const program = basename(path);
   if (program === "cp") return args.every((arg) => !arg.startsWith("-") || /^-[finpv]+$/.test(arg));
   if (program === "git") {
+    // `-c` can set a pager or other program for this one command.
     let index = 0;
-    while (args[index]?.startsWith("-"))
-      index += ["-C", "-c"].includes(args[index] as string) ? 2 : 1;
+    while (args[index] === "-C" || args[index] === "--no-pager")
+      index += args[index] === "-C" ? 2 : 1;
     const sub = args[index] ?? "";
-    return GIT_SYMLINK_FREE.has(sub) || (sub === "worktree" && args[index + 1] === "list");
+    const rest = args.slice(index + 1);
+    if (rest.some((arg) => GIT_RUNS.test(arg)) || (sub === "ls-remote" && rest.includes("-u")))
+      return false;
+    return GIT_SYMLINK_FREE.has(sub) || (sub === "worktree" && rest[0] === "list");
   }
-  if (program === "gh") return !args.some((arg) => GH_WRITES.test(arg));
+  if (program === "gh") {
+    const [group = "", verb = ""] = args;
+    return group === "api" || !!GH_SYMLINK_FREE[group]?.has(verb);
+  }
   return SYMLINK_FREE.has(program);
 }
 
-/** Once a foreground loop or pipeline ends, nothing in it can run after a later command. */
-function endReorder(ctx: Ctx, approved: boolean): void {
-  if (ctx.loop === 0 && !ctx.reorder) ctx.box.script.approved = approved;
+/** Where a loop or pipeline starts, so its end can tell whether it started a background job. */
+function reorderMark(ctx: Ctx): { approved: boolean; jobs: number } {
+  return { approved: ctx.box.script.approved, jobs: ctx.box.script.jobs };
+}
+/**
+ * Once a foreground loop or pipeline ends, nothing in it can run after a later command, unless
+ * it started a background job, which may still be running.
+ */
+function endReorder(ctx: Ctx, mark: { approved: boolean; jobs: number }): void {
+  if (ctx.loop === 0 && !ctx.reorder && ctx.box.script.jobs === mark.jobs)
+    ctx.box.script.approved = mark.approved;
 }
 
 /** git clone options that take a separate value. */
@@ -1361,7 +1388,7 @@ function runFor(
 ): Decision | undefined {
   if (BANNED_ENV.test(node.name))
     return human(ctx.request, "unknown", "Environment override requires human review");
-  const approved = ctx.box.script.approved;
+  const mark = reorderMark(ctx);
   const refusal = runSubs(
     ctx,
     node.words.flatMap((w) => w.subs),
@@ -1393,7 +1420,7 @@ function runFor(
     const body = runList({ ...ctx, loop: ctx.loop + 1 }, node.body, inner);
     if (body) return body;
   }
-  endReorder(ctx, approved);
+  endReorder(ctx, mark);
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -1408,7 +1435,7 @@ function runWhile(
   assignedInList(node.body, changed, state.funcs);
   const inner = copy(state);
   forget(inner, changed);
-  const approved = ctx.box.script.approved;
+  const mark = reorderMark(ctx);
   const loop = { ...ctx, loop: ctx.loop + 1 };
   const refusal = runList(loop, node.cond, inner);
   if (refusal) return refusal;
@@ -1421,7 +1448,7 @@ function runWhile(
     const body = runList(loop, node.body, pass);
     if (body) return body;
   }
-  endReorder(ctx, approved);
+  endReorder(ctx, mark);
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -1531,6 +1558,7 @@ function runList(
     // A background job runs in a subshell of its own.
     const target = item.background ? copy(state) : state;
     const { first, rest } = item.node;
+    if (item.background) ctx.box.script.jobs++;
     const refusal = runPipeline(item.background ? { ...ctx, reorder: true } : ctx, first, target);
     if (refusal) return refusal;
     if (!rest.length) {
@@ -1587,13 +1615,13 @@ function runPipeline(
     return refusal;
   }
   const changed = new Set<string>();
-  const approved = ctx.box.script.approved;
+  const mark = reorderMark(ctx);
   for (const [index, stage] of node.stages.entries()) {
     assignedInCommand(stage, changed, state.funcs);
     const refusal = runCommand(ctx, stage, copy(state), index, true);
     if (refusal) return refusal;
   }
-  endReorder(ctx, approved);
+  endReorder(ctx, mark);
   // The last stage may run in the current shell, so what the stages assign is unknown afterwards.
   forget(state, changed);
   return undefined;
@@ -1621,7 +1649,7 @@ export function commandDecision(
     loop: 0,
     calls: 0,
     positional: !/argv/.test(command),
-    box: { calls: 0, script: fill?.script ?? { tainted: false, approved: false } },
+    box: { calls: 0, script: fill?.script ?? { tainted: false, approved: false, jobs: 0 } },
     ...(fill?.reorder ? { reorder: true } : {}),
   };
   const opening = script.items[0];

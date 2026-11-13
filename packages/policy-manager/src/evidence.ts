@@ -267,6 +267,8 @@ export interface Fill {
     tainted: boolean;
     /** A temp path was approved where a later command can run first. */
     approved: boolean;
+    /** Background jobs started so far; one may outlive the loop or pipeline that started it. */
+    jobs: number;
   };
   /** In a loop, a pipeline or a background job a later command can run first. */
   reorder: boolean;

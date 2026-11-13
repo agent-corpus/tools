@@ -448,6 +448,15 @@ describe("deletion in scratch and temp directories", () => {
       "wget -r ftp://example.com/x && echo x > w.txt",
       "for f in a b; do echo $f > o$f; cp -R sub ex; done",
       "echo x > w.txt & node x.js",
+      "for f in a b; do (sleep 1; echo x > o$f) & done; ln -s ../victim/v1 oa",
+      "(sleep 1; echo x > oc) & echo y | cat; ln -s ../victim/v1 oc",
+      "gh repo create o/r --template o/t -c && echo x > w.txt",
+      "gh issue develop 1 -c && echo x > w.txt",
+      "gh myext run && echo x > w.txt",
+      "git -c core.pager=x log && echo x > w.txt",
+      "git grep -Ox foo && echo x > w.txt",
+      "git fetch --upload-pack=x origin && echo x > w.txt",
+      "git ls-remote -u x origin && echo x > w.txt",
     ])
       refused(command, dir);
     // Commands that create no symlink keep later temp paths trusted.
