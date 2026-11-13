@@ -2,11 +2,16 @@ import { basename, resolve } from "node:path";
 import {
   branchEvidence,
   canonical,
+  disposable,
   inside,
   isProtectedPath,
+  OUTSIDE_REPOSITORY,
   pathEvidence,
+  policyState,
   protectedPath,
   sensitive,
+  tempRoots,
+  tempWrite,
 } from "./evidence.js";
 import { commandDecision } from "./flow.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
@@ -170,6 +175,145 @@ export function human(request: Request, category: Decision["category"], reason: 
   return result(request, category, reason);
 }
 
+const GH_TEXT = new Set(["--body", "-b", "--title", "-t", "--jq", "-q", "--template", "--notes"]);
+/** Short options that take a value, per program; the value is never the pattern or script. */
+const SHORT_VALUES: Record<string, string> = {
+  sed: "fl",
+  grep: "ABCDdfm",
+  egrep: "ABCDdfm",
+  fgrep: "ABCDdfm",
+  rg: "ABCEfgjMmrTt",
+};
+const RG_LONG_VALUES = new Set([
+  "--after-context",
+  "--before-context",
+  "--context",
+  "--encoding",
+  "--glob",
+  "--iglob",
+  "--max-count",
+  "--max-depth",
+  "--replace",
+  "--threads",
+  "--type",
+  "--type-not",
+]);
+
+/**
+ * File names a sed script reads, writes or runs (`r`, `R`, `w`, `W`, the `s///w` flag, GNU `e`).
+ * Over-matching only sends more to a human.
+ */
+function sedScriptPaths(script: string): string[] {
+  const paths: string[] = [];
+  for (const match of script.matchAll(/(?:^|[^A-Za-z\\])[eErRwW]\s*([^\n]*)/g))
+    paths.push(...(match[1] ?? "").split(/[\s;]+/).filter(Boolean));
+  return paths;
+}
+
+/**
+ * Indices of `args` that are text rather than paths, paths named inside that text, and the file
+ * operands (for sed, the files `-i` rewrites).
+ */
+function textOperands(
+  program: string,
+  args: string[],
+): { text: Set<number>; paths: string[]; files: string[] } {
+  const text = new Set<number>();
+  const files: string[] = [];
+  if (program === "gh") {
+    for (const [index, word] of args.entries()) {
+      if (GH_TEXT.has(word)) text.add(index + 1);
+      else if (/^--(?:body|title|jq|template|notes)=/.test(word)) text.add(index);
+    }
+    return { text, paths: [], files };
+  }
+  const values = SHORT_VALUES[program];
+  if (values === undefined) return { text, paths: [], files };
+  const scripts: string[] = [];
+  const named = (index: number, script = args[index] ?? "") => {
+    text.add(index);
+    scripts.push(script);
+  };
+  let explicit = false;
+  let ended = false;
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index] ?? "";
+    if (!ended && word === "--") {
+      ended = true;
+      continue;
+    }
+    if (!ended && word.startsWith("-")) {
+      if (word === "--expression" || word === "--regexp") {
+        explicit = true;
+        named(++index);
+      } else if (/^--(?:expression|regexp)=/.test(word)) {
+        explicit = true;
+        named(index, word.slice(word.indexOf("=") + 1));
+      } else if (program === "rg" && RG_LONG_VALUES.has(word)) index++;
+      else if (/^-[A-Za-z]/.test(word))
+        for (let at = 1; at < word.length; at++) {
+          const flag = word[at] ?? "";
+          if (program === "sed" && flag === "i") break; // the rest is a backup suffix
+          if (flag === "e") {
+            explicit = true;
+            if (at + 1 < word.length) named(index, word.slice(at + 1));
+            else named(++index);
+            break;
+          }
+          if (values.includes(flag)) {
+            if (at + 1 === word.length) index++;
+            break;
+          }
+        }
+      continue;
+    }
+    // The first operand is the script or pattern unless -e named one. BSD `sed -i ''` leaves an
+    // empty suffix operand, which is skipped.
+    if (word === "") continue;
+    if (!explicit && scripts.length === 0) named(index);
+    else files.push(word);
+  }
+  const paths = program === "sed" ? scripts.flatMap(sedScriptPaths) : [];
+  return { text, paths, files };
+}
+
+const FIND_ACTIONS = new Set([
+  "-exec",
+  "-execdir",
+  "-ok",
+  "-okdir",
+  "-fprint",
+  "-fprint0",
+  "-fprintf",
+  "-fls",
+]);
+/**
+ * `rm`, `rmdir`, `unlink` or `find ... -delete` whose every target is disposable: strictly inside
+ * a scratch root or the system temp directory (see `disposable`).
+ */
+function scratchDeletion(program: string, args: string[], cwd: string, profile: Profile): boolean {
+  const roots = [...profile.scratchRoots, ...tempRoots()];
+  let targets: string[];
+  if (program === "rm" || program === "rmdir" || program === "unlink") {
+    const end = args.indexOf("--");
+    const options = end < 0 ? args : args.slice(0, end);
+    targets = [
+      ...options.filter((arg) => !arg.startsWith("-")),
+      ...(end < 0 ? [] : args.slice(end + 1)),
+    ];
+  } else if (program === "find") {
+    if (
+      !args.includes("-delete") ||
+      args.some((arg) => FIND_ACTIONS.has(arg) || ["-L", "-H", "-follow"].includes(arg))
+    )
+      return false;
+    const first = args.findIndex((arg) => /^[-(!)]/.test(arg));
+    targets = first < 0 ? args : args.slice(0, first);
+    if (targets.length === 0) targets = ["."];
+  } else return false;
+  return targets.length > 0 && targets.every((target) => disposable(cwd, target, roots));
+}
+
 export function permissiveRead(cwd: string, input: string) {
   try {
     const lexical = resolve(cwd, input);
@@ -195,9 +339,11 @@ export function permissiveRead(cwd: string, input: string) {
 }
 
 export function permissiveWrite(cwd: string, input: string, profile: Profile) {
+  let lexical: string | undefined;
+  let path: string | undefined;
   try {
-    const lexical = resolve(cwd, input);
-    const path = canonical(lexical);
+    lexical = resolve(cwd, input);
+    path = canonical(lexical);
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
         allowed: false,
@@ -205,9 +351,11 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
         reason: "Protected path requires human approval",
       };
     // Never let a scratch root reach the policy service's own session directories.
+    const target = path;
     if (
-      !path.split(/[\\/]/).some((part) => part.startsWith("acp-")) &&
-      profile.scratchRoots.some((root) => inside(root, path))
+      !policyState(target) &&
+      !policyState(lexical) &&
+      profile.scratchRoots.some((root) => inside(root, target))
     )
       return {
         allowed: true,
@@ -217,7 +365,21 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
   } catch {
     /* fall through to the repository check, which fails closed */
   }
-  return pathEvidence(cwd, input, true);
+  const evidence = pathEvidence(cwd, input, true);
+  // Repository rules win; the temp directory only covers writes outside any repository.
+  if (
+    !evidence.allowed &&
+    evidence.reason === OUTSIDE_REPOSITORY &&
+    lexical &&
+    path &&
+    tempWrite(lexical, path)
+  )
+    return {
+      allowed: true,
+      category: "temp-write" as const,
+      reason: "Write within the system temp directory",
+    };
+  return evidence;
 }
 
 interface Unwrapped {
@@ -681,14 +843,22 @@ export function simpleDecision(
   const joined = argv.join(" ");
   if (profile.humanPatterns.some((pattern) => pattern.test(joined)))
     return human(request, "destructive", "Matches an organization human-approval pattern");
-  // Anything that looks like a credential or protected-config path stays with a human.
-  for (const word of argv.slice(1)) {
+  // Anything that looks like a credential or protected-config path stays with a human. Words in
+  // known text positions (sed scripts, grep patterns, gh message text) are not paths, but the
+  // files a sed script reads or writes are.
+  const operands = textOperands(program, args);
+  for (const [index, word] of args.entries()) {
+    if (operands.text.has(index)) continue;
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
     if (candidate.includes("/") || candidate.startsWith(".")) {
       if (sensitive(candidate))
         return human(request, "sensitive", "Protected path requires human approval");
     }
   }
+  if (operands.paths.some((path) => sensitive(path)))
+    return human(request, "sensitive", "Protected path requires human approval");
+  if (scratchDeletion(program, args, cwd, profile))
+    return result(request, "temp-write", "Delete within a scratch directory", true);
   if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
     return human(request, "destructive", "Destructive operation requires human approval");
   if (REMOTE_EXECUTORS.has(program))
@@ -769,12 +939,28 @@ export function simpleDecision(
       args.some((arg) => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"))) ||
     (program === "perl" && args.some((arg) => /^-[a-zA-Z]*i/.test(arg)))
   ) {
-    for (const file of args.filter((arg) => !arg.startsWith("-")).slice(1)) {
+    const files =
+      program === "sed"
+        ? textOperands(program, args).files
+        : args.filter((arg) => !arg.startsWith("-")).slice(1);
+    for (const file of files) {
       const check = permissiveWrite(cwd, file, profile);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   } else if (WRITERS.has(program)) {
-    for (const file of args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg))) {
+    // Option values can name a target too: `--target-directory=/etc`, `-t/etc`.
+    const optionValues = args.flatMap((arg) => {
+      const value =
+        /^--[^=]+=(.+)$/.exec(arg)?.[1] ??
+        (["cp", "mv", "ln", "install"].includes(program)
+          ? /^-[a-zA-Z]*t(.+)$/.exec(arg)?.[1]
+          : undefined);
+      return value === undefined ? [] : [value];
+    });
+    for (const file of [
+      ...args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg)),
+      ...optionValues,
+    ]) {
       const check = permissiveWrite(cwd, file, profile);
       if (!check.allowed) return human(request, check.category, check.reason);
     }

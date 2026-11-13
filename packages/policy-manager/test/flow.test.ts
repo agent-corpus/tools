@@ -26,6 +26,9 @@ function decide(command: string, cwd = worktree) {
 
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "flow-test-"));
+  // A main checkout around the fixtures, so `..` from the worktree is a guarded write and not a
+  // temp-directory write.
+  execFileSync("git", ["init", "-b", "main", root], { stdio: "ignore" });
   const origin = join(root, "origin.git");
   const repo = join(root, "repo");
   worktree = join(root, "wt");

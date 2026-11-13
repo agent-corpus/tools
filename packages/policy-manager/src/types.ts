@@ -1,12 +1,16 @@
-export type Category =
-  | "code-read"
-  | "worktree-write"
-  | "cloud-read"
-  | "git-read"
-  | "impactful-write"
-  | "destructive"
-  | "sensitive"
-  | "unknown";
+export const CATEGORIES = [
+  "code-read",
+  "worktree-write",
+  /** A recoverable write outside any repository, such as the system temp directory. */
+  "temp-write",
+  "cloud-read",
+  "git-read",
+  "impactful-write",
+  "destructive",
+  "sensitive",
+  "unknown",
+] as const;
+export type Category = (typeof CATEGORIES)[number];
 export interface Request {
   sessionId: string;
   harness: "claude" | "codex" | "copilot";

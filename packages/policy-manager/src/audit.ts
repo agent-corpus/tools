@@ -3,7 +3,7 @@ import { lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
-import { hash, words } from "./policy.js";
+import { hash, requestHash, words } from "./policy.js";
 import type { Request } from "./types.js";
 
 const vocabulary = new Set(
@@ -101,7 +101,7 @@ export function requestSummary(request: Request): Record<string, unknown> {
     tool: tools.has(request.tool) ? request.tool : "other",
     ...(typeof file === "string" ? { targetHash: hash([request.cwd, file]) } : {}),
     ...(targets.length ? { targets } : {}),
-    requestHash: hash(request),
+    requestHash: requestHash(request),
     harness: request.harness,
     sessionHash: hash(request.sessionId),
     cwdHash: hash(request.cwd),

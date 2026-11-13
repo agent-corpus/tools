@@ -80,7 +80,7 @@ The session's policy-manager agent returns the following object for an ambiguous
 { "requestHash": "<exact hash from review>", "category": "unknown", "confidence": 0.4 }
 ```
 
-Categories are `code-read`, `worktree-write`, `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Explicitly listed metadata operations with permitted selectors can qualify through AI classification. Endpoint overrides and cloud writes cannot qualify. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
+Categories are `code-read`, `worktree-write`, `temp-write` (a recoverable write outside any repository), `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Explicitly listed metadata operations with permitted selectors can qualify through AI classification. Endpoint overrides and cloud writes cannot qualify. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
 
 ## AI classification of ambiguous requests (experiment)
 
@@ -88,7 +88,7 @@ Under a `permissive` profile, a person is asked only for what code says must sta
 
 How a hook call flows (Claude Code, Codex and Copilot `PreToolUse`):
 
-1. **First call.** The command is _not run_ and the person is not asked. The hook blocks it with a reason that tells the model to ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive, to record the answer with `policy-manager classify`, and to retry the same command.
+1. **First call.** The command is _not run_ and the person is not asked. The hook blocks it with a reason that tells the model to ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive, to record the answer with `policy-manager classify`, and to retry the same command. The reason starts with `Needs classification (not an error)` and states the rule the classifier applies: a person is needed only for unrecoverable loss, credential or secret retrieval, protected configuration or paths, and `humanPatterns`; a recoverable outward-facing write such as an issue comment is approvable. The request hash covers only effect-relevant input, so a retry with a different Bash `description` reuses the classification.
 2. **Classified.** `classify` takes `{requestHash, category, confidence, recoverable, rationale}`. The request is approved only when `recoverable` is `true`, `confidence` is at least 0.95, and the category is not `sensitive`, `destructive` or `unknown`. Anything else is a **deny with a reason** the model sees and works around. No person is involved either way. The outcome is remembered for five minutes for that exact request, and a verdict is final in that time: a deny cannot be reclassified into an approve.
 3. **Fallback.** If the classifier is unavailable or its answer is invalid, the retry reaches a person through the normal prompt (under Codex, which cannot ask, it is a deny that tells the model to have the user run the command themselves or change the profile). This happens at most once per request, so there is never a loop and never a lost prompt. After 50 AI approvals in a session, further ambiguous requests go to a person.
 
@@ -133,7 +133,7 @@ Without a profile the engine is strict (everything above). An organization can i
   "mode": "permissive",
   "cloudWrites": "human",
   "humanPatterns": ["^npm install"],
-  "scratchRoots": ["/tmp"]
+  "scratchRoots": ["/srv/scratch"]
 }
 ```
 
@@ -144,7 +144,13 @@ policy-manager profile install policy.json   # writes ~/.config/agent-corpus/pol
 
 The service reads the profile only from that user directory (`$XDG_CONFIG_HOME` honored). It must be a regular, non-symlink file owned by the user, not group/world writable, and outside every Git checkout, so an agent cannot rewrite its own rules from a worktree. On Windows, POSIX owner and mode bits do not exist, so only the regular-file, non-symlink and outside-Git checks apply and the user-profile ACL is the trust boundary. `cd <literal>` is tracked, and each later command is judged in every directory it could run in. Git long-option abbreviations are treated as the full option. An invalid or untrusted profile logs `profile ... invalid-using-strict` and the session stays strict. Each session records the profile mode and SHA-256 digest in `audit.jsonl`.
 
-`permissive` approves compound commands (`;`, `&&`, `||`, `|`, quotes, redirects, `VAR=x` prefixes) when every simple command is acceptable, and approves unknown executables and interpreters with inline code. It still sends these to a human: deletion (`rm`, `find -delete`, `xargs rm`), `sudo`, `git reset --hard`, `git clean`, forced or mirror pushes, discarding checkouts and restores, stash and reflog destruction, `gh` deletions and security endpoints, cloud deletion and credential retrieval, infrastructure destroy, `npm publish`, destructive HTTP verbs, piping into a shell, ssh and database clients, builtins that run a string later (`eval`, `source`, `trap`, `alias`), printing the environment, writes outside linked feature worktrees and `scratchRoots`, and protected or credential paths. `humanPatterns` adds organization-specific expressions.
+`permissive` approves compound commands (`;`, `&&`, `||`, `|`, quotes, redirects, `VAR=x` prefixes) when every simple command is acceptable, and approves unknown executables and interpreters with inline code. It still sends these to a human: deletion (`rm`, `find -delete`, `xargs rm`), `sudo`, `git reset --hard`, `git clean`, forced or mirror pushes, discarding checkouts and restores, stash and reflog destruction, `gh` deletions and security endpoints, cloud deletion and credential retrieval, infrastructure destroy, `npm publish`, destructive HTTP verbs, piping into a shell, ssh and database clients, builtins that run a string later (`eval`, `source`, `trap`, `alias`), printing the environment, writes outside linked feature worktrees, `scratchRoots` and the system temp directory, and protected or credential paths.
+
+Writes outside every repository to the system temp directory (`os.tmpdir()`, plus `/tmp` and `/private/tmp` off Windows) are approved as `temp-write`, after symlinks (dangling ones too) and `..` are resolved. Repository rules still apply to a checkout that lives in the temp directory. The policy service's own `acp-*` session directories, hard-linked files, protected names and credential paths are never temp writes. A temp root that contains the home directory grants nothing.
+
+Deleting disposable files is approved too (`Delete within a scratch directory`): `rm`, `rmdir`, `unlink` and `find ... -delete` (without `-exec`, `-L` or `-follow`) when every target resolves strictly inside a `scratchRoots` entry or the system temp directory, never the root itself. A glob may appear only in the last component, and its directory must itself be strictly inside a root, so `rm -rf /tmp/*` still asks. Targets in or holding a Git repository (unpushed work), `acp-*` policy state, and protected or credential names still go to a person.
+
+Credential-path checks skip words that are text, not paths: a `sed` script (but not the files its `r`, `w` or `e` commands name, nor `-f`), a `grep` or `rg` pattern, and `gh` `--body`, `--title`, `--jq`, `--template` and `--notes` values. Other programs keep the conservative check.
 
 #### Shell syntax in permissive mode
 
