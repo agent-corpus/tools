@@ -11,13 +11,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import { evaluate, hash } from "../src/policy.js";
 import { parseProfile } from "../src/profile.js";
 import { PolicySession } from "../src/session.js";
 import type { Request } from "../src/types.js";
 
 const links = process.platform !== "win32";
+// Every decision here reads live Git evidence, which is slow on Windows runners.
+vi.setConfig({ testTimeout: 30_000 });
 let root: string, repo: string, wt: string, outside: string;
 const profile = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
 
@@ -391,8 +393,7 @@ describe("files this session created", () => {
       expect(s.review(r, undefined, "PreToolUse").tier).toBeUndefined();
       expect(evaluate(r, verdict(r, true, 0.99), profile).decision).toBe("human");
     }
-    // A dozen Git evidence calls are slow on Windows runners.
-  }, 30_000);
+  });
 
   test("protected paths stay with a person", () => {
     const s = session();
