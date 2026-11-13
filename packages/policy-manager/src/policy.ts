@@ -8,7 +8,7 @@ import {
   permissiveWrite,
   WORKTREE_DELETION,
 } from "./permissive.js";
-import { type Profile, strictProfile } from "./profile.js";
+import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
 import type { Category, Classification, Decision, Request } from "./types.js";
 
@@ -322,6 +322,14 @@ function evaluateCore(request: Request, profile: Profile): Decision {
   const input = request.input;
   if (!input || typeof input !== "object" || Array.isArray(input))
     return result(request, "unknown", "Invalid tool input");
+  // MCP arguments are tool-specific, so their `cwd` or `path` mean nothing here.
+  if (request.tool.startsWith("mcp__"))
+    return mcpReadOnly(profile, request.tool)
+      ? result(request, "cloud-read", "MCP tool listed as read-only in the profile", true)
+      : {
+          ...result(request, "unknown", "MCP tool not listed as read-only; left to the harness"),
+          decision: "native",
+        };
   const cwd = input.workdir ?? input.cwd ?? request.cwd;
   if (typeof cwd !== "string" || cwd !== request.cwd)
     return result(request, "unknown", "Execution directory differs from the reviewed directory");
