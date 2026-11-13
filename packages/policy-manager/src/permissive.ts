@@ -371,9 +371,9 @@ function worktreeAdd(request: Request, cwd: string, args: string[]): Decision | 
       break;
     }
     if (word.startsWith("--")) {
-      // --orphan and --reason take the next word unless it is given inline (`--reason=x`).
-      if (!word.includes("=") && ["--orphan", "--reason"].some((name) => abbreviates(word, name)))
-        i++;
+      // Only --reason takes a value (the next word unless given inline as `--reason=x`). Every
+      // other long option of `worktree add` is a switch: --orphan, --lock, --track, --force, ...
+      if (!word.includes("=") && abbreviates(word, "--reason")) i++;
     } else if (word.startsWith("-") && word.length > 1) {
       // A cluster of short flags (`-qb`, `-fB`): the first `b` or `B` takes the rest of the word
       // as its value (`-bname`), or the next word when it ends the cluster.
