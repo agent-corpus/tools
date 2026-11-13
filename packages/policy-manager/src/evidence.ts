@@ -12,12 +12,12 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
- * A shell word as an absolute path, with a leading `~` expanded as the shell does. `~user`, `~+`
- * and `~-` cannot be resolved here and throw.
+ * A shell word as an absolute path, with a leading `~` expanded as the shell does. `~user`, `~+`,
+ * `~-` and zsh's `=name` (the path of an executable) cannot be resolved here and throw.
  */
 export function resolveWord(cwd: string, word: string): string {
   if (/^~(?:[\\/]|$)/.test(word)) return join(homedir(), word.slice(1));
-  if (word.startsWith("~")) throw new Error("Unresolvable tilde");
+  if (word.startsWith("~") || word.startsWith("=")) throw new Error("Unresolvable expansion");
   return resolve(cwd, word);
 }
 

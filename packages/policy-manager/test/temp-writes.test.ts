@@ -258,6 +258,17 @@ describe("deletion in scratch and temp directories", () => {
     expect(write("~/policy-test-x").decision).toBe("human");
   });
 
+  test("zsh =name (an executable's path) is never a temp target", () => {
+    for (const command of [
+      "rm -rf =node",
+      "echo x > =node",
+      "echo x | tee =node",
+      "cp a.txt =node",
+      "touch =node",
+    ])
+      refused(command, outside);
+  });
+
   test("find leading options do not hide the start path", () => {
     const away = posix(main);
     for (const command of [
@@ -270,12 +281,21 @@ describe("deletion in scratch and temp directories", () => {
       `find -H ${posix(outside)} -delete`,
       `find -f ${posix(outside)} -delete`,
       `find -Z ${posix(outside)} -delete`,
+      `find -xP ${away} -delete`,
+      `find -EP ${away} -delete`,
+      `find -Ex ${away} -delete`,
+      `find -sx ${away} -delete`,
+      `find -xL ${away} -delete`,
+      `find -xQ -delete`,
+      `find -bogus -delete`,
       `find ${posix(outside)} -files0-from x -delete`,
     ])
       refused(command, outside);
     mkdirSync(join(outside, "find-opts"), { recursive: true });
     approved(`find -P ${posix(outside)}/find-opts -delete`);
     approved(`find -- ${posix(outside)}/find-opts -name '*.tmp' -delete`);
+    approved(`find -xP ${posix(outside)}/find-opts -delete`);
+    approved("find -name '*.tmp' -delete", join(outside, "find-opts"));
   });
 
   test("rmdir -p is refused: it removes ancestors up to and past the root", () => {
@@ -283,6 +303,8 @@ describe("deletion in scratch and temp directories", () => {
     refused(`rmdir -p ${posix(outside)}/p/q`);
     refused(`rmdir --parents ${posix(outside)}/p/q`);
     refused(`rmdir -vp ${posix(outside)}/p/q`);
+    refused(`rmdir --parent ${posix(outside)}/p/q`);
+    refused(`rmdir --p ${posix(outside)}/p/q`);
     approved(`rmdir ${posix(outside)}/p/q`);
   });
 

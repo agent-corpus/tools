@@ -342,6 +342,8 @@ function textOperands(
         explicit = true;
         named(index, word.slice(word.indexOf("=") + 1));
       } else if (word.startsWith("--")) {
+        // A pattern or script file means there is no pattern operand: every operand is a file.
+        if (word === "--file" || word.startsWith("--file=")) explicit = true;
         if (word.includes("=")) continue;
         // A value-taking long option consumes the next word, which stays a checked operand. An
         // option this list does not know might too, so nothing is treated as text.
@@ -363,6 +365,7 @@ function textOperands(
             break;
           }
           if (values.includes(flag)) {
+            if (flag === "f") explicit = true;
             if (at + 1 === word.length) index++;
             break;
           }
@@ -389,6 +392,47 @@ const FIND_ACTIONS = new Set([
   "-fprintf",
   "-fls",
 ]);
+/** Expression primaries that may open a find expression when no start path is given. */
+const FIND_PRIMARIES = new Set(
+  [
+    "amin",
+    "anewer",
+    "atime",
+    "cmin",
+    "cnewer",
+    "ctime",
+    "delete",
+    "depth",
+    "empty",
+    "group",
+    "iname",
+    "inum",
+    "ipath",
+    "iregex",
+    "iwholename",
+    "links",
+    "maxdepth",
+    "mindepth",
+    "mmin",
+    "mount",
+    "mtime",
+    "name",
+    "newer",
+    "nogroup",
+    "nouser",
+    "path",
+    "perm",
+    "print",
+    "print0",
+    "prune",
+    "regex",
+    "size",
+    "type",
+    "user",
+    "wholename",
+    "xdev",
+  ].map((name) => `-${name}`),
+);
 /**
  * `rm`, `rmdir`, `unlink` or `find ... -delete` whose every target is disposable: strictly inside
  * a scratch root or the system temp directory (see `disposable`).
@@ -404,7 +448,8 @@ function scratchDeletion(program: string, args: string[], cwd: string, profile: 
       ...(end < 0 ? [] : args.slice(end + 1)),
     ];
     // `rmdir -p` also removes empty ancestors, up to and past a root.
-    if (program === "rmdir" && options.some((arg) => arg === "--parents" || /^-[^-]*p/.test(arg)))
+    // GNU accepts abbreviations (`--parent`, `--p`).
+    if (program === "rmdir" && options.some((arg) => /^--p/.test(arg) || /^-[^-]*p/.test(arg)))
       return false;
   } else if (program === "find") {
     if (
@@ -421,7 +466,8 @@ function scratchDeletion(program: string, args: string[], cwd: string, profile: 
         index++;
         break;
       }
-      if (/^-[PEsxXd]$/.test(arg) || /^-O[0-9]*$/.test(arg)) continue;
+      // BSD find accepts clusters such as -xP.
+      if (/^-[PEsxXd]+$/.test(arg) || /^-O[0-9]*$/.test(arg)) continue;
       if (arg === "-D") {
         index++;
         continue;
@@ -433,7 +479,12 @@ function scratchDeletion(program: string, args: string[], cwd: string, profile: 
     targets = [];
     for (; index < args.length && !/^[-(!)]/.test(args[index] ?? ""); index++)
       targets.push(args[index] as string);
-    if (targets.length === 0) targets = ["."];
+    // With no start path find searches the cwd, but only when the next word is a real primary; an
+    // unknown option there could be hiding the start path.
+    if (targets.length === 0) {
+      if (index < args.length && !FIND_PRIMARIES.has(args[index] as string)) return false;
+      targets = ["."];
+    }
   } else return false;
   return targets.length > 0 && targets.every((target) => disposable(cwd, target, roots));
 }
