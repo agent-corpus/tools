@@ -74,7 +74,12 @@ export class AuditLog {
         0o600,
       );
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new AuditBusyError();
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") throw new AuditBusyError();
+      // Windows refuses to open a file another writer is still deleting (EPERM or EACCES) rather
+      // than reporting it as existing, so the lock is just as busy.
+      if (process.platform === "win32" && (code === "EPERM" || code === "EACCES"))
+        throw new AuditBusyError();
       throw error;
     }
     try {
