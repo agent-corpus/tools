@@ -75,6 +75,7 @@ try {
     const summary = {
       mode: profile.mode,
       cloudWrites: profile.cloudWrites,
+      mcpReadOnly: profile.mcpReadOnly.length,
       digest: profile.digest,
     };
     if (harnessArg === "install") {

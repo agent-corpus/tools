@@ -71,6 +71,20 @@ export function audit(directory: string, event: Record<string, unknown>): void {
   });
 }
 export function requestSummary(request: Request): Record<string, unknown> {
+  // MCP arguments are tool-specific: record only hashes of the tool name and argument keys.
+  if (request.tool.startsWith("mcp__"))
+    return {
+      summary: "MCP tool operation",
+      action: "tool operation",
+      tool: "mcp",
+      requestHash: hash(request),
+      harness: request.harness,
+      sessionHash: hash(request.sessionId),
+      cwdHash: hash(request.cwd),
+      toolHash: hash(request.tool),
+      inputKeys: Object.keys(request.input).map((key) => hash(key)),
+      executable: "other",
+    };
   const command = request.input.command ?? request.input.cmd;
   const argv = typeof command === "string" ? words(command) : undefined;
   const operation = argv?.slice(0, 4).filter((word, index) => index === 0 || !word.startsWith("-"));
