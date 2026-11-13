@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import { canonical } from "../src/evidence.js";
 import { evaluate } from "../src/policy.js";
 import { parseProfile, strictProfile } from "../src/profile.js";
 import type { Request } from "../src/types.js";
@@ -12,6 +13,8 @@ import type { Request } from "../src/types.js";
  * as the writes land in a linked feature worktree. The main checkout of either repository stays
  * protected. The rule is the same for every harness.
  */
+// Each case runs several git processes, which is slow on Windows runners.
+vi.setConfig({ testTimeout: 60_000 });
 let root: string, session: string, repo: string, wt: string;
 const permissive = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
 const HARNESSES = ["claude", "codex", "copilot"] as const;
@@ -35,7 +38,8 @@ function decide(
 }
 
 beforeAll(() => {
-  root = mkdtempSync(join(tmpdir(), "cross-repo-"));
+  // The long form: a Windows 8.3 short name (RUNNER~1) has a `~` that strict parsing refuses.
+  root = canonical(mkdtempSync(join(tmpdir(), "cross-repo-")));
   const origin = join(root, "origin.git");
   session = join(root, "session");
   repo = join(root, "repo");
