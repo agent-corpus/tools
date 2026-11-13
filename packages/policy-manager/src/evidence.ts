@@ -217,21 +217,7 @@ function holdsRepository(path: string): boolean {
  * repository (unpushed work). A glob is allowed only in the last component, and then its
  * directory must itself be strictly inside a root.
  */
-/**
- * Whether the directory a path is looked up through exists now. When it does not, a command that
- * runs earlier in the same script can create it with a symlink inside (`git clone`, `cp -R`, `tar`),
- * so the path cannot be resolved when the hook runs.
- */
-export function settled(input: string, lexical: string): boolean {
-  return existsSync(/[\\/]\.?$/.test(input) ? lexical : dirname(lexical));
-}
-
-export function disposable(
-  cwd: string,
-  input: string,
-  roots: string[],
-  populated = false,
-): boolean {
+export function disposable(cwd: string, input: string, roots: string[], fill?: Fill): boolean {
   try {
     let target = input;
     if (/[*?[]/.test(input)) {
@@ -242,8 +228,10 @@ export function disposable(
     }
     const lexical = resolveWord(cwd, target);
     const path = canonical(lexical);
+    // `rm` does not follow the last component unless a trailing slash asks it to.
+    const traversed = /[\\/]\.?$/.test(target) ? lexical : dirname(lexical);
     if (
-      (populated && !settled(target, lexical)) ||
+      refilled(fill, traversed) ||
       policyState(lexical) ||
       policyState(path) ||
       sensitive(lexical) ||
@@ -261,10 +249,38 @@ export function disposable(
     } catch {
       /* not inside a repository */
     }
-    return !holdsRepository(path);
+    if (holdsRepository(path)) return false;
+    fill?.pending?.push(traversed);
+    return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Paths are resolved when the hook runs, before the script does. A command earlier in the script
+ * that copies, moves, links, clones or extracts can put a symlink anywhere below where it writes,
+ * so a later write or delete through such a path is not trusted, whether or not it exists now.
+ */
+export interface Fill {
+  /** Where earlier commands write; `self` when that path itself may become a symlink. */
+  filled: Array<{ paths: string[]; self: boolean }>;
+  /** In a loop, pipeline or background job a later command can run first: approved paths go here. */
+  pending?: string[];
+}
+
+/** Whether `path` (one a command follows) lies below where an earlier command may have written. */
+export function refilled(fill: Fill | undefined, path: string): boolean {
+  if (!fill?.filled.length) return false;
+  let real = path;
+  try {
+    real = canonical(path);
+  } catch {
+    /* compare the written form only */
+  }
+  return fill.filled.some(({ paths, self }) =>
+    paths.some((root) => [path, real].some((p) => (p === root ? self : inside(root, p)))),
+  );
 }
 
 export const OUTSIDE_REPOSITORY = "Cannot verify repository and path evidence";

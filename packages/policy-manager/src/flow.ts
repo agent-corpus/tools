@@ -1,7 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, posix, resolve } from "node:path";
-import { canonical, resolveWord, UNKNOWN_CWD } from "./evidence.js";
+import { canonical, type Fill, refilled, resolveWord, UNKNOWN_CWD } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -70,6 +70,8 @@ interface Ctx {
   calls: number;
   /** False when the script could assign positional parameters through zsh's `argv` array. */
   positional: boolean;
+  /** Inside a background job, which later commands can overtake. */
+  background?: boolean;
   /** `first` is the script's first top-level pipeline, the only `cd` trusted not to fail. */
   box: {
     last?: Decision;
@@ -77,8 +79,10 @@ interface Ctx {
     first?: PipelineNode;
     /** Directories that earlier commands create, so a later `cd` into one is not unknown. */
     created?: Set<string>;
-    /** An earlier command may have created directories with content (a clone, a copy, an archive). */
-    populated?: boolean;
+    /** Where earlier commands copy, move, link, clone or extract (see `Fill`). */
+    filled: Fill["filled"];
+    /** Approved paths of commands that a later one may run before. */
+    pending: string[];
   };
 }
 
@@ -330,7 +334,7 @@ function runRedirects(ctx: Ctx, redirs: Redir[], state: State): Decision | undef
           redirect,
           ctx.profile,
           cwd,
-          populatedNow(ctx, false),
+          fillFor(ctx, false),
         );
         if (check) return check;
       }
@@ -663,7 +667,7 @@ function runSimple(
         const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
         if (!redirect) continue;
         for (const cwd of state.cwds) {
-          const check = redirectDecision(request, redirect, profile, cwd, populatedNow(ctx, piped));
+          const check = redirectDecision(request, redirect, profile, cwd, fillFor(ctx, piped));
           if (check) return check;
         }
       }
@@ -687,11 +691,28 @@ function runSimple(
     for (const cwd of state.cwds) {
       if (++ctx.box.calls > MAX_JUDGEMENTS)
         return human(request, "unknown", "Too many commands to verify");
-      const populated = populatedNow(ctx, piped);
-      const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd, populated);
+      const fill = fillFor(ctx, piped);
+      const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd, fill);
       if (decision.decision !== "approve") return decision;
       ctx.box.last = decision;
-      if (!INERT.has(unwrap(command.argv).argv[0] ?? "")) ctx.box.populated = true;
+      for (const { dir, self } of fillTargets(unwrap(command.argv).argv)) {
+        if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
+        const written = resolveWord(cwd, dir);
+        const paths = [written];
+        try {
+          paths.push(canonical(written));
+        } catch {
+          /* the written form only */
+        }
+        const entry = { paths, self };
+        if (ctx.box.pending.some((path) => refilled({ filled: [entry] }, path)))
+          return human(
+            request,
+            "unknown",
+            "A copy or extract that may run before an approved write requires human review",
+          );
+        ctx.box.filled.push(entry);
+      }
       for (const dir of createdDirectories(unwrap(command.argv).argv)) {
         if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
         ctx.box.created ??= new Set();
@@ -735,45 +756,66 @@ function runSimple(
   return undefined;
 }
 
-/** Programs that never create a directory or a symlink. */
-const INERT = new Set([
-  "cd",
-  "chdir",
-  "export",
-  "set",
-  "shift",
-  "unset",
-  "read",
-  "local",
-  "mkdir",
-  "echo",
-  "printf",
-  "print",
-  "true",
-  "false",
-  ":",
-  "pwd",
-  "test",
-  "[",
-  "ls",
-  "cat",
-  "head",
-  "tail",
-  "wc",
-  "grep",
-  "rg",
-  "touch",
-  "rm",
-  "rmdir",
-  "sleep",
-  "date",
-]);
+/** In a loop, a pipeline or a background job, a later command can run first. */
+function fillFor(ctx: Ctx, piped: boolean): Fill {
+  const reorder = ctx.loop > 0 || piped || !!ctx.background;
+  return { filled: ctx.box.filled, ...(reorder ? { pending: ctx.box.pending } : {}) };
+}
+
+/** Value of `-X dir`, `-Xdir` or `--long=dir` among `args`; the last one wins. */
+function optionValue(args: string[], short: string, long?: string): string | undefined {
+  let value: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] ?? "";
+    if (arg === "--") break;
+    if (arg === short) value = args[++index];
+    else if (arg.startsWith(short) && !arg.startsWith("--")) value = arg.slice(short.length);
+    else if (long && arg === long) value = args[++index];
+    else if (long && arg.startsWith(`${long}=`)) value = arg.slice(long.length + 1);
+  }
+  return value;
+}
+
 /**
- * Whether a path whose directory does not exist yet may first be created with content by another
- * command: an earlier one, or, in a loop or pipeline, a later one that runs first.
+ * Where a command can create entries that may be symlinks: a recursive copy, move, link or sync
+ * destination (which may itself become one), a clone or new worktree, or an archive's output
+ * directory (whose contents are new). Other programs write regular files, or are trusted outright.
  */
-function populatedNow(ctx: Ctx, piped: boolean): boolean {
-  return !!ctx.box.populated || ctx.loop > 0 || piped;
+function fillTargets(argv: string[]): Array<{ dir: string; self: boolean }> {
+  const [program = "", ...args] = argv;
+  const dest = (values: Set<string>) => {
+    const target = optionValue(args, "-t", "--target-directory");
+    if (target) return [{ dir: target, self: true }];
+    const rest = positionals(args, values);
+    const last =
+      rest.length > 1
+        ? rest[rest.length - 1]
+        : rest.length === 1 && program === "ln"
+          ? basename(rest[0] as string)
+          : undefined;
+    return last ? [{ dir: last, self: true }] : [];
+  };
+  if (
+    program === "cp" &&
+    args.some((arg) => /^-[^-]*[rRa]/.test(arg) || /^--(?:recursive|archive)$/.test(arg))
+  )
+    return dest(new Set(["-t", "-S", "--suffix"]));
+  if (["mv", "ln", "rsync", "ditto"].includes(program))
+    return dest(new Set(["-t", "-S", "--suffix"]));
+  if (program === "git") return createdDirectories(argv).map((dir) => ({ dir, self: true }));
+  if (["tar", "bsdtar", "gtar"].includes(program)) {
+    const first = args[0] ?? "";
+    const listsOrCreates =
+      (/^[^-]/.test(first) ? /[ctru]/.test(first) && !first.includes("x") : false) ||
+      args.some((arg) => /^-[^-]*[ctru]/.test(arg) && !/^-[^-]*x/.test(arg)) ||
+      args.some((arg) => /^--(?:create|list|append|update)$/.test(arg));
+    if (listsOrCreates) return [];
+    return [{ dir: optionValue(args, "-C", "--directory") ?? ".", self: false }];
+  }
+  if (program === "unzip") return [{ dir: optionValue(args, "-d") ?? ".", self: false }];
+  if (/^7z[az]?$/.test(program) || program === "cpio")
+    return [{ dir: optionValue(args, "-o") ?? ".", self: false }];
+  return [];
 }
 
 /** git clone options that take a separate value. */
@@ -1505,7 +1547,11 @@ function runList(
     // A background job runs in a subshell of its own.
     const target = item.background ? copy(state) : state;
     const { first, rest } = item.node;
-    const refusal = runPipeline(ctx, first, target);
+    const refusal = runPipeline(
+      item.background ? { ...ctx, background: true } : ctx,
+      first,
+      target,
+    );
     if (refusal) return refusal;
     if (!rest.length) {
       if (last && outcome) outcome.success = copy(item.background ? state : target);
@@ -1592,7 +1638,7 @@ export function commandDecision(
     loop: 0,
     calls: 0,
     positional: !/argv/.test(command),
-    box: { calls: 0 },
+    box: { calls: 0, filled: [], pending: [] },
   };
   const opening = script.items[0];
   if (depth === 0 && opening && !opening.background) ctx.box.first = opening.node.first;

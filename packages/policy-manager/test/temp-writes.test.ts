@@ -395,6 +395,50 @@ describe("deletion in scratch and temp directories", () => {
       expect(bash(command, outside).decision, command).toBe("approve");
   });
 
+  test("an existing path below where an earlier command copies or extracts is not trusted", () => {
+    const dir = join(outside, "refill");
+    mkdirSync(join(dir, "made", "inner"), { recursive: true });
+    mkdirSync(join(dir, "ex", "out"), { recursive: true });
+    mkdirSync(join(dir, "sub"), { recursive: true });
+    writeFileSync(join(dir, "w.txt"), "x");
+    writeFileSync(join(dir, "f"), "x");
+    // The earlier command can replace a directory, or create the last component, as a symlink.
+    for (const command of [
+      "rm -rf made && cp -R sub made && rm -rf made/inner/dist",
+      "mv made old && cp -R sub made && rm -rf made/inner/dist",
+      "rm -rf made && mv sub made && rm -rf made/inner/dist",
+      "rm -rf made && cp -R sub made && echo x > made/inner/w.txt",
+      "tar xf a.tar && rm -rf ex/out/dist",
+      "tar -xzf a.tgz -C ex && rm -rf ex/out/dist",
+      "tar xf b.tar && echo x > w.txt",
+      "tar xf b.tar && echo x >> w.txt",
+      "tar xf b.tar && touch w.txt",
+      "tar xf b.tar && echo x | tee w.txt",
+      "tar xf b.tar && cp f lnk",
+      "tar xf b.tar && rm -rf lnk/",
+      "cp -R sub/. . && echo x > w.txt",
+      "cp -R sub/ new0 && echo x > new0/w.txt",
+      "mv sub made && echo x > made",
+      "ln -s sub made7 && echo x > made7/w.txt",
+      "unzip b.zip && echo x > w.txt",
+      "unzip -d ex b.zip && rm -rf ex/out/dist",
+      "echo x > ex/out/w.txt & tar xf a.tar",
+    ])
+      refused(command, dir);
+    // The archive's own directory is not replaced, and rm does not follow the last component.
+    for (const command of [
+      "tar xf a.tar && rm a.tar",
+      "tar xf b.tar && rm -rf lnk",
+      "rm -rf made && cp -R sub made",
+      "mkdir -p new1 && cp f new1/a && cp f new1/b",
+      "mkdir -p new1 && sort f > new1/a && sort f > new1/b",
+      "git status; mkdir -p new1 && echo a > new1/a",
+      "mkdir new1 && cd new1 && git init && echo x > README.md",
+      "tar cf out.tar sub && echo x > w.txt",
+    ])
+      expect(bash(command, dir).decision, command).toBe("approve");
+  });
+
   test("a variable named like a created directory makes the cd unknown (CDABLE_VARS)", () => {
     for (const command of [
       `made5=${posix(main)}; false && mkdir made5; cd made5 && rm -rf dist`,
