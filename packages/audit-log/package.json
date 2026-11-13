@@ -1,6 +1,6 @@
 {
   "name": "@agent-corpus/audit-log",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Portable structured audit events with private JSONL storage, query, export, and bounded rotation.",
   "keywords": [
     "audit",
