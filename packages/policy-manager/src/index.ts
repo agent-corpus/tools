@@ -1,4 +1,4 @@
-export { executionReport, hookResponse, normalize } from "./adapters.js";
+export { executionReport, hookOutput, hookResponse, normalize } from "./adapters.js";
 export { branchEvidence, pathEvidence } from "./evidence.js";
 export { mergedEvidence } from "./merged.js";
 export { evaluate, hash, requestHash, words } from "./policy.js";
