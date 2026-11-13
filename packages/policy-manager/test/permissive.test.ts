@@ -61,6 +61,8 @@ beforeAll(() => {
   git(repo, ["push", "origin", "main", "ff", "squash", "wip", "extended"]);
   git(repo, ["fetch", "origin"]);
   git(repo, ["worktree", "add", "-b", "feature", worktree]);
+  // `cd src` needs a real directory: a bare name that is not one goes to a person.
+  mkdirSync(join(worktree, "src"), { recursive: true });
   mkdirSync(join(root, "scratch", "acp-1-x"), { recursive: true });
   profile = parseProfile(
     JSON.stringify({ version: 1, mode: "permissive", scratchRoots: [join(root, "scratch")] }),

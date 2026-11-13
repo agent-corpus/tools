@@ -734,7 +734,10 @@ describe("evaluation of scripts", () => {
     // Too many nodes to parse.
     expect(decide(Array.from({ length: 450 }, () => "ls").join("; ")).decision).toBe("human");
     // Three possible cd's give eight directories; every later command is judged in each of them.
-    const many = decide(`cd a; cd b; cd c; ${Array.from({ length: 60 }, () => "ls").join("; ")}`);
+    // `./`: a bare name that is not a directory is refused before the count.
+    const many = decide(
+      `cd ./a; cd ./b; cd ./c; ${Array.from({ length: 60 }, () => "ls").join("; ")}`,
+    );
     expect(many.decision).toBe("human");
     expect(many.reason).toContain("Too many commands");
   });

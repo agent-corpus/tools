@@ -714,6 +714,18 @@ function runSimple(
   return undefined;
 }
 
+/** A relative `cd` target that does not start with `.`: CDPATH and CDABLE_VARS can redirect it. */
+function bareName(word: string): boolean {
+  return !isAbsolute(word) && !/^(?:\.{1,2}(?:[\\/]|$)|[\\/])/.test(word);
+}
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function changeDirectory(
   ctx: Ctx,
   state: State,
@@ -742,9 +754,10 @@ function changeDirectory(
       !word ||
       word.includes(SUBSTITUTION) ||
       /^~|[*?[\]]/.test(word) ||
-      word.startsWith("-") ||
+      // `-N` and zsh `+N` pick directory-stack entries.
+      /^[+-]/.test(word) ||
       // CDPATH (from the environment the shell inherited) redirects a relative name.
-      (process.env.CDPATH && !/^(?:\.{1,2}(?:[\\/]|$)|[\\/])/.test(word) && !isAbsolute(word))
+      (process.env.CDPATH && bareName(word))
     )
       return human(request, "unknown", "Directory change requires human review");
     // bash and zsh `cd` is logical: `..` drops the last written component. In physical mode (`cd
@@ -761,6 +774,10 @@ function changeDirectory(
     } catch {
       return human(request, "unknown", "Directory change requires human review");
     }
+    // A bare name that is a directory nowhere can only succeed through options set in rc files
+    // (zsh CDABLE_VARS, a CDPATH set there), which send it somewhere unknown.
+    if (bareName(word) && !next.some(isDirectory))
+      return human(request, "unknown", "Directory change requires human review");
     cwds = [...new Set([...cwds, ...next])];
   }
   if (!cwds.length || cwds.length + state.cwds.length > MAX_DIRECTORIES)

@@ -328,6 +328,35 @@ describe("deletion in scratch and temp directories", () => {
     approved(`chdir ${posix(join(outside, "chd"))} && rm -rf dist`, outside);
   });
 
+  test("directory-stack entries and rc-file redirects go to a person", () => {
+    const temp = posix(outside);
+    for (const command of [
+      `cd ${temp} && cd +1 && rm -rf dist`,
+      `cd ${temp} && chdir +1 && rm -rf dist`,
+      `cd ${temp} && cd +1 && echo x > w.txt`,
+      `cd ${temp} && cd -1 && rm -rf dist`,
+      `cd ${temp} && pushd +1 && rm -rf dist`,
+      // CDABLE_VARS: `cd foo` goes to $foo when no directory foo exists.
+      `foo=${posix(main)}; cd foo && rm -rf dist`,
+      "cd no-such-dir && rm -rf dist",
+    ])
+      refused(command, main);
+    mkdirSync(join(outside, "bare", "dist"), { recursive: true });
+    approved("cd bare && rm -rf dist", outside);
+    approved("cd ./bare && rm -rf dist", outside);
+  });
+
+  test("builtins and keywords are commands, not AUTO_CD", () => {
+    const dir = join(outside, "builtins");
+    for (const name of ["export", "set", "test"])
+      mkdirSync(join(dir, name, "dist"), { recursive: true });
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    approved("export FOO=1 && rm -rf dist", dir);
+    approved("set -e; rm -rf dist", dir);
+    mkdirSync(join(dir, "nocmd-xyz"), { recursive: true });
+    refused("nocmd-xyz && rm -rf dist", dir);
+  });
+
   test("CDPATH inherited from the environment makes a relative cd unknown", () => {
     const saved = process.env.CDPATH;
     process.env.CDPATH = posix(root);

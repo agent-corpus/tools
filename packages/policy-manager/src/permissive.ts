@@ -1048,6 +1048,18 @@ function interpreterCodeRefusal(code: string): string | undefined {
   return undefined;
 }
 
+/** bash and zsh builtins and reserved words. */
+const SHELL_WORDS = new Set(
+  (
+    ". : [ [[ ]] { } ! alias autoload bg bind bindkey break builtin caller case cd chdir command " +
+    "compgen complete continue coproc declare dirs disown do done echo elif else emulate enable " +
+    "esac eval exec exit export false fc fg float for function functions getopts hash help history " +
+    "if in integer jobs kill let local logout mapfile noglob nocorrect popd print printf pushd pwd " +
+    "read readarray readonly repeat return select set setopt shift shopt source suspend test then " +
+    "time times trap true type typeset ulimit umask unalias unset unsetopt until wait whence where " +
+    "which while zle zmodload zstyle"
+  ).split(" "),
+);
 /** Commands that change the shell's directory. */
 const DIRECTORY_CHANGERS = new Set(["cd", "chdir", "pushd", "popd"]);
 /**
@@ -1055,7 +1067,8 @@ const DIRECTORY_CHANGERS = new Set(["cd", "chdir", "pushd", "popd"]);
  * executable of that name is on PATH.
  */
 function autoCd(cwd: string, word: string): boolean {
-  if (word === ".") return false; // `source`
+  // A builtin or keyword is a command, so AUTO_CD never applies; `.` is `source`.
+  if (SHELL_WORDS.has(word)) return false;
   try {
     if (!statSync(resolveWord(cwd, word)).isDirectory()) return false;
   } catch {
