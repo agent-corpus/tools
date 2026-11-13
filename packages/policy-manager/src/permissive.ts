@@ -12,7 +12,6 @@ import {
   pathEvidence,
   policyState,
   protectedPath,
-  refilled,
   resolveWord,
   sensitive,
   tempRoots,
@@ -591,23 +590,21 @@ export function permissiveRead(cwd: string, input: string) {
   }
 }
 
-/** A write is followed through every component, the last one too (see `Fill`). */
+const DISPOSABLE_WRITES = new Set([
+  "Write within a scratch directory",
+  "Write within the system temp directory",
+]);
+/** Temp and scratch writes are trusted only before anything could plant a symlink (see `Fill`). */
 export function permissiveWrite(cwd: string, input: string, profile: Profile, fill?: Fill) {
   const check = writeEvidence(cwd, input, profile);
-  if (!check.allowed || !fill) return check;
-  let lexical: string;
-  try {
-    lexical = resolveWord(cwd, input);
-  } catch {
-    return check;
-  }
-  if (refilled(fill, lexical))
+  if (!check.allowed || !fill || !DISPOSABLE_WRITES.has(check.reason)) return check;
+  if (fill.script.tainted)
     return {
       allowed: false,
-      category: "worktree-write" as const,
-      reason: "Write below where an earlier command copies or extracts requires human review",
+      category: "temp-write" as const,
+      reason: "Temp write after a command that can create symlinks requires review",
     };
-  fill.pending?.push(lexical);
+  if (fill.reorder) fill.script.approved = true;
   return check;
 }
 
@@ -1269,7 +1266,7 @@ export function simpleDecision(
             : undefined;
       if (script === undefined || depth >= 2)
         return human(request, "unknown", "Shell invocation requires human review");
-      return commandDecision(request, script, profile, depth + 1, [cwd]);
+      return commandDecision(request, script, profile, depth + 1, [cwd], fill);
     }
     // Inline code and a heredoc body are both literal text, so both can be read. Code piped in
     // from elsewhere cannot.

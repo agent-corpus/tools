@@ -228,10 +228,8 @@ export function disposable(cwd: string, input: string, roots: string[], fill?: F
     }
     const lexical = resolveWord(cwd, target);
     const path = canonical(lexical);
-    // `rm` does not follow the last component unless a trailing slash asks it to.
-    const traversed = /[\\/]\.?$/.test(target) ? lexical : dirname(lexical);
     if (
-      refilled(fill, traversed) ||
+      fill?.script.tainted ||
       policyState(lexical) ||
       policyState(path) ||
       sensitive(lexical) ||
@@ -250,7 +248,7 @@ export function disposable(cwd: string, input: string, roots: string[], fill?: F
       /* not inside a repository */
     }
     if (holdsRepository(path)) return false;
-    fill?.pending?.push(traversed);
+    if (fill?.reorder) fill.script.approved = true;
     return true;
   } catch {
     return false;
@@ -258,29 +256,20 @@ export function disposable(cwd: string, input: string, roots: string[], fill?: F
 }
 
 /**
- * Paths are resolved when the hook runs, before the script does. A command earlier in the script
- * that copies, moves, links, clones or extracts can put a symlink anywhere below where it writes,
- * so a later write or delete through such a path is not trusted, whether or not it exists now.
+ * Paths are resolved when the hook runs, before the script does. A command that can create a
+ * symlink (a recursive copy, a move, an extract, an unknown program) may plant one anywhere, so
+ * after it no temp write or scratch deletion in the same script is approved.
  */
 export interface Fill {
-  /** Where earlier commands write; `self` when that path itself may become a symlink. */
-  filled: Array<{ paths: string[]; self: boolean }>;
-  /** In a loop, pipeline or background job a later command can run first: approved paths go here. */
-  pending?: string[];
-}
-
-/** Whether `path` (one a command follows) lies below where an earlier command may have written. */
-export function refilled(fill: Fill | undefined, path: string): boolean {
-  if (!fill?.filled.length) return false;
-  let real = path;
-  try {
-    real = canonical(path);
-  } catch {
-    /* compare the written form only */
-  }
-  return fill.filled.some(({ paths, self }) =>
-    paths.some((root) => [path, real].some((p) => (p === root ? self : inside(root, p)))),
-  );
+  /** Shared by the whole script, nested `bash -c` scripts included. */
+  script: {
+    /** An earlier command may have created a symlink. */
+    tainted: boolean;
+    /** A temp path was approved where a later command can run first. */
+    approved: boolean;
+  };
+  /** In a loop, a pipeline or a background job a later command can run first. */
+  reorder: boolean;
 }
 
 export const OUTSIDE_REPOSITORY = "Cannot verify repository and path evidence";

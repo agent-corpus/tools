@@ -1,7 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, posix, resolve } from "node:path";
-import { canonical, type Fill, refilled, resolveWord, UNKNOWN_CWD } from "./evidence.js";
+import { canonical, type Fill, resolveWord, UNKNOWN_CWD } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -70,8 +70,8 @@ interface Ctx {
   calls: number;
   /** False when the script could assign positional parameters through zsh's `argv` array. */
   positional: boolean;
-  /** Inside a background job, which later commands can overtake. */
-  background?: boolean;
+  /** Inside a background job, or a script run where later commands can overtake it. */
+  reorder?: boolean;
   /** `first` is the script's first top-level pipeline, the only `cd` trusted not to fail. */
   box: {
     last?: Decision;
@@ -79,10 +79,8 @@ interface Ctx {
     first?: PipelineNode;
     /** Directories that earlier commands create, so a later `cd` into one is not unknown. */
     created?: Set<string>;
-    /** Where earlier commands copy, move, link, clone or extract (see `Fill`). */
-    filled: Fill["filled"];
-    /** Approved paths of commands that a later one may run before. */
-    pending: string[];
+    /** Whether a symlink may exist that the hook could not see (see `Fill`). */
+    script: Fill["script"];
   };
 }
 
@@ -695,23 +693,14 @@ function runSimple(
       const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd, fill);
       if (decision.decision !== "approve") return decision;
       ctx.box.last = decision;
-      for (const { dir, self } of fillTargets(unwrap(command.argv).argv)) {
-        if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
-        const written = resolveWord(cwd, dir);
-        const paths = [written];
-        try {
-          paths.push(canonical(written));
-        } catch {
-          /* the written form only */
-        }
-        const entry = { paths, self };
-        if (ctx.box.pending.some((path) => refilled({ filled: [entry] }, path)))
+      if (!symlinkFree(unwrap(command.argv).argv)) {
+        if (ctx.box.script.approved)
           return human(
             request,
             "unknown",
-            "A copy or extract that may run before an approved write requires human review",
+            "A command that can create symlinks may run before an approved temp path",
           );
-        ctx.box.filled.push(entry);
+        ctx.box.script.tainted = true;
       }
       for (const dir of createdDirectories(unwrap(command.argv).argv)) {
         if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
@@ -758,64 +747,40 @@ function runSimple(
 
 /** In a loop, a pipeline or a background job, a later command can run first. */
 function fillFor(ctx: Ctx, piped: boolean): Fill {
-  const reorder = ctx.loop > 0 || piped || !!ctx.background;
-  return { filled: ctx.box.filled, ...(reorder ? { pending: ctx.box.pending } : {}) };
-}
-
-/** Value of `-X dir`, `-Xdir` or `--long=dir` among `args`; the last one wins. */
-function optionValue(args: string[], short: string, long?: string): string | undefined {
-  let value: string | undefined;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index] ?? "";
-    if (arg === "--") break;
-    if (arg === short) value = args[++index];
-    else if (arg.startsWith(short) && !arg.startsWith("--")) value = arg.slice(short.length);
-    else if (long && arg === long) value = args[++index];
-    else if (long && arg.startsWith(`${long}=`)) value = arg.slice(long.length + 1);
-  }
-  return value;
+  return { script: ctx.box.script, reorder: ctx.loop > 0 || piped || !!ctx.reorder };
 }
 
 /**
- * Where a command can create entries that may be symlinks: a recursive copy, move, link or sync
- * destination (which may itself become one), a clone or new worktree, or an archive's output
- * directory (whose contents are new). Other programs write regular files, or are trusted outright.
+ * Programs that create no symlink: they read, print, or write regular files only. Shells are here
+ * because the script they run is judged with the same state.
  */
-function fillTargets(argv: string[]): Array<{ dir: string; self: boolean }> {
-  const [program = "", ...args] = argv;
-  const dest = (values: Set<string>) => {
-    const target = optionValue(args, "-t", "--target-directory");
-    if (target) return [{ dir: target, self: true }];
-    const rest = positionals(args, values);
-    const last =
-      rest.length > 1
-        ? rest[rest.length - 1]
-        : rest.length === 1 && program === "ln"
-          ? basename(rest[0] as string)
-          : undefined;
-    return last ? [{ dir: last, self: true }] : [];
-  };
-  if (
-    program === "cp" &&
-    args.some((arg) => /^-[^-]*[rRa]/.test(arg) || /^--(?:recursive|archive)$/.test(arg))
-  )
-    return dest(new Set(["-t", "-S", "--suffix"]));
-  if (["mv", "ln", "rsync", "ditto"].includes(program))
-    return dest(new Set(["-t", "-S", "--suffix"]));
-  if (program === "git") return createdDirectories(argv).map((dir) => ({ dir, self: true }));
-  if (["tar", "bsdtar", "gtar"].includes(program)) {
-    const first = args[0] ?? "";
-    const listsOrCreates =
-      (/^[^-]/.test(first) ? /[ctru]/.test(first) && !first.includes("x") : false) ||
-      args.some((arg) => /^-[^-]*[ctru]/.test(arg) && !/^-[^-]*x/.test(arg)) ||
-      args.some((arg) => /^--(?:create|list|append|update)$/.test(arg));
-    if (listsOrCreates) return [];
-    return [{ dir: optionValue(args, "-C", "--directory") ?? ".", self: false }];
+const SYMLINK_FREE = new Set([
+  ...[":", "[", "test", "true", "false", "echo", "printf", "print", "pwd", "sleep", "date"],
+  ...["cd", "chdir", "export", "set", "shift", "unset", "read", "local"],
+  ...["cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "paste", "diff", "cmp", "jq"],
+  ...["grep", "egrep", "fgrep", "rg", "sed", "ls", "stat", "file", "which", "type"],
+  ...["basename", "dirname", "realpath", "readlink", "mkdir", "touch", "tee"],
+  ...["rm", "rmdir", "unlink", "bash", "sh", "zsh", "dash"],
+]);
+/** git subcommands that leave the working tree as it is, or only add a fresh `.git`. */
+const GIT_SYMLINK_FREE = new Set([
+  ...["status", "log", "diff", "show", "add", "commit", "init", "rev-parse", "ls-files"],
+  ...["branch", "config", "fetch", "remote", "describe"],
+]);
+/**
+ * Whether a command is known to create no symlink. Anything else may plant one anywhere, so
+ * later temp paths in the script are no longer trusted. `cp` without options that copy links
+ * (`-R`, `-a`, `-P`, `-d`, long options) writes a regular file.
+ */
+function symlinkFree(argv: string[]): boolean {
+  const [path = "", ...args] = argv;
+  const program = basename(path);
+  if (program === "cp") return args.every((arg) => !arg.startsWith("-") || /^-[finpv]+$/.test(arg));
+  if (program === "git") {
+    const sub = args.find((arg) => !arg.startsWith("-"));
+    return args[0] === sub && GIT_SYMLINK_FREE.has(sub ?? "");
   }
-  if (program === "unzip") return [{ dir: optionValue(args, "-d") ?? ".", self: false }];
-  if (/^7z[az]?$/.test(program) || program === "cpio")
-    return [{ dir: optionValue(args, "-o") ?? ".", self: false }];
-  return [];
+  return SYMLINK_FREE.has(program);
 }
 
 /** git clone options that take a separate value. */
@@ -1547,11 +1512,7 @@ function runList(
     // A background job runs in a subshell of its own.
     const target = item.background ? copy(state) : state;
     const { first, rest } = item.node;
-    const refusal = runPipeline(
-      item.background ? { ...ctx, background: true } : ctx,
-      first,
-      target,
-    );
+    const refusal = runPipeline(item.background ? { ...ctx, reorder: true } : ctx, first, target);
     if (refusal) return refusal;
     if (!rest.length) {
       if (last && outcome) outcome.success = copy(item.background ? state : target);
@@ -1628,6 +1589,7 @@ export function commandDecision(
   profile: Profile,
   depth = 0,
   start: string[] = [request.cwd],
+  fill?: Fill,
 ): Decision {
   const script = parseScript(command);
   if (!script) return human(request, "unknown", UNSUPPORTED);
@@ -1638,7 +1600,8 @@ export function commandDecision(
     loop: 0,
     calls: 0,
     positional: !/argv/.test(command),
-    box: { calls: 0, filled: [], pending: [] },
+    box: { calls: 0, script: fill?.script ?? { tainted: false, approved: false } },
+    ...(fill?.reorder ? { reorder: true } : {}),
   };
   const opening = script.items[0];
   if (depth === 0 && opening && !opening.background) ctx.box.first = opening.node.first;

@@ -384,15 +384,12 @@ describe("deletion in scratch and temp directories", () => {
       "unzip a.zip && rm -rf ex/out/dist",
       "for x in 1 2; do rm -rf cl/out/dist; git clone https://example.com/o/r.git cl; done",
       "rm -rf cl/out/dist | git clone https://example.com/o/r.git cl",
-    ])
-      refused(command, outside);
-    // A missing directory that only mkdir created, and existing directories, stay approved.
-    for (const command of [
-      "mkdir -p fresh/out && rm -rf fresh/out/dist",
+      // After anything that can create a symlink, no temp path in the script is trusted.
       "git clone https://example.com/o/r.git cl2 && rm -rf cl2",
       `git clone https://example.com/o/r.git cl3 && echo x > ${posix(outside)}/w.txt`,
     ])
-      expect(bash(command, outside).decision, command).toBe("approve");
+      refused(command, outside);
+    expect(bash("mkdir -p fresh/out && rm -rf fresh/out/dist", outside).decision).toBe("approve");
   });
 
   // Each command runs Git for repository evidence, which is slow on Windows runners.
@@ -426,18 +423,36 @@ describe("deletion in scratch and temp directories", () => {
       "unzip b.zip && echo x > w.txt",
       "unzip -d ex b.zip && rm -rf ex/out/dist",
       "echo x > ex/out/w.txt & tar xf a.tar",
+      // Path-qualified programs, wrappers, nested shells, link-copying options and globs.
+      "/bin/cp -R sub mad1 && rm -rf mad1/inner/dist",
+      "/usr/bin/tar xf a.tar && rm -rf ex/out/dist",
+      "/bin/ln -s sub mad2 && echo x > mad2/w.txt",
+      "/bin/mv sub mad3 && rm -rf mad3/inner/dist",
+      "echo mad4 | xargs cp -R sub && rm -rf mad4/inner/dist",
+      "bash -c 'cp -R sub mad5' && rm -rf mad5/inner/dist",
+      "sh -c 'cp -R sub mad6 && rm -rf mad6/inner/dist'",
+      "cp -R sub mad7 && bash -c 'rm -rf mad7/inner/dist'",
+      "rsync -t -a sub/ mad8 && rm -rf mad8/inner/dist",
+      "cp -R sub/. mad?13 && rm -rf mad13/inner/dist",
+      "cp -P lnk mad9 && echo x > mad9",
+      "cp -d lnk mad10 && echo x > mad10",
+      "cp --no-dereference lnk mad11 && echo x > mad11",
+      "tar xf b.tar && rm -rf lnk/*",
+      "pax -r < a.pax && rm -rf ex/out/dist",
+      "python3 -c 'print(1)' && rm -rf ex/out/dist",
+      "rm -rf ex/out/dist | cp -R sub ex",
     ])
       refused(command, dir);
-    // The archive's own directory is not replaced, and rm does not follow the last component.
+    // Commands that create no symlink keep later temp paths trusted.
     for (const command of [
-      "tar xf a.tar && rm a.tar",
-      "tar xf b.tar && rm -rf lnk",
       "rm -rf made && cp -R sub made",
       "mkdir -p new1 && cp f new1/a && cp f new1/b",
       "mkdir -p new1 && sort f > new1/a && sort f > new1/b",
       "git status; mkdir -p new1 && echo a > new1/a",
       "mkdir new1 && cd new1 && git init && echo x > README.md",
-      "tar cf out.tar sub && echo x > w.txt",
+      "cp -p f new2 && /bin/cp f new3 && rm -rf new2 new3",
+      "grep -l x f | sort > new4 && rm new4",
+      "bash -c 'echo x > new5' && rm new5",
     ])
       expect(bash(command, dir).decision, command).toBe("approve");
   });
