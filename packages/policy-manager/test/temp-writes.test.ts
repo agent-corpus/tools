@@ -346,6 +346,41 @@ describe("deletion in scratch and temp directories", () => {
     approved("cd ./bare && rm -rf dist", outside);
   });
 
+  test("a cd into a missing bare name leaves the cwd unknown, unless the script creates it", () => {
+    // A missing name the script does not create: nothing relative is approved after it.
+    for (const command of [
+      "cd nosuch && touch a",
+      "cd nosuch && echo x > w.txt",
+      "cd nosuch && cd sub && rm -rf dist",
+      "cd nosuch && cd .. && rm -rf dist",
+    ])
+      refused(command, outside);
+    // Commands that do not depend on the cwd still run.
+    for (const command of ["cd nosuch && ls", `cd nosuch && touch ${posix(outside)}/abs.txt`]) {
+      const d = bash(command, outside);
+      expect(d.decision, command).toBe("approve");
+    }
+    // A directory the script creates first is a known destination.
+    for (const command of [
+      "mkdir -p made && cd made && touch a",
+      "mkdir -p made2/deep && cd made2 && touch a",
+      "mkdir -p made3/deep && cd made3/deep && rm -rf dist",
+      "mkdir made4 && cd made4 && echo x > w.txt",
+    ])
+      expect(bash(command, outside).decision, command).toBe("approve");
+  });
+
+  test("the reviewer's create-then-cd idioms are approved in a worktree", () => {
+    for (const command of [
+      "mkdir -p newdir && cd newdir && ls",
+      "git clone https://example.com/o/cl.git && cd cl && ls",
+      "git clone https://example.com/o/r.git cl && cd cl && ls",
+      "git worktree add ../wt2 && cd ../wt2 && ls",
+      "cd newdir && ls",
+    ])
+      expect(bash(command).decision, command).toBe("approve");
+  });
+
   test("builtins and keywords are commands, not AUTO_CD", () => {
     const dir = join(outside, "builtins");
     for (const name of ["export", "set", "test"])
@@ -355,6 +390,11 @@ describe("deletion in scratch and temp directories", () => {
     approved("set -e; rm -rf dist", dir);
     mkdirSync(join(dir, "nocmd-xyz"), { recursive: true });
     refused("nocmd-xyz && rm -rf dist", dir);
+    // bash-only builtins are not commands in zsh, so AUTO_CD enters a directory of that name.
+    for (const name of ["help", "bind", "caller", "compgen", "complete", "mapfile", "readarray"]) {
+      mkdirSync(join(dir, name, "dist"), { recursive: true });
+      refused(`${name} && rm -rf dist`, dir);
+    }
   });
 
   test("CDPATH inherited from the environment makes a relative cd unknown", () => {

@@ -1048,16 +1048,18 @@ function interpreterCodeRefusal(code: string): string | undefined {
   return undefined;
 }
 
-/** bash and zsh builtins and reserved words. */
+/**
+ * zsh builtins and reserved words. AUTO_CD is a zsh option, so a bash-only builtin (`help`,
+ * `mapfile`) is not a command there and a directory of that name is entered.
+ */
 const SHELL_WORDS = new Set(
   (
-    ". : [ [[ ]] { } ! alias autoload bg bind bindkey break builtin caller case cd chdir command " +
-    "compgen complete continue coproc declare dirs disown do done echo elif else emulate enable " +
-    "esac eval exec exit export false fc fg float for function functions getopts hash help history " +
-    "if in integer jobs kill let local logout mapfile noglob nocorrect popd print printf pushd pwd " +
-    "read readarray readonly repeat return select set setopt shift shopt source suspend test then " +
-    "time times trap true type typeset ulimit umask unalias unset unsetopt until wait whence where " +
-    "which while zle zmodload zstyle"
+    ". : [ [[ ]] { } ! alias autoload bg bindkey break builtin case cd chdir command continue " +
+    "coproc declare dirs disown do done echo elif else emulate enable esac eval exec exit export " +
+    "false fc fg float for function functions getopts hash history if in integer jobs kill let " +
+    "local logout noglob nocorrect popd print printf pushd pwd read readonly repeat return select " +
+    "set setopt shift source suspend test then time times trap true type typeset ulimit umask " +
+    "unalias unset unsetopt until wait whence where which while zle zmodload zstyle"
   ).split(" "),
 );
 /** Commands that change the shell's directory. */

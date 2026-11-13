@@ -16,6 +16,12 @@ const SEPARATOR = process.platform === "win32" ? /[\\/]/ : /\//;
 const SEPARATORS = process.platform === "win32" ? /[\\/]+/ : /\/+/;
 
 /**
+ * The working directory after a `cd` whose destination is unknown. It cannot exist (a NUL byte),
+ * and a relative path against it never resolves, so nothing relative is approved there.
+ */
+export const UNKNOWN_CWD = resolve("/", "\u0000unknown-directory");
+
+/**
  * A shell word as an absolute path, with a leading `~` expanded as the shell does. `~user`, `~+`,
  * `~-` and zsh's `=name` (the path of an executable) cannot be resolved here and throw.
  *
@@ -36,6 +42,7 @@ export function resolveWord(cwd: string, word: string): string {
     base = resolve(cwd, root);
     rest = word.slice(root.length);
   } else {
+    if (cwd === UNKNOWN_CWD) throw new Error("Unknown working directory");
     base = cwd;
     rest = word;
   }

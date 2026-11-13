@@ -1,7 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, posix, resolve } from "node:path";
-import { canonical, resolveWord } from "./evidence.js";
+import { canonical, resolveWord, UNKNOWN_CWD } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -71,7 +71,13 @@ interface Ctx {
   /** False when the script could assign positional parameters through zsh's `argv` array. */
   positional: boolean;
   /** `first` is the script's first top-level pipeline, the only `cd` trusted not to fail. */
-  box: { last?: Decision; calls: number; first?: PipelineNode };
+  box: {
+    last?: Decision;
+    calls: number;
+    first?: PipelineNode;
+    /** Directories that earlier commands create, so a later `cd` into one is not unknown. */
+    created?: Set<string>;
+  };
 }
 
 const copy = (state: State): State => ({
@@ -676,6 +682,11 @@ function runSimple(
       const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd);
       if (decision.decision !== "approve") return decision;
       ctx.box.last = decision;
+      for (const dir of createdDirectories(unwrap(command.argv).argv)) {
+        if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
+        ctx.box.created ??= new Set();
+        ctx.box.created.add(resolve(cwd, dir));
+      }
     }
   }
 
@@ -712,6 +723,73 @@ function runSimple(
     forget(state, forgotten);
   }
   return undefined;
+}
+
+/** git clone options that take a separate value. */
+const CLONE_VALUES = new Set([
+  "-b",
+  "--branch",
+  "-o",
+  "--origin",
+  "-c",
+  "--config",
+  "--depth",
+  "--reference",
+  "--separate-git-dir",
+  "-u",
+  "--upload-pack",
+  "--template",
+  "-j",
+  "--jobs",
+  "--filter",
+  "--shallow-since",
+  "--shallow-exclude",
+]);
+/** Positional words of `args`, skipping options and the values of those in `values`. */
+function positionals(args: string[], values: Set<string>): string[] {
+  const out: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index] ?? "";
+    if (word === "--") return [...out, ...args.slice(index + 1)];
+    if (values.has(word)) index++;
+    else if (!word.startsWith("-")) out.push(word);
+  }
+  return out;
+}
+/**
+ * Directories a command creates (as written, relative to its cwd): `mkdir` (with `-p`, every
+ * ancestor too), `git clone <url> [dir]`, `git worktree add <path>`, and the destination of `cp -r`
+ * or `mv`.
+ */
+function createdDirectories(argv: string[]): string[] {
+  const [program, ...args] = argv;
+  if (program === "mkdir") {
+    const parents = args.some((arg) => arg === "--parents" || /^-[^-]*p/.test(arg));
+    return positionals(args, new Set(["-m", "--mode"])).flatMap((dir) => {
+      if (!parents) return [dir];
+      const parts = dir.split("/");
+      return parts.map((_, index) => parts.slice(0, index + 1).join("/") || "/");
+    });
+  }
+  if (program === "git" && args[0] === "clone") {
+    const [url, dir] = positionals(args.slice(1), CLONE_VALUES);
+    if (dir) return [dir];
+    const name = url
+      ?.replace(/[\\/]+$/, "")
+      .split(/[/:]/)
+      .pop()
+      ?.replace(/\.git$/, "");
+    return name ? [name] : [];
+  }
+  if (program === "git" && args[0] === "worktree" && args[1] === "add") {
+    const [path] = positionals(args.slice(2), new Set(["-b", "-B", "--reason"]));
+    return path ? [path] : [];
+  }
+  if ((program === "cp" && args.some((arg) => /^-[^-]*[rRa]/.test(arg))) || program === "mv") {
+    const rest = positionals(args, new Set(["-t", "-S", "--suffix"]));
+    return rest.length > 1 ? [rest[rest.length - 1] as string] : [];
+  }
+  return [];
 }
 
 /** A relative `cd` target that does not start with `.`: CDPATH and CDABLE_VARS can redirect it. */
@@ -769,15 +847,16 @@ function changeDirectory(
         const logical = resolve(cwd, word);
         if (canonical(logical) !== canonical(resolveWord(cwd, raw as string)))
           throw new Error("Logical and physical directories differ");
+        // A bare name that is not a directory, and that no earlier command creates, fails in a
+        // plain shell; options set in rc files (zsh CDABLE_VARS, a CDPATH set there) can still send
+        // it anywhere. The shell is then somewhere unknown, so nothing relative is approved there.
+        if (bareName(word) && !isDirectory(logical) && !ctx.box.created?.has(logical))
+          return UNKNOWN_CWD;
         return logical;
       });
     } catch {
       return human(request, "unknown", "Directory change requires human review");
     }
-    // A bare name that is a directory nowhere can only succeed through options set in rc files
-    // (zsh CDABLE_VARS, a CDPATH set there), which send it somewhere unknown.
-    if (bareName(word) && !next.some(isDirectory))
-      return human(request, "unknown", "Directory change requires human review");
     cwds = [...new Set([...cwds, ...next])];
   }
   if (!cwds.length || cwds.length + state.cwds.length > MAX_DIRECTORIES)
