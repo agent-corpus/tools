@@ -20,6 +20,14 @@ import { StringDecoder } from "node:string_decoder";
 import { parseRecord, record, timestamp } from "./schema.js";
 import type { AuditRecord, EventInput, Filters, QueryResult, StorageOptions } from "./types.js";
 
+function lockPresent(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 export type {
   Attribute,
   AuditRecord,
@@ -66,9 +74,17 @@ export class AuditLog {
   }
   private locked<T>(directory: string, operation: () => T): T {
     const path = join(directory, "audit.lock");
-    let fd: number;
+    const fd = this.lock(path, true);
     try {
-      fd = openSync(
+      return operation();
+    } finally {
+      closeSync(fd);
+      unlinkSync(path);
+    }
+  }
+  private lock(path: string, retry: boolean): number {
+    try {
+      return openSync(
         path,
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
         0o600,
@@ -76,17 +92,14 @@ export class AuditLog {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "EEXIST") throw new AuditBusyError();
-      // Windows refuses to open a file another writer is still deleting (EPERM or EACCES) rather
-      // than reporting it as existing, so the lock is just as busy.
-      if (process.platform === "win32" && (code === "EPERM" || code === "EACCES"))
-        throw new AuditBusyError();
+      // Windows refuses to open a lock file another writer is still deleting with EPERM or
+      // EACCES rather than EEXIST. Busy while the lock is visibly there; otherwise the delete may
+      // just have finished, so try once more. A failure that persists is reported as itself.
+      if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+        if (lockPresent(path)) throw new AuditBusyError();
+        if (retry) return this.lock(path, false);
+      }
       throw error;
-    }
-    try {
-      return operation();
-    } finally {
-      closeSync(fd);
-      unlinkSync(path);
     }
   }
   private checkedFile(path: string, flags: number): number {
