@@ -105,7 +105,7 @@ beforeAll(() => {
   write(join(wt, "new.txt"), "untracked");
   if (links) symlinkSync("a.txt", join(wt, "newlink"));
   // Untracked user files, born well before any approval in the tests.
-  for (const name of ["user1.md", "user2.md", "user3.md", "user4.md", "user5.md"])
+  for (const name of ["user1.md", "user2.md", "user3.md", "user4.md", "user5.md", "user6.md"])
     write(join(wt, "user", name), `user notes ${name}`);
   const born = Date.now() + 300;
   while (Date.now() < born) {
@@ -536,6 +536,36 @@ describe("files this session created", () => {
       attempt(s, command, () => write(join(wt, file), "made by the session"));
       try {
         expect(rm(s, `rm ${file}`).decision, command).toBe("approve");
+      } finally {
+        cleanup(file);
+      }
+    }
+  });
+
+  test("an input redirect or an expandable operand records nothing", () => {
+    // tee copies a user's notes into y2.txt, then mv overwrites the notes: y2.txt is the only copy.
+    const s = session();
+    create(s, "mine2.txt");
+    attempt(s, "tee y2.txt < user/user6.md && mv mine2.txt user/user6.md", () => {
+      write(join(wt, "y2.txt"), "user notes user6.md");
+      renameSync(join(wt, "mine2.txt"), user("user6.md"));
+    });
+    try {
+      expect(rm(s, "rm y2.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("y2.txt", "mine2.txt");
+      write(user("user6.md"), "user notes user6.md");
+    }
+    // A word the shell would expand is not the literal path it looks like.
+    for (const [command, file] of [
+      ["touch ~tilde.txt", "~tilde.txt"],
+      ["touch =eq.txt", "=eq.txt"],
+      ["echo hi > ~tilde2.txt", "~tilde2.txt"],
+    ] as const) {
+      const t = session();
+      attempt(t, command, () => write(join(wt, file), "expanded elsewhere"));
+      try {
+        expect(rm(t, `rm ./${file}`).decision, command).not.toBe("approve");
       } finally {
         cleanup(file);
       }

@@ -107,6 +107,14 @@ const CREATING = new Set(["touch", "tee", "cp", "mv", "cd", "pwd", "echo", "prin
 /** Absolute directories whose `touch`, `cp`, ... are the system tools, not a lookalike script. */
 const SYSTEM_BIN = /^\/(?:usr\/(?:local\/)?)?bin\/[^/]+$|^\/opt\/homebrew\/bin\/[^/]+$/;
 
+/**
+ * A path word the shell passes through unchanged. A leading `~` or `=` (zsh's command path) and a
+ * `$`, glob or brace anywhere could expand to something else, so such a word is unprovable.
+ */
+function literal(word: string): boolean {
+  return word.length > 0 && !/^[~=]/.test(word) && !/[$*?[\]{}]/.test(word);
+}
+
 /** The allowlisted program `word` names, or undefined (a relative path may be any script). */
 function program(word: string | undefined): string | undefined {
   if (!word || (word.includes("/") && !SYSTEM_BIN.test(word))) return undefined;
@@ -116,8 +124,9 @@ function program(word: string | undefined): string | undefined {
 
 /**
  * Creation targets of a plain script, or undefined when any command is not provably on the
- * allowlist. A substitution, process substitution, heredoc, assignment, wrapper (`env`, `xargs`,
- * `time`, `nice`, `command`), nested shell or unknown option makes the whole script record
+ * allowlist. A substitution, process substitution, heredoc, input or descriptor redirect,
+ * expandable path word, assignment, wrapper (`env`, `xargs`, `time`, `nice`, `command`), nested
+ * shell or unknown option makes the whole script record
  * nothing; so does `mv` or `cp` from a file the session does not own when the hook runs (an
  * earlier command in the same script cannot confer ownership).
  */
@@ -129,24 +138,28 @@ function shellTargets(
   const found: Target[] = [];
   let cwd = start;
   const add = (path: string, prior?: Stamp) => {
-    const at = located(cwd, path);
+    const at = literal(path) ? located(cwd, path) : undefined;
     if (!at) return false;
     found.push({ path: at, ...(prior ? { prior } : {}) });
     return true;
   };
   for (const stages of pipelines)
     for (const c of stages) {
-      if (c.subs.length || c.env.length || c.stdin !== undefined) return undefined;
+      // parseShell already refuses heredocs and here-strings, so `subs` and `env` are what remain.
+      if (c.subs.length || c.env.length) return undefined;
       const name = program(c.argv[0]);
       if (!name) return undefined;
       const args = c.argv.slice(1);
       const flags = args.filter((word) => word.startsWith("-"));
       const words = args.filter((word) => !word.startsWith("-"));
-      for (const r of c.redirects)
-        if ((r.op === ">" || r.op === ">>") && r.target !== "/dev/null" && !add(r.target))
-          return undefined;
+      // Only output redirects to the script's own targets: `tee y < notes.md` reads a user's file,
+      // and `<`, `>&` and the like may carry content the session did not write.
+      for (const r of c.redirects) {
+        if (r.op !== ">" && r.op !== ">>") return undefined;
+        if (r.target !== "/dev/null" && !add(r.target)) return undefined;
+      }
       if (name === "cd") {
-        if (args.length !== 1 || flags.length) return undefined;
+        if (args.length !== 1 || flags.length || !literal(args[0] as string)) return undefined;
         cwd = resolve(cwd, args[0] as string);
       } else if (name === "touch") {
         if (flags.length) return undefined;
@@ -158,7 +171,8 @@ function shellTargets(
         if (flags.some((flag) => flag !== "-f" && flag !== "-v") || words.length !== 2)
           return undefined;
         // Only from a file the session owns now: `mv` keeps its inode, `cp` copies its content.
-        const source = owned(created, located(cwd, words[0] as string));
+        const from = words[0] as string;
+        const source = literal(from) ? owned(created, located(cwd, from)) : undefined;
         if (!source || !add(words[1] as string, name === "mv" ? source : undefined))
           return undefined;
       }
