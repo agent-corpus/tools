@@ -72,7 +72,7 @@ Pass one JSON object on standard input:
 }
 ```
 
-Run `policy-manager review codex session-example`. The response includes `decision` (`approve` or `human`), `category`, `reason`, `requestHash`, `cache`, and `cached`. The library exports the same evaluator.
+Run `policy-manager review codex session-example`. The response includes `decision` (`approve`, `human`, `deny`, or `native` for an unlisted MCP tool left to the harness), `category`, `reason`, `requestHash`, `cache`, and `cached`. The library exports the same evaluator.
 
 The session's policy-manager agent returns the following object for an ambiguous request. The working agent submits it through `policy-manager classify codex session-example`:
 
@@ -133,7 +133,8 @@ Without a profile the engine is strict (everything above). An organization can i
   "mode": "permissive",
   "cloudWrites": "human",
   "humanPatterns": ["^npm install"],
-  "scratchRoots": ["/tmp"]
+  "scratchRoots": ["/tmp"],
+  "mcpReadOnly": ["mcp__github__get_issue", "mcp__github__list_pull_requests"]
 }
 ```
 
@@ -156,6 +157,20 @@ Every command that could run is judged, not only the first. Understood: `;`, new
 - **Compound commands.** Branches are judged on copies of the state and merged; a loop's assigned variables are unknown inside it and afterwards, and a `cd` inside a loop or pipeline needs a human. A `cd` can fail, so the directory it started from stays possible, except in an unbroken `&&` chain (`cd X && cmd`) or an `if cd X; then` body, which run only after it succeeded. `cd X; cmd`, `cd X || cmd` and `! cd X && cmd` are judged in both directories.
 - **Other repositories.** A session started in one repository may change any other Git repository when the writes land in a linked feature worktree: `cd <worktree> && <edit>`, and commits, pushes and `gh pr create` from there. From any clone, `git fetch origin` and `git worktree add` are approved; a new worktree inside the main checkout must go under `.worktrees/` or `.claude/worktrees/`, and `-B` needs a human. Writes to a main checkout still need a human. The strict profile approves `git worktree add [--no-track] <path> -b <new branch> origin/main` (either order, `main` or `master`) under those two directories.
 - **Still sent to a human:** brace expansion, arithmetic (`$((`, `$[`, `(( ))`), `${X:-y}` and other parameter forms, `$'...'`, function definitions, unquoted heredocs whose body expands, and scripts that expand to more than a few hundred commands. `cloudWrites: "allow"` also approves non-destructive cloud changes.
+
+#### MCP read-only tools
+
+`mcpReadOnly` lists MCP tools that run without a prompt, in any `mode`. Each entry is an exact `mcp__<server>__<tool>` name, or a name whose tool segment ends in `*` (`mcp__docs__search_*`). Neither segment may contain `__`, and a wildcard approves only a tool whose whole tool segment (after `mcp__<server>__`) is free of `__`, so it cannot reach another server such as `github__get`. Whole-server wildcards (`mcp__github__*`), regular expressions and other tool names are rejected, and the list holds at most 200 entries of 128 characters. List only tools that cannot change anything and cannot return credentials: the tool name is all the engine checks, not the arguments. Prefer exact names. A prefix also covers tools that a server adds later, and read-looking prefixes can include secret readers: the GitHub server's `get_*` and `list_*` cover its secret-scanning alert tools, which return the detected secret.
+
+The server segment is whatever name the harness configuration gives the server, and the engine cannot tell where it came from. In Claude Code, a project `.mcp.json` server overrides a user server of the same name, so a repository can register its own `github`. Once the user enables it, its listed tools run without a prompt. List only servers defined in managed or user configuration, and pair the list with the harness's MCP server allowlists (Claude Code `enabledMcpjsonServers`, or managed MCP settings).
+
+A listed tool is approved. Any other MCP tool gets no decision from the policy manager: the harness's own permission flow (allow rules, prompts) handles it exactly as without the hook, so nothing that worked before needs a classification or a new prompt. The audit log records an MCP request with the tool name and argument keys hashed, never argument values.
+
+| Harness     | MCP support                                                                                                                                                                                                              |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Claude Code | `PreToolUse` matcher `mcp__.*` (regex on `mcp__<server>__<tool>`); `PermissionRequest` already sees every tool.                                                                                                          |
+| Codex       | Same matcher; Codex names MCP tools `mcp__<server>__<tool>` in `PreToolUse` and `PermissionRequest`. The new matcher changes the `PreToolUse` hook's trust hash, so trust it again in `/hooks` after `setup-hook-codex`. |
+| Copilot     | Not supported. The Copilot hooks reference documents no MCP tool name for hooks, so setup adds no MCP matcher and `mcpReadOnly` never matches a Copilot tool; Copilot's own MCP permissions apply.                       |
 
 Measure a profile against real usage with `policy-manager replay ~/.claude/projects --profile policy.json`: it replays the Bash commands recorded in Claude Code transcripts through the evaluator (nothing is executed) and prints the approval rate with and without the profile, plus the most common reasons that still need a human. Reports include short command excerpts, so keep them local.
 

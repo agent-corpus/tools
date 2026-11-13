@@ -60,6 +60,7 @@ export function hookResponse(
   decision: Decision,
   context?: HookContext,
 ): Record<string, unknown> {
+  if (decision.decision === "native") return {};
   if (decision.decision === "deny") {
     const reason =
       decision.classification === "requested"
