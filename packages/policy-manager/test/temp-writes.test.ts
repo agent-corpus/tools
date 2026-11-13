@@ -288,6 +288,12 @@ describe("deletion in scratch and temp directories", () => {
       `find -xL ${away} -delete`,
       `find -xQ -delete`,
       `find -bogus -delete`,
+      // bfs takes start paths, -f and -- inside the expression.
+      `find sub -delete ${away}`,
+      `find -name x ${away} -delete`,
+      `find sub -f ${away} -delete`,
+      `find sub -- ${away} -delete`,
+      `find sub -name x -delete -print ${away}`,
       `find ${posix(outside)} -files0-from x -delete`,
     ])
       refused(command, outside);
@@ -296,6 +302,10 @@ describe("deletion in scratch and temp directories", () => {
     approved(`find -- ${posix(outside)}/find-opts -name '*.tmp' -delete`);
     approved(`find -xP ${posix(outside)}/find-opts -delete`);
     approved("find -name '*.tmp' -delete", join(outside, "find-opts"));
+    approved("find . ! -name keep -delete", join(outside, "find-opts"));
+    approved("find . -not -name keep -delete", join(outside, "find-opts"));
+    approved("find . \\( -name a -o -name b \\) -delete", join(outside, "find-opts"));
+    approved("find ! -name keep -delete", join(outside, "find-opts"));
   });
 
   test("rmdir -p is refused: it removes ancestors up to and past the root", () => {

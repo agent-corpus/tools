@@ -322,11 +322,16 @@ function textOperands(
   }
   const values = SHORT_VALUES[program];
   if (values === undefined) return { text, paths: [], files };
-  const scripts: string[] = [];
-  const named = (index: number, script = args[index] ?? "") => {
-    text.add(index);
-    scripts.push(script);
+  // Fallback when an option cannot be understood: every operand is checked.
+  const everyWord = {
+    text: new Set<number>(),
+    paths: [],
+    files: args.filter((arg) => arg !== "" && !arg.startsWith("-")),
   };
+  // grep, rg and GNU sed accept options after operands, so collect everything before deciding
+  // which operand, if any, is the pattern or script.
+  const scripts: Array<[number, string]> = [];
+  const operands: number[] = [];
   let explicit = false;
   let ended = false;
   for (let index = 0; index < args.length; index++) {
@@ -335,52 +340,83 @@ function textOperands(
       ended = true;
       continue;
     }
-    if (!ended && word.startsWith("-")) {
-      if (word === "--expression" || word === "--regexp") {
+    if (!ended && word.startsWith("--")) {
+      const eq = word.indexOf("=");
+      const name = longOption(program, eq < 0 ? word : word.slice(0, eq));
+      if (name === undefined) return everyWord;
+      if (name === "--expression" || name === "--regexp") {
         explicit = true;
-        named(++index);
-      } else if (/^--(?:expression|regexp)=/.test(word)) {
-        explicit = true;
-        named(index, word.slice(word.indexOf("=") + 1));
-      } else if (word.startsWith("--")) {
-        // A pattern or script file means there is no pattern operand: every operand is a file.
-        if (word === "--file" || word.startsWith("--file=")) explicit = true;
-        if (word.includes("=")) continue;
-        // A value-taking long option consumes the next word, which stays a checked operand. An
-        // option this list does not know might too, so nothing is treated as text.
-        if (LONG_VALUES[program]?.has(word)) index++;
-        else if (!LONG_FLAGS[program]?.has(word))
-          return {
-            text: new Set(),
-            paths: [],
-            files: args.filter((arg) => arg !== "" && !arg.startsWith("-")),
-          };
-      } else if (/^-[A-Za-z]/.test(word))
-        for (let at = 1; at < word.length; at++) {
-          const flag = word[at] ?? "";
-          if (program === "sed" && flag === "i") break; // the rest is a backup suffix
-          if (flag === "e") {
-            explicit = true;
-            if (at + 1 < word.length) named(index, word.slice(at + 1));
-            else named(++index);
-            break;
-          }
-          if (values.includes(flag)) {
-            if (flag === "f") explicit = true;
-            if (at + 1 === word.length) index++;
-            break;
-          }
+        if (eq >= 0) scripts.push([index, word.slice(eq + 1)]);
+        else {
+          index++;
+          scripts.push([index, args[index] ?? ""]);
         }
+      } else {
+        // A pattern or script file means there is no pattern operand: every operand is a file.
+        if (name === "--file") explicit = true;
+        // A value-taking long option consumes the next word, which stays a checked operand.
+        if (eq < 0 && LONG_VALUES[program]?.has(name)) index++;
+      }
       continue;
     }
-    // The first operand is the script or pattern unless -e named one. BSD `sed -i ''` leaves an
-    // empty suffix operand, which is skipped.
-    if (word === "") continue;
-    if (!explicit && scripts.length === 0) named(index);
-    else files.push(word);
+    if (!ended && /^-[A-Za-z]/.test(word)) {
+      for (let at = 1; at < word.length; at++) {
+        const flag = word[at] ?? "";
+        if (program === "sed" && flag === "i") break; // the rest is a backup suffix
+        if (flag === "e") {
+          explicit = true;
+          if (at + 1 < word.length) scripts.push([index, word.slice(at + 1)]);
+          else {
+            index++;
+            scripts.push([index, args[index] ?? ""]);
+          }
+          break;
+        }
+        if (values.includes(flag)) {
+          if (flag === "f") explicit = true;
+          if (at + 1 === word.length) index++;
+          break;
+        }
+      }
+      continue;
+    }
+    if (!ended && word.startsWith("-")) continue;
+    // BSD `sed -i ''` leaves an empty suffix operand, which is skipped.
+    if (word !== "") operands.push(index);
   }
-  const paths = program === "sed" ? scripts.flatMap(sedScriptPaths) : [];
+  // The first operand is the script or pattern only when no -e, -f, --regexp, --expression or
+  // --file named one, wherever that option appears.
+  const first = explicit ? undefined : operands.shift();
+  if (first !== undefined) scripts.push([first, args[first] ?? ""]);
+  for (const [index] of scripts) text.add(index);
+  files.push(...operands.map((index) => args[index] ?? ""));
+  const paths = program === "sed" ? scripts.flatMap(([, script]) => sedScriptPaths(script)) : [];
   return { text, paths, files };
+}
+
+/** Pattern and script options per program, besides the value lists. */
+const PATTERN_OPTIONS: Record<string, string[]> = {
+  sed: ["--expression", "--file"],
+  grep: ["--regexp", "--file"],
+  egrep: ["--regexp", "--file"],
+  fgrep: ["--regexp", "--file"],
+  rg: ["--regexp", "--file"],
+};
+/**
+ * A long option name resolved as GNU getopt does: an exact match, or the one known option it
+ * abbreviates. Unknown or ambiguous names are undefined.
+ */
+function longOption(program: string, name: string): string | undefined {
+  const known = new Set([
+    ...(PATTERN_OPTIONS[program] ?? []),
+    ...(LONG_VALUES[program] ?? []),
+    ...(LONG_FLAGS[program] ?? []),
+  ]);
+  if (known.has(name)) return name;
+  // rg takes no abbreviations: `rg --files` is not `--files-with-matches`.
+  if (program === "rg") return undefined;
+  const matches = [...known].filter((option) => option.startsWith(name));
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 const FIND_ACTIONS = new Set([
@@ -393,8 +429,8 @@ const FIND_ACTIONS = new Set([
   "-fprintf",
   "-fls",
 ]);
-/** Expression primaries that may open a find expression when no start path is given. */
-const FIND_PRIMARIES = new Set(
+/** find primaries that take one argument. */
+const FIND_VALUE_PRIMARIES = new Set(
   [
     "amin",
     "anewer",
@@ -402,9 +438,6 @@ const FIND_PRIMARIES = new Set(
     "cmin",
     "cnewer",
     "ctime",
-    "delete",
-    "depth",
-    "empty",
     "group",
     "iname",
     "inum",
@@ -415,25 +448,56 @@ const FIND_PRIMARIES = new Set(
     "maxdepth",
     "mindepth",
     "mmin",
-    "mount",
     "mtime",
     "name",
     "newer",
-    "nogroup",
-    "nouser",
     "path",
     "perm",
-    "print",
-    "print0",
-    "prune",
     "regex",
     "size",
     "type",
     "user",
     "wholename",
-    "xdev",
   ].map((name) => `-${name}`),
 );
+/** find primaries and operators that take no argument. */
+const FIND_FLAG_PRIMARIES = new Set([
+  ...[
+    "a",
+    "and",
+    "delete",
+    "depth",
+    "empty",
+    "false",
+    "mount",
+    "nogroup",
+    "not",
+    "nouser",
+    "o",
+    "or",
+    "print",
+    "print0",
+    "prune",
+    "true",
+    "xdev",
+  ].map((name) => `-${name}`),
+  "!",
+  "(",
+  ")",
+]);
+/**
+ * Whether every word of a find expression is a known primary, operator or primary argument. bfs
+ * (behind Claude Code's `find`) also takes start paths, `-f` and `--` inside the expression, so an
+ * unknown word could be one.
+ */
+function knownFindExpression(words: string[]): boolean {
+  for (let index = 0; index < words.length; index++) {
+    const word = words[index] ?? "";
+    if (FIND_VALUE_PRIMARIES.has(word)) index++;
+    else if (!FIND_FLAG_PRIMARIES.has(word)) return false;
+  }
+  return true;
+}
 /**
  * `rm`, `rmdir`, `unlink` or `find ... -delete` whose every target is disposable: strictly inside
  * a scratch root or the system temp directory (see `disposable`).
@@ -480,12 +544,8 @@ function scratchDeletion(program: string, args: string[], cwd: string, profile: 
     targets = [];
     for (; index < args.length && !/^[-(!)]/.test(args[index] ?? ""); index++)
       targets.push(args[index] as string);
-    // With no start path find searches the cwd, but only when the next word is a real primary; an
-    // unknown option there could be hiding the start path.
-    if (targets.length === 0) {
-      if (index < args.length && !FIND_PRIMARIES.has(args[index] as string)) return false;
-      targets = ["."];
-    }
+    if (!knownFindExpression(args.slice(index))) return false;
+    if (targets.length === 0) targets = ["."];
   } else return false;
   return targets.length > 0 && targets.every((target) => disposable(cwd, target, roots));
 }
