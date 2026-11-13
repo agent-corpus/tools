@@ -605,7 +605,10 @@ function runSimple(
     const args = unwrap(argv).argv.slice(1);
     if (
       state.funcs.size &&
-      (UNDEFINES.has(effective) || (effective === "unset" && !args.includes("-v")))
+      (UNDEFINES.has(effective) ||
+        // bash and sh read options only before the first name: `unset touch -v` removes `touch`.
+        (effective === "unset" &&
+          !(args[0] === "-v" && args.slice(1).every((a) => !a.startsWith("-")))))
     )
       return human(
         request,
@@ -908,8 +911,9 @@ function mayRun(
         }
         return c.argv.slice(1).some((w) => names.has(plainText(w) ?? ""));
       }
+      // A function the body defines or redefines may be called later in it.
       case "function":
-        return false;
+        return mayRun(c.body.body, names, funcs, seen);
       case "subshell":
         return false;
       case "group":

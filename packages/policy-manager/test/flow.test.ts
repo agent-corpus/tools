@@ -803,6 +803,19 @@ describe("functions, positional parameters, parameter operations and read loops"
     ["touch() { echo no; }; unfunction touch; touch $HOME/.probe", "unknown"],
     ["touch() { echo no; }; unhash -f touch; touch $HOME/.probe", "unknown"],
     ["touch() { echo no; }; disable -f touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset touch -v; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset X -v touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset -v -f touch; touch $HOME/.probe", "unknown"],
+    // a cd in a function the body defines, or that a called function defines, may run before return
+    ['f() { [ -n "$1" ] || return 0; h() { cd src; }; h; }; f && echo x > probe-n.txt', "unknown"],
+    [
+      'g() { h() { cd src; }; }; f() { [ -n "$1" ] || return 0; g; h; }; f && echo x > probe-n.txt',
+      "unknown",
+    ],
+    [
+      'h() { :; }; f() { [ -n "$1" ] || return 0; h() { cd src; }; h; }; f && echo x > probe-n.txt',
+      "unknown",
+    ],
     // zsh reads $10 as the tenth parameter, bash and sh as $1 then 0
     ['f() { touch "$10$HOME/.probe"; }; f x', "unknown"],
     ['set -- x; touch "$10$HOME/.probe"', "unknown"],
@@ -911,6 +924,7 @@ describe("functions, positional parameters, parameter operations and read loops"
     'f() { [ -n "$1" ] || return 1; echo $1; }; f a',
     'f() { [ -n "$1" ] || return 1; X=src; }; f a; echo $X',
     "f() { ls; }; X=1; unset -v X; f",
+    "touch() { echo no; }; X=1; unset -v X touch; touch x",
     'f() { echo "${1}0"; }; f a',
     'f() { echo "$@"; }; f a b',
     "f() {\n  ls $1\n}\nf src; f .",
