@@ -69,9 +69,9 @@ function settle(state: State): void {
   delete state.failed;
 }
 
+/** Every directory either state could be in; neither input is changed. */
 function merge(a: State, b: State): State {
-  settle(a);
-  settle(b);
+  const cwds = [...a.cwds, ...(a.failed ?? []), ...b.cwds, ...(b.failed ?? [])];
   const vars = new Map<string, string[] | null>();
   for (const [name, left] of a.vars) {
     if (!b.vars.has(name)) continue; // assigned on one path only: an environment value is possible
@@ -79,7 +79,7 @@ function merge(a: State, b: State): State {
     const union = left && right ? [...new Set([...left, ...right])] : null;
     vars.set(name, union && union.length <= MAX_VARIANTS ? union : null);
   }
-  return { cwds: [...new Set([...a.cwds, ...b.cwds])], vars };
+  return { cwds: [...new Set(cwds)], vars };
 }
 
 function replace(target: State, source: State): void {

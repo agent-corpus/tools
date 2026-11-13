@@ -366,10 +366,23 @@ function worktreeAdd(request: Request, cwd: string, args: string[]): Decision | 
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const word = args[i] as string;
-    if (word === "-B" || word.startsWith("-B"))
-      return human(request, "destructive", "git worktree add -B resets an existing branch");
-    if (["-b", "--orphan", "--reason"].includes(word)) i++;
-    else if (!word.startsWith("-")) positional.push(word);
+    if (word === "--") {
+      positional.push(...args.slice(i + 1));
+      break;
+    }
+    if (word.startsWith("--")) {
+      // --orphan and --reason take the next word unless it is given inline (`--reason=x`).
+      if (!word.includes("=") && ["--orphan", "--reason"].some((name) => abbreviates(word, name)))
+        i++;
+    } else if (word.startsWith("-") && word.length > 1) {
+      // A cluster of short flags (`-qb`, `-fB`): the first `b` or `B` takes the rest of the word
+      // as its value (`-bname`), or the next word when it ends the cluster.
+      const letters = word.slice(1);
+      const at = letters.search(/[bB]/);
+      if (letters[at] === "B")
+        return human(request, "destructive", "git worktree add -B resets an existing branch");
+      if (at === letters.length - 1) i++;
+    } else positional.push(word);
   }
   const path = positional[0];
   if (!path) return undefined;

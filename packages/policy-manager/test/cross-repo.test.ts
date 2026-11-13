@@ -77,6 +77,9 @@ describe("writes after `cd` into another repository's linked worktree", () => {
     `cd ${posix(wt)} && (echo x > a.txt)`,
     `{ cd ${posix(wt)}; } && echo x > a.txt`,
     `if cd ${posix(wt)}; then echo x > a.txt; fi`,
+    // A `cd` later in an unbroken `&&` chain is trusted the same as the first one.
+    `true && cd ${posix(wt)} && echo x > a.txt`,
+    `cd ${posix(repo)} && cd .worktrees/feat && echo x > a.txt`,
     `cd ${posix(wt)} && git add -A && git commit -m x && git push -u origin HEAD && gh pr create --fill`,
   ];
   test.each(HARNESSES)("%s approves them", (harness) => {
@@ -122,6 +125,9 @@ describe("Git from another repository's main clone", () => {
       `cd ${posix(repo)} && git worktree add -b feat/new .worktrees/new origin/main`,
       `git -C ${posix(repo)} worktree add ${posix(root)}/elsewhere -b feat/new origin/main`,
       `git -C ${posix(wt)} worktree add ${posix(repo)}/.worktrees/sibling -b feat/s origin/main`,
+      `git -C ${posix(wt)} worktree add -qb feat/q ../q origin/main`,
+      `git -C ${posix(repo)} worktree add -bfeat/q .worktrees/q origin/main`,
+      `git -C ${posix(repo)} worktree add --reason why .worktrees/q -b feat/q origin/main`,
     ])
       expect(decide(command, h).decision, command).toBe("approve");
   });
@@ -133,6 +139,14 @@ describe("Git from another repository's main clone", () => {
       `git -C ${posix(repo)} worktree add .claude/other -b feat/new origin/main`,
       `git -C ${posix(wt)} worktree add ../../src -b feat/new origin/main`,
       `git -C ${posix(repo)} worktree add -B main .worktrees/new origin/main`,
+      // -B bundled with other short flags still resets an existing branch.
+      `git -C ${posix(wt)} worktree add -qB feat/x ../yy origin/main`,
+      `git -C ${posix(wt)} worktree add -fB feat/x ../yy origin/main`,
+      // A bundled -b takes the next word as its value, so the path after it is judged.
+      `git -C ${posix(wt)} worktree add -qb br ../../inmain origin/main`,
+      `git -C ${posix(wt)} worktree add -bbr ../../inmain origin/main`,
+      `git -C ${posix(repo)} worktree add --reason .worktrees/x src/in -b feat/r origin/main`,
+      `git -C ${posix(repo)} worktree add -b feat/r -- src/in origin/main`,
       `cd ${posix(repo)} && echo x > a.txt`,
     ])
       expect(decide(command, h).decision, command).toBe("human");
