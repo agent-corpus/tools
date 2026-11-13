@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
 import {
   commandDecision,
@@ -397,6 +397,23 @@ function evaluateCore(request: Request, profile: Profile): Decision {
   return evaluateArgv(request, argv);
 }
 
+/**
+ * `worktree add [--no-track] <path> -b <branch> <base>` (or `-b <branch>` before the path), with
+ * `origin/main` or `origin/master` as the base. Anything else is not recognised.
+ */
+function worktreeAddForm(
+  args: string[],
+): { path: string; branch: string; base: string } | undefined {
+  if (args[0] !== "worktree" || args[1] !== "add") return undefined;
+  const rest = args.slice(2);
+  if (rest[0] === "--no-track") rest.shift();
+  if (rest.length !== 4 || !/^origin\/(?:main|master)$/.test(rest[3] ?? "")) return undefined;
+  const [a = "", b = "", c = "", base = ""] = rest;
+  if (a === "-b" && !b.startsWith("-") && !c.startsWith("-")) return { path: c, branch: b, base };
+  if (b === "-b" && !a.startsWith("-") && !c.startsWith("-")) return { path: a, branch: c, base };
+  return undefined;
+}
+
 export function evaluateArgv(request: Request, argv: string[]): Decision {
   const [program, ...args] = argv;
   let gitCwd = request.cwd;
@@ -445,30 +462,28 @@ export function evaluateArgv(request: Request, argv: string[]): Decision {
         return result(request, "unknown", "Cannot verify Git fetch target");
       }
     }
-    if (
-      args.length === 7 &&
-      args[0] === "worktree" &&
-      args[1] === "add" &&
-      args[2] === "--no-track" &&
-      args[4] === "-b" &&
-      args[6] === "origin/main"
-    ) {
+    const add = worktreeAddForm(args);
+    if (add) {
       try {
-        const root = canonical(git(gitCwd, ["rev-parse", "--show-toplevel"]));
-        const target = canonical(resolve(gitCwd, args[3] ?? ""));
-        const branch = args[5] ?? "";
-        git(gitCwd, ["check-ref-format", "--branch", branch]);
-        git(gitCwd, ["rev-parse", "--verify", "origin/main^{commit}"]);
+        // The main checkout's root, also when the command runs in a linked worktree.
+        const common = canonical(resolve(gitCwd, git(gitCwd, ["rev-parse", "--git-common-dir"])));
+        const root =
+          basename(common) === ".git"
+            ? dirname(common)
+            : canonical(git(gitCwd, ["rev-parse", "--show-toplevel"]));
+        const target = canonical(resolve(gitCwd, add.path));
+        git(gitCwd, ["check-ref-format", "--branch", add.branch]);
+        git(gitCwd, ["rev-parse", "--verify", `${add.base}^{commit}`]);
+        const parents = [resolve(root, ".worktrees"), resolve(root, ".claude", "worktrees")];
         if (
-          !/^(?:main|master)$/.test(branch) &&
+          !/^(?:main|master)$/.test(add.branch) &&
           !existsSync(target) &&
-          inside(resolve(root, ".worktrees"), target) &&
-          target !== resolve(root, ".worktrees")
+          parents.some((parent) => inside(parent, target) && target !== parent)
         )
           return result(
             request,
             "worktree-write",
-            "Create a new linked feature worktree under the repository's .worktrees directory",
+            "Create a new linked feature worktree under the repository's .worktrees or .claude/worktrees directory",
             true,
           );
       } catch {

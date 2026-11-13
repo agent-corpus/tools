@@ -97,8 +97,13 @@ export function hookResponse(
     return decision.decision === "approve"
       ? { hookSpecificOutput: { hookEventName: phase, decision: { behavior: "allow" } } }
       : {};
+  // Codex rejects PreToolUse `permissionDecision: "allow"` without `updatedInput` ("unsupported
+  // permissionDecision:allow") and marks the hook failed. An approval there is no decision at all;
+  // if Codex would then prompt, its PermissionRequest hook (above) returns the allow.
   if (decision.decision === "approve")
-    return { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
+    return harness === "codex"
+      ? {}
+      : { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
   // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
   // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
   // so a decision that needs a human is a deny. Approving it in chat does not change the decision,
@@ -125,6 +130,17 @@ export function hookResponse(
       permissionDecisionReason: decision.reason,
     },
   };
+}
+
+/** The exact stdout of a PreToolUse or PermissionRequest hook. Codex gets no output for no decision. */
+export function hookOutput(
+  harness: Request["harness"],
+  phase: string,
+  decision: Decision,
+  context?: HookContext,
+): string {
+  const response = hookResponse(harness, phase, decision, context);
+  return harness === "codex" && Object.keys(response).length === 0 ? "" : JSON.stringify(response);
 }
 
 export function executionReport(

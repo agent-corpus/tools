@@ -15,14 +15,15 @@ test.each(["claude", "codex", "copilot"] as const)(
   (harness) => {
     const sessionId = `integration-${randomUUID()}`;
     const directory = sessionDirectory(harness, sessionId);
+    const raw = (event: string, input: Record<string, unknown>) =>
+      execFileSync(process.execPath, [cli, "hook", harness, event], {
+        encoding: "utf8",
+        input: JSON.stringify(input),
+        timeout: 15000,
+      });
+    // Codex gets no output at all for "no decision".
     const run = (event: string, input: Record<string, unknown>) =>
-      JSON.parse(
-        execFileSync(process.execPath, [cli, "hook", harness, event], {
-          encoding: "utf8",
-          input: JSON.stringify(input),
-          timeout: 15000,
-        }),
-      );
+      JSON.parse(raw(event, input) || "{}");
     let stopped = false;
     const payload = {
       session_id: sessionId,
@@ -42,6 +43,16 @@ test.each(["claude", "codex", "copilot"] as const)(
         toolInput: { command: "az resource delete --ids private-id" },
       };
       expect(run("PermissionRequest", human)).toEqual({});
+      // The exact text each harness reads for an approved PreToolUse and a human PermissionRequest.
+      expect(raw("PreToolUse", payload)).toBe(
+        {
+          claude:
+            '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}\n',
+          codex: "",
+          copilot: '{"permissionDecision":"allow"}\n',
+        }[harness],
+      );
+      expect(raw("PermissionRequest", human)).toBe(harness === "codex" ? "" : "{}\n");
       const entries = readFileSync(join(directory, "audit.jsonl"), "utf8");
       expect(entries).toContain('"decision":"human"');
       expect(entries).not.toContain("private-id");
