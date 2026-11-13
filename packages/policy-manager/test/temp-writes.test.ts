@@ -77,7 +77,8 @@ describe("writes to the system temp directory", () => {
   test.skipIf(windows)("/tmp and /private/tmp are temp roots", () => {
     expect(bash("echo hi > /tmp/policy-temp-writes-test.txt").decision).toBe("approve");
     expect(write("/tmp/policy-temp-writes-test/x.md").category).toBe("temp-write");
-    expect(write("/private/tmp/policy-temp-writes-test/x.md").decision).toBe("approve");
+    if (process.platform === "darwin")
+      expect(write("/private/tmp/policy-temp-writes-test/x.md").decision).toBe("approve");
   });
 
   test("repository rules still win inside a temp directory", () => {
@@ -206,7 +207,8 @@ describe("deletion in scratch and temp directories", () => {
   });
 
   test.skipIf(windows)("the Claude scratchpad shape is approved", () => {
-    const pad = mkdtempSync("/private/tmp/policy-test-claude-");
+    const base = process.platform === "darwin" ? "/private/tmp" : "/tmp";
+    const pad = mkdtempSync(`${base}/policy-test-claude-`);
     try {
       mkdirSync(join(pad, "proj", "session", "scratchpad"), { recursive: true });
       approved(`rm -rf ${pad}/proj/session/scratchpad/*`);
