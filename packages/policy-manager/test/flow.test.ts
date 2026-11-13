@@ -885,22 +885,31 @@ describe("functions, positional parameters, parameter operations and read loops"
     "f() { set -- rm; }; set -- ls; f; $1 -la",
     "while read -r r n; do gh pr view $n -R $r --json state; done <<'EOF'\no/r 1\no/s 2\nEOF",
     "ls -la $(dirname src/a.txt)",
-    'ls "$(pwd)/src"',
     "ls $(basename /x/src)",
     "X=~/notes; echo $X",
     "if V=$(date) && M=src; then :; else M=src; fi; ls $M",
   ])("approves %j", (command) => expect(decide(command).decision).toBe("approve"));
 
-  test("a cd to an existing directory lets an && chain go on, and the old directory stays", () => {
-    const wt = posix(worktree);
-    expect(decide(`cd ${wt} && S=src; ls $S`).decision).toBe("approve");
-    expect(decide(`L=${wt}/a.txt; wc -l $L; ls -la $(dirname $L)`).decision).toBe("approve");
-    expect(decide(`cd ${wt} && rm -rf src`).decision).toBe("human");
-    // The cd is still allowed to have failed when judging where later commands run.
-    expect(decide(`cd ${posix(scratch)} && echo x > n.txt`, join(root, "repo")).decision).toBe(
-      "human",
-    );
+  // A Windows path (drive letter, backslashes) is never a simple absolute value, so there the
+  // `cd` may fail and `$(pwd)` stays unknown.
+  test.skipIf(process.platform === "win32")("$(pwd) is the single current directory", () => {
+    expect(decide('ls "$(pwd)/src"').decision).toBe("approve");
+    expect(decide('cd .. && ls "$(pwd)/src"').decision).toBe("human");
   });
+
+  test.skipIf(process.platform === "win32")(
+    "a cd to an existing directory lets an && chain go on, and the old directory stays",
+    () => {
+      const wt = posix(worktree);
+      expect(decide(`cd ${wt} && S=src; ls $S`).decision).toBe("approve");
+      expect(decide(`L=${wt}/a.txt; wc -l $L; ls -la $(dirname $L)`).decision).toBe("approve");
+      expect(decide(`cd ${wt} && rm -rf src`).decision).toBe("human");
+      // The cd is still allowed to have failed when judging where later commands run.
+      expect(decide(`cd ${posix(scratch)} && echo x > n.txt`, join(root, "repo")).decision).toBe(
+        "human",
+      );
+    },
+  );
 
   test("each loop item or input line is judged with the values that belong together", () => {
     const items = Array.from({ length: 10 }, (_, i) => `"o/r${i} ${i}"`).join(" ");
