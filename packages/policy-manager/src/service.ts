@@ -3,7 +3,7 @@ import { chmodSync, existsSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { join } from "node:path";
 import { audit, sessionDirectory, sessionDirectoryPath, sessionToken } from "./audit.js";
-import { hash } from "./policy.js";
+import { hash, requestHash } from "./policy.js";
 import { loadProfile, type Profile, strictProfile } from "./profile.js";
 import { PolicySession } from "./session.js";
 import type { Classification, OutcomeReport, Request } from "./types.js";
@@ -52,7 +52,7 @@ export async function serve(harness: string, sessionId: string): Promise<void> {
           event: "request-envelope",
           payloadHash: hash(data.slice(0, end)),
           ...(message.request
-            ? { requestHash: hash(message.request) }
+            ? { requestHash: requestHash(message.request) }
             : message.classification
               ? { requestHash: message.classification.requestHash }
               : message.report

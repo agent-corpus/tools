@@ -8,6 +8,8 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
   const hooks: Record<string, unknown> = {};
   const matcher =
     "Bash|Read|Edit|Write|apply_patch|bash|powershell|view|read_file|write_file|edit|create|exec_command|shell";
+  // Copilot documents no MCP tool name format for hooks, so only Claude and Codex see MCP calls.
+  const preMatcher = harness === "copilot" ? matcher : `${matcher}|mcp__.*`;
   const phases = [
     "SessionStart",
     "PreToolUse",
@@ -33,7 +35,11 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
     } else
       hooks[phase] = [
         {
-          ...(phase === "PreToolUse" || phase.startsWith("PostToolUse") ? { matcher } : {}),
+          ...(phase === "PreToolUse"
+            ? { matcher: preMatcher }
+            : phase.startsWith("PostToolUse")
+              ? { matcher }
+              : {}),
           hooks: [
             {
               type: "command",

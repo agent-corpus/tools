@@ -1,12 +1,16 @@
-export type Category =
-  | "code-read"
-  | "worktree-write"
-  | "cloud-read"
-  | "git-read"
-  | "impactful-write"
-  | "destructive"
-  | "sensitive"
-  | "unknown";
+export const CATEGORIES = [
+  "code-read",
+  "worktree-write",
+  /** A recoverable write outside any repository, such as the system temp directory. */
+  "temp-write",
+  "cloud-read",
+  "git-read",
+  "impactful-write",
+  "destructive",
+  "sensitive",
+  "unknown",
+] as const;
+export type Category = (typeof CATEGORIES)[number];
 export interface Request {
   sessionId: string;
   harness: "claude" | "codex" | "copilot";
@@ -26,8 +30,11 @@ export interface Classification {
 /** Where an ambiguous request stands in the AI classification flow. */
 export type ClassificationStage = "requested" | "approved" | "denied" | "fallback";
 export interface Decision {
-  /** `deny` is a decision the model sees and works around; `human` asks the person. */
-  decision: "approve" | "human" | "deny";
+  /**
+   * `deny` is a decision the model sees and works around; `human` asks the person; `native` makes
+   * no decision and leaves the request to the harness's own permission flow.
+   */
+  decision: "approve" | "human" | "deny" | "native";
   category: Category;
   reason: string;
   requestHash: string;

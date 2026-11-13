@@ -1,14 +1,35 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
-import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
-import { type Profile, strictProfile } from "./profile.js";
+import {
+  commandDecision,
+  permissiveRead,
+  permissiveWrite,
+  WORKTREE_DELETION,
+} from "./permissive.js";
+import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
-import type { Category, Classification, Decision, Request } from "./types.js";
+import {
+  CATEGORIES,
+  type Category,
+  type Classification,
+  type Decision,
+  type Request,
+} from "./types.js";
 
 export function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+/** Shell tools whose `description` only labels the command. Elsewhere it can be content. */
+const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell"]);
+/** The correlation hash of a request, over its effect-relevant input only. */
+export function requestHash(request: Request): string {
+  if (!SHELL_TOOLS.has(request.tool)) return hash(request);
+  const input = Object.fromEntries(
+    Object.entries(request.input ?? {}).filter(([key]) => key !== "description"),
+  );
+  return hash({ ...request, input });
 }
 // Deliberately accepts one simple command. Shell syntax and expansions need human review.
 export function words(command: string): string[] | undefined {
@@ -168,7 +189,7 @@ export function result(
     decision: approve ? "approve" : "human",
     category,
     reason,
-    requestHash: hash(request),
+    requestHash: requestHash(request),
     cache: approve && category === "cloud-read" ? "session" : "none",
     cached: false,
   };
@@ -176,10 +197,11 @@ export function result(
 /** Self-reported confidence needed for the AI to approve an ambiguous request. */
 export const AMBIGUOUS_CONFIDENCE = 0.95;
 /**
- * Escalations that stay with a human in every profile. Categories `sensitive` (credentials,
- * secrets, protected paths and configuration) and `destructive` (unrecoverable loss) are excluded
- * by category; these are the remaining boundaries: the request itself cannot be trusted, an
- * organization or the profile asked for a human, or a repository rule forbids the write.
+ * Escalations that stay with a human in every profile. Category `sensitive` (credentials,
+ * secrets, protected paths and configuration) is excluded by category; these are the remaining
+ * boundaries: the request itself cannot be trusted, an organization or the profile asked for a
+ * human, or a repository rule forbids the write. Of `destructive`, only deletion inside a linked
+ * feature worktree is classified: recoverable is approved, anything else goes to a person.
  */
 const HUMAN_BOUNDARIES: RegExp[] = [
   /^Incomplete request/,
@@ -204,17 +226,23 @@ function markAmbiguous(decision: Decision, profile: Profile): Decision {
     decision.decision !== "human" ||
     decision.needsClassification ||
     decision.category === "sensitive" ||
-    decision.category === "destructive" ||
+    // Git history, remote, cloud, publish and HTTP deletions are not provably recoverable, and the
+    // classifier is not independent; only local deletion inside a feature worktree is classified.
+    (decision.category === "destructive" && decision.reason !== WORKTREE_DELETION) ||
     HUMAN_BOUNDARIES.some((pattern) => pattern.test(decision.reason))
   )
     return decision;
   return { ...decision, needsClassification: true, tier: "ambiguous" };
 }
 function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
+  // A `destructive` verdict approves only what the engine proved is a deletion inside a feature
+  // worktree; on anything else (an unparsable `rm -rf ~/{a,b}`) the label alone means a person.
+  const destructiveOk = ai.category !== "destructive" || decision.reason === WORKTREE_DELETION;
   const safe =
     ai.recoverable === true &&
     ai.confidence >= AMBIGUOUS_CONFIDENCE &&
-    !["sensitive", "destructive", "unknown"].includes(ai.category);
+    destructiveOk &&
+    !["sensitive", "unknown"].includes(ai.category);
   const base = { ...decision, needsClassification: false, cache: "session" as const, ai };
   if (safe)
     return {
@@ -225,6 +253,15 @@ function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
       reason: "Ambiguous request judged recoverable and non-sensitive by the same-session AI",
     };
   const why = ai.rationale ? ` Rationale: ${redactText(ai.rationale, 200)}` : "";
+  // Possible unrecoverable loss is a person's decision, not a deny the model works around.
+  if (decision.category === "destructive" || ai.category === "destructive")
+    return {
+      ...base,
+      decision: "human",
+      cache: "none",
+      classification: "denied",
+      reason: `Destructive request not judged recoverable by the classifier (confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"}); a person decides.${why}`,
+    };
   return {
     ...base,
     decision: "deny",
@@ -241,16 +278,7 @@ export function evaluate(
   if (ai) {
     // Self-reported confidence is not a probability or a substitute for verified effects.
     if (
-      ![
-        "code-read",
-        "worktree-write",
-        "cloud-read",
-        "git-read",
-        "impactful-write",
-        "destructive",
-        "sensitive",
-        "unknown",
-      ].includes(ai.category) ||
+      !(CATEGORIES as readonly string[]).includes(ai.category) ||
       ai.requestHash !== decision.requestHash ||
       !Number.isFinite(ai.confidence) ||
       ai.confidence < 0 ||
@@ -305,6 +333,14 @@ function evaluateCore(request: Request, profile: Profile): Decision {
   const input = request.input;
   if (!input || typeof input !== "object" || Array.isArray(input))
     return result(request, "unknown", "Invalid tool input");
+  // MCP arguments are tool-specific, so their `cwd` or `path` mean nothing here.
+  if (request.tool.startsWith("mcp__"))
+    return mcpReadOnly(profile, request.tool)
+      ? result(request, "cloud-read", "MCP tool listed as read-only in the profile", true)
+      : {
+          ...result(request, "unknown", "MCP tool not listed as read-only; left to the harness"),
+          decision: "native",
+        };
   const cwd = input.workdir ?? input.cwd ?? request.cwd;
   if (typeof cwd !== "string" || cwd !== request.cwd)
     return result(request, "unknown", "Execution directory differs from the reviewed directory");
@@ -372,6 +408,23 @@ function evaluateCore(request: Request, profile: Profile): Decision {
   return evaluateArgv(request, argv);
 }
 
+/**
+ * `worktree add [--no-track] <path> -b <branch> <base>` (or `-b <branch>` before the path), with
+ * `origin/main` or `origin/master` as the base. Anything else is not recognised.
+ */
+function worktreeAddForm(
+  args: string[],
+): { path: string; branch: string; base: string } | undefined {
+  if (args[0] !== "worktree" || args[1] !== "add") return undefined;
+  const rest = args.slice(2);
+  if (rest[0] === "--no-track") rest.shift();
+  if (rest.length !== 4 || !/^origin\/(?:main|master)$/.test(rest[3] ?? "")) return undefined;
+  const [a = "", b = "", c = "", base = ""] = rest;
+  if (a === "-b" && !b.startsWith("-") && !c.startsWith("-")) return { path: c, branch: b, base };
+  if (b === "-b" && !a.startsWith("-") && !c.startsWith("-")) return { path: a, branch: c, base };
+  return undefined;
+}
+
 export function evaluateArgv(request: Request, argv: string[]): Decision {
   const [program, ...args] = argv;
   let gitCwd = request.cwd;
@@ -420,30 +473,28 @@ export function evaluateArgv(request: Request, argv: string[]): Decision {
         return result(request, "unknown", "Cannot verify Git fetch target");
       }
     }
-    if (
-      args.length === 7 &&
-      args[0] === "worktree" &&
-      args[1] === "add" &&
-      args[2] === "--no-track" &&
-      args[4] === "-b" &&
-      args[6] === "origin/main"
-    ) {
+    const add = worktreeAddForm(args);
+    if (add) {
       try {
-        const root = canonical(git(gitCwd, ["rev-parse", "--show-toplevel"]));
-        const target = canonical(resolve(gitCwd, args[3] ?? ""));
-        const branch = args[5] ?? "";
-        git(gitCwd, ["check-ref-format", "--branch", branch]);
-        git(gitCwd, ["rev-parse", "--verify", "origin/main^{commit}"]);
+        // The main checkout's root, also when the command runs in a linked worktree.
+        const common = canonical(resolve(gitCwd, git(gitCwd, ["rev-parse", "--git-common-dir"])));
+        const root =
+          basename(common) === ".git"
+            ? dirname(common)
+            : canonical(git(gitCwd, ["rev-parse", "--show-toplevel"]));
+        const target = canonical(resolve(gitCwd, add.path));
+        git(gitCwd, ["check-ref-format", "--branch", add.branch]);
+        git(gitCwd, ["rev-parse", "--verify", `${add.base}^{commit}`]);
+        const parents = [resolve(root, ".worktrees"), resolve(root, ".claude", "worktrees")];
         if (
-          !/^(?:main|master)$/.test(branch) &&
+          !/^(?:main|master)$/.test(add.branch) &&
           !existsSync(target) &&
-          inside(resolve(root, ".worktrees"), target) &&
-          target !== resolve(root, ".worktrees")
+          parents.some((parent) => inside(parent, target) && target !== parent)
         )
           return result(
             request,
             "worktree-write",
-            "Create a new linked feature worktree under the repository's .worktrees directory",
+            "Create a new linked feature worktree under the repository's .worktrees or .claude/worktrees directory",
             true,
           );
       } catch {
