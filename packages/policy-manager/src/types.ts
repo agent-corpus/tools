@@ -30,8 +30,11 @@ export interface Classification {
 /** Where an ambiguous request stands in the AI classification flow. */
 export type ClassificationStage = "requested" | "approved" | "denied" | "fallback";
 export interface Decision {
-  /** `deny` is a decision the model sees and works around; `human` asks the person. */
-  decision: "approve" | "human" | "deny";
+  /**
+   * `deny` is a decision the model sees and works around; `human` asks the person; `native` makes
+   * no decision and leaves the request to the harness's own permission flow.
+   */
+  decision: "approve" | "human" | "deny" | "native";
   category: Category;
   reason: string;
   requestHash: string;

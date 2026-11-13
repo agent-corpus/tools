@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { classifyCommand, hookResponse } from "../src/adapters.js";
-import { audit } from "../src/audit.js";
+import { audit, requestSummary } from "../src/audit.js";
 import { evaluate, hash, requestHash } from "../src/policy.js";
 import { APPROVAL_PRINCIPLE } from "../src/principle.js";
 import { parseProfile } from "../src/profile.js";
@@ -497,6 +497,9 @@ describe("request hash and classifier rule", () => {
       input: { title: "t", description },
     });
     expect(requestHash(mcp("a"))).not.toBe(requestHash(mcp("b")));
+    // The audit record correlates by the same hash as the decision, for shell and MCP requests.
+    for (const r of [a, mcp("a")])
+      expect(requestSummary(r).requestHash).toBe(evaluate(r, undefined, permissive).requestHash);
   });
 
   test("a classification survives a retry with a different description", () => {
