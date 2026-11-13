@@ -238,6 +238,54 @@ describe("deletion in scratch and temp directories", () => {
       refused(command);
   });
 
+  test("a leading ~ is the home directory, not a directory named ~", () => {
+    for (const command of [
+      "rm -rf ~",
+      "rm -rf ~/policy-test-x",
+      "rmdir ~/policy-test-x",
+      "find ~/policy-test-x -delete",
+      "rm -rf ~root/x",
+      "rm -rf ~+/x",
+      "echo x > ~/policy-test-x",
+      "mkdir -p ~/policy-test-x",
+      "touch ~/policy-test-x",
+      "echo x | tee ~/policy-test-x",
+      "cp a.txt ~/policy-test-x",
+    ]) {
+      refused(command, outside);
+      if (!command.includes("~root") && !command.includes("~+")) refused(command, "/");
+    }
+    expect(write("~/policy-test-x").decision).toBe("human");
+  });
+
+  test("find leading options do not hide the start path", () => {
+    const away = posix(main);
+    for (const command of [
+      `find -P ${away} -delete`,
+      `find -E ${away} -delete`,
+      `find -x ${away} -delete`,
+      `find -O3 ${away} -delete`,
+      `find -D tree ${away} -delete`,
+      `find -- ${away} -delete`,
+      `find -H ${posix(outside)} -delete`,
+      `find -f ${posix(outside)} -delete`,
+      `find -Z ${posix(outside)} -delete`,
+      `find ${posix(outside)} -files0-from x -delete`,
+    ])
+      refused(command, outside);
+    mkdirSync(join(outside, "find-opts"), { recursive: true });
+    approved(`find -P ${posix(outside)}/find-opts -delete`);
+    approved(`find -- ${posix(outside)}/find-opts -name '*.tmp' -delete`);
+  });
+
+  test("rmdir -p is refused: it removes ancestors up to and past the root", () => {
+    mkdirSync(join(outside, "p", "q"), { recursive: true });
+    refused(`rmdir -p ${posix(outside)}/p/q`);
+    refused(`rmdir --parents ${posix(outside)}/p/q`);
+    refused(`rmdir -vp ${posix(outside)}/p/q`);
+    approved(`rmdir ${posix(outside)}/p/q`);
+  });
+
   test("the temp root itself is refused on every platform", () => {
     for (const temp of tempRoots()) refused(`rm -rf ${posix(temp)}`);
     refused(`rm -rf ${posix(outside)}/../../..`);

@@ -9,7 +9,17 @@ import {
   statSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+/**
+ * A shell word as an absolute path, with a leading `~` expanded as the shell does. `~user`, `~+`
+ * and `~-` cannot be resolved here and throw.
+ */
+export function resolveWord(cwd: string, word: string): string {
+  if (/^~(?:[\\/]|$)/.test(word)) return join(homedir(), word.slice(1));
+  if (word.startsWith("~")) throw new Error("Unresolvable tilde");
+  return resolve(cwd, word);
+}
 
 export function git(cwd: string, args: string[]): string {
   return execFileSync("git", ["-c", "core.fsmonitor=false", "-C", cwd, ...args], {
@@ -181,7 +191,7 @@ export function disposable(cwd: string, input: string, roots: string[]): boolean
       if (!last || last.startsWith(".") || parts.some((part) => /[*?[]/.test(part))) return false;
       target = parts.join("/") || (parts.length ? "/" : ".");
     }
-    const lexical = resolve(cwd, target);
+    const lexical = resolveWord(cwd, target);
     const path = canonical(lexical);
     if (
       policyState(lexical) ||
@@ -215,7 +225,7 @@ export function pathEvidence(
   write: boolean,
 ): { allowed: boolean; category: "code-read" | "worktree-write" | "sensitive"; reason: string } {
   try {
-    const lexical = resolve(cwd, input);
+    const lexical = resolveWord(cwd, input);
     const path = canonical(lexical);
     if (
       sensitive(path) ||

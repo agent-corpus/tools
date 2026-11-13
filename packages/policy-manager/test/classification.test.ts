@@ -490,6 +490,13 @@ describe("request hash and classifier rule", () => {
     expect(requestHash(request("gh issue comment 2 --body hi"))).not.toBe(requestHash(base));
     const sandbox = { ...base, input: { ...base.input, dangerouslyDisableSandbox: true } };
     expect(requestHash(sandbox)).not.toBe(requestHash(base));
+    // Outside shell tools a description can be content, such as an MCP work item body.
+    const mcp = (description: string): Request => ({
+      ...base,
+      tool: "mcp__ado__create_work_item",
+      input: { title: "t", description },
+    });
+    expect(requestHash(mcp("a"))).not.toBe(requestHash(mcp("b")));
   });
 
   test("a classification survives a retry with a different description", () => {

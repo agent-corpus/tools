@@ -9,6 +9,7 @@ import {
   pathEvidence,
   policyState,
   protectedPath,
+  resolveWord,
   sensitive,
   tempRoots,
   tempWrite,
@@ -184,20 +185,111 @@ const SHORT_VALUES: Record<string, string> = {
   fgrep: "ABCDdfm",
   rg: "ABCEfgjMmrTt",
 };
-const RG_LONG_VALUES = new Set([
+const GREP_LONG_VALUES = [
   "--after-context",
   "--before-context",
+  "--binary-files",
   "--context",
-  "--encoding",
-  "--glob",
-  "--iglob",
+  "--devices",
+  "--directories",
+  "--exclude",
+  "--exclude-dir",
+  "--exclude-from",
+  "--file",
+  "--include",
+  "--label",
   "--max-count",
-  "--max-depth",
-  "--replace",
-  "--threads",
-  "--type",
-  "--type-not",
-]);
+];
+const GREP_LONG_FLAGS = [
+  "--count",
+  "--extended-regexp",
+  "--files-with-matches",
+  "--files-without-match",
+  "--fixed-strings",
+  "--ignore-case",
+  "--invert-match",
+  "--line-number",
+  "--line-regexp",
+  "--no-filename",
+  "--no-messages",
+  "--null",
+  "--only-matching",
+  "--perl-regexp",
+  "--quiet",
+  "--recursive",
+  "--dereference-recursive",
+  "--silent",
+  "--with-filename",
+  "--word-regexp",
+];
+/** Long options that take a separate value; the value is never the pattern or script. */
+const LONG_VALUES: Record<string, Set<string>> = {
+  sed: new Set(["--file", "--line-length"]),
+  grep: new Set(GREP_LONG_VALUES),
+  egrep: new Set(GREP_LONG_VALUES),
+  fgrep: new Set(GREP_LONG_VALUES),
+  rg: new Set([
+    "--after-context",
+    "--before-context",
+    "--context",
+    "--encoding",
+    "--file",
+    "--glob",
+    "--iglob",
+    "--ignore-file",
+    "--max-count",
+    "--max-depth",
+    "--max-filesize",
+    "--pre",
+    "--pre-glob",
+    "--replace",
+    "--sort",
+    "--sortr",
+    "--threads",
+    "--type",
+    "--type-add",
+    "--type-not",
+  ]),
+};
+/** Long options known to take no value. */
+const LONG_FLAGS: Record<string, Set<string>> = {
+  sed: new Set([
+    "--debug",
+    "--null-data",
+    "--posix",
+    "--quiet",
+    "--regexp-extended",
+    "--sandbox",
+    "--separate",
+    "--silent",
+    "--unbuffered",
+    "--in-place",
+  ]),
+  grep: new Set(GREP_LONG_FLAGS),
+  egrep: new Set(GREP_LONG_FLAGS),
+  fgrep: new Set(GREP_LONG_FLAGS),
+  rg: new Set([
+    "--count",
+    "--files-with-matches",
+    "--fixed-strings",
+    "--follow",
+    "--hidden",
+    "--ignore-case",
+    "--invert-match",
+    "--json",
+    "--line-number",
+    "--multiline",
+    "--no-filename",
+    "--no-heading",
+    "--no-ignore",
+    "--only-matching",
+    "--pcre2",
+    "--smart-case",
+    "--vimgrep",
+    "--with-filename",
+    "--word-regexp",
+  ]),
+};
 
 /**
  * File names a sed script reads, writes or runs (`r`, `R`, `w`, `W`, the `s///w` flag, GNU `e`).
@@ -249,8 +341,18 @@ function textOperands(
       } else if (/^--(?:expression|regexp)=/.test(word)) {
         explicit = true;
         named(index, word.slice(word.indexOf("=") + 1));
-      } else if (program === "rg" && RG_LONG_VALUES.has(word)) index++;
-      else if (/^-[A-Za-z]/.test(word))
+      } else if (word.startsWith("--")) {
+        if (word.includes("=")) continue;
+        // A value-taking long option consumes the next word, which stays a checked operand. An
+        // option this list does not know might too, so nothing is treated as text.
+        if (LONG_VALUES[program]?.has(word)) index++;
+        else if (!LONG_FLAGS[program]?.has(word))
+          return {
+            text: new Set(),
+            paths: [],
+            files: args.filter((arg) => arg !== "" && !arg.startsWith("-")),
+          };
+      } else if (/^-[A-Za-z]/.test(word))
         for (let at = 1; at < word.length; at++) {
           const flag = word[at] ?? "";
           if (program === "sed" && flag === "i") break; // the rest is a backup suffix
@@ -301,14 +403,36 @@ function scratchDeletion(program: string, args: string[], cwd: string, profile: 
       ...options.filter((arg) => !arg.startsWith("-")),
       ...(end < 0 ? [] : args.slice(end + 1)),
     ];
+    // `rmdir -p` also removes empty ancestors, up to and past a root.
+    if (program === "rmdir" && options.some((arg) => arg === "--parents" || /^-[^-]*p/.test(arg)))
+      return false;
   } else if (program === "find") {
     if (
       !args.includes("-delete") ||
-      args.some((arg) => FIND_ACTIONS.has(arg) || ["-L", "-H", "-follow"].includes(arg))
+      args.some((arg) => FIND_ACTIONS.has(arg) || ["-follow", "-files0-from"].includes(arg))
     )
       return false;
-    const first = args.findIndex((arg) => /^[-(!)]/.test(arg));
-    targets = first < 0 ? args : args.slice(0, first);
+    // Leading options come before the start paths: GNU -P -D -O, BSD -E -s -x -X -d. -H, -L follow
+    // symlinks and BSD -f names a start path, so those stay with a person.
+    let index = 0;
+    for (; index < args.length; index++) {
+      const arg = args[index] ?? "";
+      if (arg === "--") {
+        index++;
+        break;
+      }
+      if (/^-[PEsxXd]$/.test(arg) || /^-O[0-9]*$/.test(arg)) continue;
+      if (arg === "-D") {
+        index++;
+        continue;
+      }
+      // Expression primaries are words (-name, -type); a single letter is an unknown option.
+      if (/^-[HLf]$/.test(arg) || /^-.$/.test(arg)) return false;
+      break;
+    }
+    targets = [];
+    for (; index < args.length && !/^[-(!)]/.test(args[index] ?? ""); index++)
+      targets.push(args[index] as string);
     if (targets.length === 0) targets = ["."];
   } else return false;
   return targets.length > 0 && targets.every((target) => disposable(cwd, target, roots));
@@ -316,7 +440,7 @@ function scratchDeletion(program: string, args: string[], cwd: string, profile: 
 
 export function permissiveRead(cwd: string, input: string) {
   try {
-    const lexical = resolve(cwd, input);
+    const lexical = resolveWord(cwd, input);
     const path = canonical(lexical);
     if (sensitive(path) || sensitive(lexical))
       return {
@@ -342,7 +466,7 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
   let lexical: string | undefined;
   let path: string | undefined;
   try {
-    lexical = resolve(cwd, input);
+    lexical = resolveWord(cwd, input);
     path = canonical(lexical);
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {

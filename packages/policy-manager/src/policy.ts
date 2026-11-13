@@ -16,12 +16,13 @@ import {
 export function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
-/** Input fields that only label a request and have no effect: Claude's Bash `description`. */
-const LABELS = new Set(["description"]);
+/** Shell tools whose `description` only labels the command. Elsewhere it can be content. */
+const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell"]);
 /** The correlation hash of a request, over its effect-relevant input only. */
 export function requestHash(request: Request): string {
+  if (!SHELL_TOOLS.has(request.tool)) return hash(request);
   const input = Object.fromEntries(
-    Object.entries(request.input ?? {}).filter(([key]) => !LABELS.has(key)),
+    Object.entries(request.input ?? {}).filter(([key]) => key !== "description"),
   );
   return hash({ ...request, input });
 }
