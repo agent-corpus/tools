@@ -1,11 +1,13 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { classifyCommand, hookResponse } from "../src/adapters.js";
-import { audit } from "../src/audit.js";
-import { evaluate, hash } from "../src/policy.js";
+import { audit, requestSummary } from "../src/audit.js";
+import { evaluate, hash, requestHash } from "../src/policy.js";
+import { APPROVAL_PRINCIPLE } from "../src/principle.js";
 import { parseProfile } from "../src/profile.js";
 import { redactText } from "../src/redact.js";
 import { replayTranscripts } from "../src/replay.js";
@@ -47,6 +49,8 @@ async function events(directory: string, name?: string) {
 
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "classification-test-"));
+  // A repository, so deletions under `work` are not disposable temp-directory deletions.
+  execFileSync("git", ["init", "-b", "main", root], { stdio: "ignore" });
   work = join(root, "work");
   mkdirSync(work);
 });
@@ -63,6 +67,8 @@ describe("hint and retry flow", () => {
       hookResponse("claude", "PreToolUse", d, { cliPath: "/opt/cli.js", sessionId: "s1" }),
     );
     expect(out).toContain('"permissionDecision":"deny"');
+    expect(out).toContain('"permissionDecisionReason":"Needs classification (not an error)');
+    expect(out).toContain("|temp-write|");
     expect(out).toContain(hash(r));
     expect(out).toContain("/opt/cli.js");
     expect(out).toContain("classify claude s1");
@@ -468,5 +474,52 @@ describe("replay", () => {
     );
     const report = replayTranscripts([file], permissive);
     expect(report).toMatchObject({ commands: 4, approved: 1, classified: 2 });
+  });
+});
+
+describe("request hash and classifier rule", () => {
+  test("a label-only field does not change the hash; the command does", () => {
+    const base = request("gh issue comment 1 --body hi");
+    const a = { ...base, input: { ...base.input, description: "Comment on issue" } };
+    const b = { ...base, input: { ...base.input, description: "Post a note" } };
+    expect(requestHash(a)).toBe(requestHash(b));
+    expect(requestHash(a)).toBe(requestHash(base));
+    expect(evaluate(a, undefined, permissive).requestHash).toBe(
+      evaluate(b, undefined, permissive).requestHash,
+    );
+    expect(requestHash(request("gh issue comment 2 --body hi"))).not.toBe(requestHash(base));
+    const sandbox = { ...base, input: { ...base.input, dangerouslyDisableSandbox: true } };
+    expect(requestHash(sandbox)).not.toBe(requestHash(base));
+    // Outside shell tools a description can be content, such as an MCP work item body.
+    const mcp = (description: string): Request => ({
+      ...base,
+      tool: "mcp__ado__create_work_item",
+      input: { title: "t", description },
+    });
+    expect(requestHash(mcp("a"))).not.toBe(requestHash(mcp("b")));
+    // The audit record correlates by the same hash as the decision, for shell and MCP requests.
+    for (const r of [a, mcp("a")])
+      expect(requestSummary(r).requestHash).toBe(evaluate(r, undefined, permissive).requestHash);
+  });
+
+  test("a classification survives a retry with a different description", () => {
+    const { session: s } = session();
+    const r = ambiguous();
+    const first = { ...r, input: { ...r.input, description: "first" } };
+    expect(s.review(first, undefined, "PreToolUse").decision).toBe("deny");
+    expect(s.classify(verdict(r)).decision).toBe("approve");
+    const retry = { ...r, input: { ...r.input, description: "second" } };
+    expect(s.review(retry, undefined, "PreToolUse").decision).toBe("approve");
+  });
+
+  test("a recoverable impactful write is AI-approvable, and the hint says so", () => {
+    const { session: s } = session();
+    const r = ambiguous();
+    const d = s.review(r, undefined, "PreToolUse");
+    const out = JSON.stringify(hookResponse("claude", "PreToolUse", d));
+    expect(out).toContain(APPROVAL_PRINCIPLE);
+    expect(s.classify(verdict(r, { category: "impactful-write", confidence: 0.95 })).decision).toBe(
+      "approve",
+    );
   });
 });

@@ -26,6 +26,9 @@ function decide(command: string, cwd = worktree) {
 
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "flow-test-"));
+  // A main checkout around the fixtures, so `..` from the worktree is a guarded write and not a
+  // temp-directory write.
+  execFileSync("git", ["init", "-b", "main", root], { stdio: "ignore" });
   const origin = join(root, "origin.git");
   const repo = join(root, "repo");
   worktree = join(root, "wt");
@@ -731,7 +734,10 @@ describe("evaluation of scripts", () => {
     // Too many nodes to parse.
     expect(decide(Array.from({ length: 450 }, () => "ls").join("; ")).decision).toBe("human");
     // Three possible cd's give eight directories; every later command is judged in each of them.
-    const many = decide(`cd a; cd b; cd c; ${Array.from({ length: 60 }, () => "ls").join("; ")}`);
+    // `./`: a bare name that is not a directory is refused before the count.
+    const many = decide(
+      `cd ./a; cd ./b; cd ./c; ${Array.from({ length: 60 }, () => "ls").join("; ")}`,
+    );
     expect(many.decision).toBe("human");
     expect(many.reason).toContain("Too many commands");
   });
@@ -887,7 +893,8 @@ describe("functions, positional parameters, parameter operations and read loops"
     ["while read PATH; do ls; done <<'EOF'\n/tmp\nEOF", "unknown"],
     ["while read c; do echo $c; done <<'EOF'\nls\nEOF\nrm -rf y", "destructive"],
     // computed substitutions: only dirname, basename and pwd of known words
-    ["rm -rf $(dirname /tmp/x/y)", "destructive"],
+    // Not /tmp: a temp-directory target is a disposable deletion.
+    ["rm -rf $(dirname /srv/x/y)", "destructive"],
     ["$(basename /bin/rm) -rf y", "destructive"],
     ["cat $(dirname /home/u/.ssh/x)/id_rsa", "sensitive"],
     ["dirname() { echo rm; }; $(dirname x) -rf y", "unknown"],

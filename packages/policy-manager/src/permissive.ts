@@ -1,13 +1,21 @@
-import { basename, dirname, resolve } from "node:path";
+import { statSync } from "node:fs";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import {
   branchEvidence,
   canonical,
+  disposable,
+  type Fill,
   git,
   inside,
   isProtectedPath,
+  OUTSIDE_REPOSITORY,
   pathEvidence,
+  policyState,
   protectedPath,
+  resolveWord,
   sensitive,
+  tempRoots,
+  tempWrite,
 } from "./evidence.js";
 import { commandDecision } from "./flow.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
@@ -171,9 +179,396 @@ export function human(request: Request, category: Decision["category"], reason: 
   return result(request, category, reason);
 }
 
+const GH_TEXT = new Set(["--body", "-b", "--title", "-t", "--jq", "-q", "--template", "--notes"]);
+/** Short options that take a value, per program; the value is never the pattern or script. */
+const SHORT_VALUES: Record<string, string> = {
+  sed: "f",
+  grep: "ABDdfm",
+  egrep: "ABDdfm",
+  fgrep: "ABDdfm",
+  rg: "ABCEfgjMmrTt",
+};
+/**
+ * Options that take a separate value in GNU but none in BSD (`sed -l`, BSD `grep -C[num]` and
+ * `--context[=num]`). Which word is the value is unknowable, so every operand is checked.
+ */
+const DUAL_SHORT: Record<string, string> = { sed: "l", grep: "C", egrep: "C", fgrep: "C" };
+const DUAL_LONG = new Set(["grep", "egrep", "fgrep"]); // `--context`
+const GREP_LONG_VALUES = [
+  "--after-context",
+  "--before-context",
+  "--binary-files",
+  "--context",
+  "--devices",
+  "--directories",
+  "--exclude",
+  "--exclude-dir",
+  "--exclude-from",
+  "--file",
+  "--include",
+  "--label",
+  "--max-count",
+];
+const GREP_LONG_FLAGS = [
+  "--count",
+  "--extended-regexp",
+  "--files-with-matches",
+  "--files-without-match",
+  "--fixed-strings",
+  "--ignore-case",
+  "--invert-match",
+  "--line-number",
+  "--line-regexp",
+  "--no-filename",
+  "--no-messages",
+  "--null",
+  "--only-matching",
+  "--perl-regexp",
+  "--quiet",
+  "--recursive",
+  "--dereference-recursive",
+  "--silent",
+  "--with-filename",
+  "--word-regexp",
+];
+/** Long options that take a separate value; the value is never the pattern or script. */
+const LONG_VALUES: Record<string, Set<string>> = {
+  sed: new Set(["--file", "--line-length"]),
+  grep: new Set(GREP_LONG_VALUES),
+  egrep: new Set(GREP_LONG_VALUES),
+  fgrep: new Set(GREP_LONG_VALUES),
+  rg: new Set([
+    "--after-context",
+    "--before-context",
+    "--context",
+    "--encoding",
+    "--file",
+    "--glob",
+    "--iglob",
+    "--ignore-file",
+    "--max-count",
+    "--max-depth",
+    "--max-filesize",
+    "--pre",
+    "--pre-glob",
+    "--replace",
+    "--sort",
+    "--sortr",
+    "--threads",
+    "--type",
+    "--type-add",
+    "--type-not",
+  ]),
+};
+/** Long options known to take no value. */
+const LONG_FLAGS: Record<string, Set<string>> = {
+  sed: new Set([
+    "--debug",
+    "--null-data",
+    "--posix",
+    "--quiet",
+    "--regexp-extended",
+    "--sandbox",
+    "--separate",
+    "--silent",
+    "--unbuffered",
+    "--in-place",
+  ]),
+  grep: new Set(GREP_LONG_FLAGS),
+  egrep: new Set(GREP_LONG_FLAGS),
+  fgrep: new Set(GREP_LONG_FLAGS),
+  rg: new Set([
+    "--count",
+    "--files-with-matches",
+    "--fixed-strings",
+    "--follow",
+    "--hidden",
+    "--ignore-case",
+    "--invert-match",
+    "--json",
+    "--line-number",
+    "--multiline",
+    "--no-filename",
+    "--no-heading",
+    "--no-ignore",
+    "--only-matching",
+    "--pcre2",
+    "--smart-case",
+    "--vimgrep",
+    "--with-filename",
+    "--word-regexp",
+  ]),
+};
+
+/**
+ * File names a sed script reads, writes or runs (`r`, `R`, `w`, `W`, the `s///w` flag, GNU `e`).
+ * Over-matching only sends more to a human.
+ */
+function sedScriptPaths(script: string): string[] {
+  const paths: string[] = [];
+  for (const match of script.matchAll(/(?:^|[^A-Za-z\\])[eErRwW]\s*([^\n]*)/g))
+    paths.push(...(match[1] ?? "").split(/[\s;]+/).filter(Boolean));
+  return paths;
+}
+
+/**
+ * Indices of `args` that are text rather than paths, paths named inside that text, and the file
+ * operands (for sed, the files `-i` rewrites).
+ */
+function textOperands(
+  program: string,
+  args: string[],
+): { text: Set<number>; paths: string[]; files: string[] } {
+  const text = new Set<number>();
+  const files: string[] = [];
+  if (program === "gh") {
+    for (const [index, word] of args.entries()) {
+      if (GH_TEXT.has(word)) text.add(index + 1);
+      else if (/^--(?:body|title|jq|template|notes)=/.test(word)) text.add(index);
+    }
+    return { text, paths: [], files };
+  }
+  const values = SHORT_VALUES[program];
+  if (values === undefined) return { text, paths: [], files };
+  // Fallback when an option cannot be understood: every operand is checked.
+  const everyWord = {
+    text: new Set<number>(),
+    paths: [],
+    files: args.filter((arg) => arg !== "" && !arg.startsWith("-")),
+  };
+  // grep, rg and GNU sed accept options after operands, so collect everything before deciding
+  // which operand, if any, is the pattern or script.
+  const scripts: Array<[number, string]> = [];
+  const operands: number[] = [];
+  let explicit = false;
+  let ended = false;
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index] ?? "";
+    if (!ended && word === "--") {
+      ended = true;
+      continue;
+    }
+    if (!ended && word.startsWith("--")) {
+      const eq = word.indexOf("=");
+      const name = longOption(program, eq < 0 ? word : word.slice(0, eq));
+      if (name === undefined) return everyWord;
+      if (name === "--context" && eq < 0 && DUAL_LONG.has(program)) return everyWord;
+      if (name === "--expression" || name === "--regexp") {
+        explicit = true;
+        if (eq >= 0) scripts.push([index, word.slice(eq + 1)]);
+        else {
+          index++;
+          scripts.push([index, args[index] ?? ""]);
+        }
+      } else {
+        // A pattern or script file means there is no pattern operand: every operand is a file.
+        if (name === "--file") explicit = true;
+        // A value-taking long option consumes the next word, which stays a checked operand.
+        if (eq < 0 && LONG_VALUES[program]?.has(name)) index++;
+      }
+      continue;
+    }
+    if (!ended && /^-[A-Za-z]/.test(word)) {
+      for (let at = 1; at < word.length; at++) {
+        const flag = word[at] ?? "";
+        if (program === "sed" && flag === "i") break; // the rest is a backup suffix
+        if (DUAL_SHORT[program]?.includes(flag)) return everyWord;
+        if (flag === "e") {
+          explicit = true;
+          if (at + 1 < word.length) scripts.push([index, word.slice(at + 1)]);
+          else {
+            index++;
+            scripts.push([index, args[index] ?? ""]);
+          }
+          break;
+        }
+        if (values.includes(flag)) {
+          if (flag === "f") explicit = true;
+          if (at + 1 === word.length) index++;
+          break;
+        }
+      }
+      continue;
+    }
+    if (!ended && word.startsWith("-")) continue;
+    // BSD `sed -i ''` leaves an empty suffix operand, which is skipped.
+    if (word !== "") operands.push(index);
+  }
+  // The first operand is the script or pattern only when no -e, -f, --regexp, --expression or
+  // --file named one, wherever that option appears.
+  const first = explicit ? undefined : operands.shift();
+  if (first !== undefined) scripts.push([first, args[first] ?? ""]);
+  for (const [index] of scripts) text.add(index);
+  files.push(...operands.map((index) => args[index] ?? ""));
+  const paths = program === "sed" ? scripts.flatMap(([, script]) => sedScriptPaths(script)) : [];
+  return { text, paths, files };
+}
+
+/** Pattern and script options per program, besides the value lists. */
+const PATTERN_OPTIONS: Record<string, string[]> = {
+  sed: ["--expression", "--file"],
+  grep: ["--regexp", "--file"],
+  egrep: ["--regexp", "--file"],
+  fgrep: ["--regexp", "--file"],
+  rg: ["--regexp", "--file"],
+};
+/**
+ * A long option name resolved as GNU getopt does: an exact match, or the one known option it
+ * abbreviates. Unknown or ambiguous names are undefined.
+ */
+function longOption(program: string, name: string): string | undefined {
+  const known = new Set([
+    ...(PATTERN_OPTIONS[program] ?? []),
+    ...(LONG_VALUES[program] ?? []),
+    ...(LONG_FLAGS[program] ?? []),
+  ]);
+  if (known.has(name)) return name;
+  // rg takes no abbreviations: `rg --files` is not `--files-with-matches`.
+  if (program === "rg") return undefined;
+  const matches = [...known].filter((option) => option.startsWith(name));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+const FIND_ACTIONS = new Set([
+  "-exec",
+  "-execdir",
+  "-ok",
+  "-okdir",
+  "-fprint",
+  "-fprint0",
+  "-fprintf",
+  "-fls",
+]);
+/** find primaries that take one argument. */
+const FIND_VALUE_PRIMARIES = new Set(
+  [
+    "amin",
+    "anewer",
+    "atime",
+    "cmin",
+    "cnewer",
+    "ctime",
+    "group",
+    "iname",
+    "inum",
+    "ipath",
+    "iregex",
+    "iwholename",
+    "links",
+    "maxdepth",
+    "mindepth",
+    "mmin",
+    "mtime",
+    "name",
+    "newer",
+    "path",
+    "perm",
+    "regex",
+    "size",
+    "type",
+    "user",
+    "wholename",
+  ].map((name) => `-${name}`),
+);
+/** find primaries and operators that take no argument. */
+const FIND_FLAG_PRIMARIES = new Set([
+  ...[
+    "a",
+    "and",
+    "delete",
+    "depth",
+    "empty",
+    "false",
+    "mount",
+    "nogroup",
+    "not",
+    "nouser",
+    "o",
+    "or",
+    "print",
+    "print0",
+    "prune",
+    "true",
+    "xdev",
+  ].map((name) => `-${name}`),
+  "!",
+  "(",
+  ")",
+]);
+/**
+ * Whether every word of a find expression is a known primary, operator or primary argument. bfs
+ * (behind Claude Code's `find`) also takes start paths, `-f` and `--` inside the expression, so an
+ * unknown word could be one.
+ */
+function knownFindExpression(words: string[]): boolean {
+  for (let index = 0; index < words.length; index++) {
+    const word = words[index] ?? "";
+    if (FIND_VALUE_PRIMARIES.has(word)) index++;
+    else if (!FIND_FLAG_PRIMARIES.has(word)) return false;
+  }
+  return true;
+}
+/**
+ * `rm`, `rmdir`, `unlink` or `find ... -delete` whose every target is disposable: strictly inside
+ * a scratch root or the system temp directory (see `disposable`).
+ */
+function scratchDeletion(
+  program: string,
+  args: string[],
+  cwd: string,
+  profile: Profile,
+  fill: Fill | undefined,
+): boolean {
+  const roots = [...profile.scratchRoots, ...tempRoots()];
+  let targets: string[];
+  if (program === "rm" || program === "rmdir" || program === "unlink") {
+    const end = args.indexOf("--");
+    const options = end < 0 ? args : args.slice(0, end);
+    targets = [
+      ...options.filter((arg) => !arg.startsWith("-")),
+      ...(end < 0 ? [] : args.slice(end + 1)),
+    ];
+    // `rmdir -p` also removes empty ancestors, up to and past a root.
+    // GNU accepts abbreviations (`--parent`, `--p`).
+    if (program === "rmdir" && options.some((arg) => /^--p/.test(arg) || /^-[^-]*p/.test(arg)))
+      return false;
+  } else if (program === "find") {
+    if (
+      !args.includes("-delete") ||
+      args.some((arg) => FIND_ACTIONS.has(arg) || ["-follow", "-files0-from"].includes(arg))
+    )
+      return false;
+    // Leading options come before the start paths: GNU -P -D -O, BSD -E -s -x -X -d. -H, -L follow
+    // symlinks and BSD -f names a start path, so those stay with a person.
+    let index = 0;
+    for (; index < args.length; index++) {
+      const arg = args[index] ?? "";
+      if (arg === "--") {
+        index++;
+        break;
+      }
+      // BSD find accepts clusters such as -xP.
+      if (/^-[PEsxXd]+$/.test(arg) || /^-O[0-9]*$/.test(arg)) continue;
+      if (arg === "-D") {
+        index++;
+        continue;
+      }
+      // Expression primaries are words (-name, -type); a single letter is an unknown option.
+      if (/^-[HLf]$/.test(arg) || /^-.$/.test(arg)) return false;
+      break;
+    }
+    targets = [];
+    for (; index < args.length && !/^[-(!)]/.test(args[index] ?? ""); index++)
+      targets.push(args[index] as string);
+    if (!knownFindExpression(args.slice(index))) return false;
+    if (targets.length === 0) targets = ["."];
+  } else return false;
+  return targets.length > 0 && targets.every((target) => disposable(cwd, target, roots, fill));
+}
+
 export function permissiveRead(cwd: string, input: string) {
   try {
-    const lexical = resolve(cwd, input);
+    const lexical = resolveWord(cwd, input);
     const path = canonical(lexical);
     if (sensitive(path) || sensitive(lexical))
       return {
@@ -195,10 +590,30 @@ export function permissiveRead(cwd: string, input: string) {
   }
 }
 
-export function permissiveWrite(cwd: string, input: string, profile: Profile) {
+const DISPOSABLE_WRITES = new Set([
+  "Write within a scratch directory",
+  "Write within the system temp directory",
+]);
+/** Temp and scratch writes are trusted only before anything could plant a symlink (see `Fill`). */
+export function permissiveWrite(cwd: string, input: string, profile: Profile, fill?: Fill) {
+  const check = writeEvidence(cwd, input, profile);
+  if (!check.allowed || !fill || !DISPOSABLE_WRITES.has(check.reason)) return check;
+  if (fill.script.tainted)
+    return {
+      allowed: false,
+      category: "temp-write" as const,
+      reason: "Temp write after a command that can create symlinks requires review",
+    };
+  if (fill.reorder) fill.script.approved = true;
+  return check;
+}
+
+function writeEvidence(cwd: string, input: string, profile: Profile) {
+  let lexical: string | undefined;
+  let path: string | undefined;
   try {
-    const lexical = resolve(cwd, input);
-    const path = canonical(lexical);
+    lexical = resolveWord(cwd, input);
+    path = canonical(lexical);
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
         allowed: false,
@@ -206,9 +621,11 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
         reason: "Protected path requires human approval",
       };
     // Never let a scratch root reach the policy service's own session directories.
+    const target = path;
     if (
-      !path.split(/[\\/]/).some((part) => part.startsWith("acp-")) &&
-      profile.scratchRoots.some((root) => inside(root, path))
+      !policyState(target) &&
+      !policyState(lexical) &&
+      profile.scratchRoots.some((root) => inside(root, target))
     )
       return {
         allowed: true,
@@ -218,7 +635,21 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
   } catch {
     /* fall through to the repository check, which fails closed */
   }
-  return pathEvidence(cwd, input, true);
+  const evidence = pathEvidence(cwd, input, true);
+  // Repository rules win; the temp directory only covers writes outside any repository.
+  if (
+    !evidence.allowed &&
+    evidence.reason === OUTSIDE_REPOSITORY &&
+    lexical &&
+    path &&
+    tempWrite(lexical, path)
+  )
+    return {
+      allowed: true,
+      category: "temp-write" as const,
+      reason: "Write within the system temp directory",
+    };
+  return evidence;
 }
 
 interface Unwrapped {
@@ -571,6 +1002,7 @@ export function redirectDecision(
   redirect: Redirect,
   profile: Profile,
   cwd: string,
+  fill?: Fill,
 ): Decision | undefined {
   if (redirect.target.includes(SUBSTITUTION))
     return human(request, "unknown", "Command substitution in a redirection requires human review");
@@ -583,7 +1015,7 @@ export function redirectDecision(
   const check =
     redirect.op === "<"
       ? permissiveRead(cwd, redirect.target)
-      : permissiveWrite(cwd, redirect.target, profile);
+      : permissiveWrite(cwd, redirect.target, profile, fill);
   return check.allowed ? undefined : human(request, check.category, check.reason);
 }
 
@@ -642,6 +1074,44 @@ function interpreterCodeRefusal(code: string): string | undefined {
   return undefined;
 }
 
+/**
+ * zsh builtins and reserved words. AUTO_CD is a zsh option, so a bash-only builtin (`help`,
+ * `mapfile`) is not a command there and a directory of that name is entered.
+ */
+const SHELL_WORDS = new Set(
+  (
+    ". : [ [[ ]] { } ! alias autoload bg bindkey break builtin case cd chdir command continue " +
+    "coproc declare dirs disown do done echo elif else emulate enable esac eval exec exit export " +
+    "false fc fg float for function functions getopts hash history if in integer jobs kill let " +
+    "local logout noglob nocorrect popd print printf pushd pwd read readonly repeat return select " +
+    "set setopt shift source suspend test then time times trap true type typeset ulimit umask " +
+    "unalias unset unsetopt until wait whence where which while zle zmodload zstyle"
+  ).split(" "),
+);
+/** Commands that change the shell's directory. */
+const DIRECTORY_CHANGERS = new Set(["cd", "chdir", "pushd", "popd"]);
+/**
+ * Whether zsh AUTO_CD could run `word` as `cd word`: it names an existing directory and no
+ * executable of that name is on PATH.
+ */
+function autoCd(cwd: string, word: string): boolean {
+  // A builtin or keyword is a command, so AUTO_CD never applies; `.` is `source`.
+  if (SHELL_WORDS.has(word)) return false;
+  try {
+    if (!statSync(resolveWord(cwd, word)).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  if (/[\\/]/.test(word) || word === "..") return true;
+  return !(process.env.PATH ?? "").split(delimiter).some((dir) => {
+    try {
+      return dir !== "" && statSync(join(dir, word)).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
 export function simpleDecision(
   request: Request,
   command: SimpleCommand,
@@ -649,12 +1119,13 @@ export function simpleDecision(
   depth: number,
   stageIndex: number,
   cwd: string,
+  fill?: Fill,
 ): Decision {
   for (const [name] of command.env)
     if (BANNED_ENV.test(name))
       return human(request, "unknown", "Environment override requires human review");
   for (const redirect of command.redirects) {
-    const refusal = redirectDecision(request, redirect, profile, cwd);
+    const refusal = redirectDecision(request, redirect, profile, cwd, fill);
     if (refusal) return refusal;
   }
   const unwrapped = unwrap(command.argv);
@@ -665,6 +1136,17 @@ export function simpleDecision(
   const looseAfterWrappers = command.loose?.slice(command.argv.length - unwrapped.argv.length);
   const argv = withOpaqueValues(unwrapped.argv, looseAfterWrappers);
   const program = basename(argv[0] ?? "");
+  // Every directory change must move the tracked cwd, which the flow evaluator does for `cd` and
+  // `chdir`. Behind a wrapper (`command cd`, `time cd`) or as a bare directory name (zsh AUTO_CD)
+  // the shell still changes directory, but nothing tracks it.
+  if (DIRECTORY_CHANGERS.has(program) && argv.length !== command.argv.length)
+    return human(request, "unknown", "A directory change behind a wrapper requires human review");
+  if (argv[0] !== undefined && autoCd(cwd, argv[0]))
+    return human(
+      request,
+      "unknown",
+      "A directory name used as a command (zsh AUTO_CD) requires human review",
+    );
   // Words a wrapper consumed (env assignments, options, durations) are gone from `argv`, but an
   // unquoted substitution in them can still split into extra words and pick a different program.
   if (
@@ -735,14 +1217,22 @@ export function simpleDecision(
   const joined = argv.join(" ");
   if (profile.humanPatterns.some((pattern) => pattern.test(joined)))
     return human(request, "destructive", "Matches an organization human-approval pattern");
-  // Anything that looks like a credential or protected-config path stays with a human.
-  for (const word of argv.slice(1)) {
+  // Anything that looks like a credential or protected-config path stays with a human. Words in
+  // known text positions (sed scripts, grep patterns, gh message text) are not paths, but the
+  // files a sed script reads or writes are.
+  const operands = textOperands(program, args);
+  for (const [index, word] of args.entries()) {
+    if (operands.text.has(index)) continue;
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
     if (candidate.includes("/") || candidate.startsWith(".")) {
       if (sensitive(candidate))
         return human(request, "sensitive", "Protected path requires human approval");
     }
   }
+  if (operands.paths.some((path) => sensitive(path)))
+    return human(request, "sensitive", "Protected path requires human approval");
+  if (scratchDeletion(program, args, cwd, profile, fill))
+    return result(request, "temp-write", "Delete within a scratch directory", true);
   if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
     return human(request, "destructive", "Destructive operation requires human approval");
   if (REMOTE_EXECUTORS.has(program))
@@ -776,7 +1266,7 @@ export function simpleDecision(
             : undefined;
       if (script === undefined || depth >= 2)
         return human(request, "unknown", "Shell invocation requires human review");
-      return commandDecision(request, script, profile, depth + 1, [cwd]);
+      return commandDecision(request, script, profile, depth + 1, [cwd], fill);
     }
     // Inline code and a heredoc body are both literal text, so both can be read. Code piped in
     // from elsewhere cannot.
@@ -823,13 +1313,29 @@ export function simpleDecision(
       args.some((arg) => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"))) ||
     (program === "perl" && args.some((arg) => /^-[a-zA-Z]*i/.test(arg)))
   ) {
-    for (const file of args.filter((arg) => !arg.startsWith("-")).slice(1)) {
-      const check = permissiveWrite(cwd, file, profile);
+    const files =
+      program === "sed"
+        ? textOperands(program, args).files
+        : args.filter((arg) => !arg.startsWith("-")).slice(1);
+    for (const file of files) {
+      const check = permissiveWrite(cwd, file, profile, fill);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   } else if (WRITERS.has(program)) {
-    for (const file of args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg))) {
-      const check = permissiveWrite(cwd, file, profile);
+    // Option values can name a target too: `--target-directory=/etc`, `-t/etc`.
+    const optionValues = args.flatMap((arg) => {
+      const value =
+        /^--[^=]+=(.+)$/.exec(arg)?.[1] ??
+        (["cp", "mv", "ln", "install"].includes(program)
+          ? /^-[a-zA-Z]*t(.+)$/.exec(arg)?.[1]
+          : undefined);
+      return value === undefined ? [] : [value];
+    });
+    for (const file of [
+      ...args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg)),
+      ...optionValues,
+    ]) {
+      const check = permissiveWrite(cwd, file, profile, fill);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   }
