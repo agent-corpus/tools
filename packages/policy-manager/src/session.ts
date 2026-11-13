@@ -22,6 +22,8 @@ import {
 const CLASSIFICATION_TTL_MS = 5 * 60_000;
 /** AI approvals per session; beyond this, ambiguous requests go to a human. */
 export const MAX_AI_APPROVALS = 50;
+/** How long after its approval an execution report may still record the files a tool created. */
+const CREATION_REPORT_MS = 15 * 60_000;
 
 interface ClassificationState {
   expires: number;
@@ -194,6 +196,9 @@ export class PolicySession {
       if (this.pending.size >= 64) this.pending.delete(this.pending.keys().next().value ?? "");
       this.pending.set(decision.requestHash, request);
     }
+    // Every decision replaces the pending creations for this request, so a report can only ever
+    // settle the most recent approval: an earlier approval whose report never came is forgotten.
+    this.creating.delete(decision.requestHash);
     if (decision.decision === "approve") {
       const targets = creationTargets(request, this.created);
       if (targets.length) {
@@ -255,9 +260,12 @@ export class PolicySession {
       });
       // A target is the session's only if `settle` proves the file there is its own inode or a new
       // one born after the approval; otherwise any earlier claim on the path is dropped.
+      // A report that comes too long after its approval records nothing.
       const pending = this.creating.get(report.requestHash);
-      for (const target of pending?.targets ?? []) {
-        const now = settle(target, pending?.approvedAt ?? Number.POSITIVE_INFINITY);
+      const fresh =
+        pending && Date.now() - pending.approvedAt <= CREATION_REPORT_MS ? pending : undefined;
+      for (const target of fresh?.targets ?? []) {
+        const now = settle(target, fresh?.approvedAt ?? Number.POSITIVE_INFINITY);
         if (!now) this.created.delete(pathKey(target.path));
         else {
           if (this.created.size >= 4096) this.created.clear();

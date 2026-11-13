@@ -610,6 +610,38 @@ describe("files this session created", () => {
     }
   });
 
+  test("only the most recent approval's report records, and only in time", () => {
+    // An approval whose report never comes must not be settled by a later report.
+    const s = session();
+    const gated = bash(s, "ls gate && touch y6.txt");
+    expect(s.review(gated, undefined, "PreToolUse").decision).toBe("approve"); // no report
+    write(join(wt, "y6.txt"), "a user's only copy"); // `cp notes.md y6.txt`, approved elsewhere
+    expect(s.review(gated, undefined, "PreToolUse").decision).toBe("approve"); // y6.txt exists now
+    s.record({ requestHash: hash(gated), event: "execution-result", status: "succeeded" });
+    try {
+      expect(rm(s, "rm y6.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("y6.txt");
+    }
+    // A report long after its approval records nothing.
+    const t = session();
+    const late = bash(t, "touch late.txt");
+    expect(t.review(late, undefined, "PreToolUse").decision).toBe("approve");
+    write(join(wt, "late.txt"), "");
+    const real = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(real + 16 * 60_000);
+    try {
+      t.record({ requestHash: hash(late), event: "execution-result", status: "succeeded" });
+    } finally {
+      clock.mockRestore();
+    }
+    try {
+      expect(rm(t, "rm late.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("late.txt");
+    }
+  });
+
   test("a script with any cd records nothing: a skipped cd cannot be told from the text", () => {
     // The gate would read cdnotes.md in cdtest/, where the session owns it; the shell skips the cd
     // and copies the user's cdnotes.md beside it, then overwrites that with the session's file.
