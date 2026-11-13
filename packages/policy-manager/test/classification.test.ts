@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { classifyCommand, hookResponse } from "../src/adapters.js";
 import { audit } from "../src/audit.js";
 import { evaluate, hash } from "../src/policy.js";
+import { HUMAN_REVIEW_PRINCIPLE } from "../src/principle.js";
 import { parseProfile } from "../src/profile.js";
 import { redactText } from "../src/redact.js";
 import { replayTranscripts } from "../src/replay.js";
@@ -187,7 +188,7 @@ describe("hint and retry flow", () => {
 describe("the AI never relaxes a deterministic boundary", () => {
   const always: Array<[string, string]> = [
     ["credential path", "cat /home/user/.aws/credentials"],
-    ["destructive", "rm -rf build"],
+    ["protected path", "echo x > .claude/settings.json"],
     ["organization pattern", "terraform apply"],
     ["environment override", "LD_PRELOAD=/tmp/x.so ls"],
     ["cloud write", "az vm restart --name a --resource-group b"],
@@ -210,12 +211,67 @@ describe("the AI never relaxes a deterministic boundary", () => {
       expect(evaluate(r, verdict(r, { confidence: 1 }), permissive).decision).toBe("human");
     });
 
-  test("sensitive, destructive and unknown categories from the AI are denied", () => {
-    for (const category of ["sensitive", "destructive", "unknown"] as const) {
+  test("sensitive and unknown categories from the AI are denied", () => {
+    for (const category of ["sensitive", "unknown"] as const) {
       const { session: s } = session();
       const r = ambiguous();
       s.review(r, undefined, "PreToolUse");
       expect(s.classify(verdict(r, { category, confidence: 1 })).decision).toBe("deny");
+    }
+  });
+});
+
+describe("destructive requests follow recoverability", () => {
+  test("a destructive request the classifier judges recoverable is approved", () => {
+    const { session: s } = session();
+    const r = request("rm -rf build");
+    const first = s.review(r, undefined, "PreToolUse");
+    expect(first).toMatchObject({ decision: "deny", classification: "requested" });
+    expect(JSON.stringify(hookResponse("claude", "PreToolUse", first))).toContain(
+      HUMAN_REVIEW_PRINCIPLE,
+    );
+    s.classify(verdict(r, { category: "destructive", confidence: 0.95 }));
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
+  });
+
+  test("an unrecoverable or unconfident destructive verdict goes to a person", () => {
+    for (const extra of [
+      { category: "destructive", recoverable: false },
+      { category: "destructive", confidence: 0.9 },
+      { category: "worktree-write", recoverable: false },
+    ] as const) {
+      const { session: s } = session();
+      const r = request("rm -rf build");
+      s.review(r, undefined, "PreToolUse");
+      const d = s.classify(verdict(r, extra));
+      expect(d.decision).toBe("human");
+      expect(hookResponse("claude", "PreToolUse", d)).toMatchObject({
+        hookSpecificOutput: { permissionDecision: "ask" },
+      });
+      expect(JSON.stringify(hookResponse("codex", "PreToolUse", d))).toContain(
+        '"permissionDecision":"deny"',
+      );
+      expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
+    }
+  });
+
+  test("an ambiguous request the AI calls destructive but unrecoverable goes to a person", () => {
+    const { session: s } = session();
+    const r = ambiguous();
+    s.review(r, undefined, "PreToolUse");
+    expect(s.classify(verdict(r, { category: "destructive", recoverable: false })).decision).toBe(
+      "human",
+    );
+  });
+
+  test("sensitive is never relaxed, even when the classifier says recoverable", () => {
+    for (const command of ["cat /home/user/.aws/credentials", "echo x > .claude/settings.json"]) {
+      const r = request(command);
+      for (const category of ["code-read", "worktree-write", "destructive"] as const)
+        expect(
+          evaluate(r, verdict(r, { category, confidence: 1, recoverable: true }), permissive)
+            .decision,
+        ).toBe("human");
     }
   });
 });
@@ -467,6 +523,6 @@ describe("replay", () => {
       [line("echo $ONE"), line("echo $TWO"), line("rm -rf build"), line("ls")].join("\n"),
     );
     const report = replayTranscripts([file], permissive);
-    expect(report).toMatchObject({ commands: 4, approved: 1, classified: 2 });
+    expect(report).toMatchObject({ commands: 4, approved: 1, classified: 3 });
   });
 });

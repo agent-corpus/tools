@@ -1,4 +1,5 @@
 import { hash } from "./policy.js";
+import { HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
 import type { Decision, OutcomeReport, Request } from "./types.js";
 export function normalize(harness: Request["harness"], payload: Record<string, unknown>): Request {
   let input: unknown = payload.tool_input ?? payload.toolInput ?? payload.toolArgs ?? {};
@@ -52,7 +53,7 @@ function classifyInstruction(
   context?: HookContext,
 ): string {
   const command = classifyCommand(harness, context);
-  return `Not run yet: this request needs classification before it can run (request ${decision.requestHash}; ${decision.reason}). Ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive. It answers with {"requestHash":"${decision.requestHash}","category":"code-read|worktree-write|cloud-read|git-read|impactful-write|destructive|sensitive|unknown","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record that answer with this command, replacing <json> with the answer and using no single quotes in it: ${command} Then retry the same command unchanged. If you cannot get a classification, retry once and the user will be asked.`;
+  return `Not run yet: this request needs classification before it can run (request ${decision.requestHash}; ${decision.reason}). Ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive, under this rule: ${HUMAN_REVIEW_PRINCIPLE} It answers with {"requestHash":"${decision.requestHash}","category":"code-read|worktree-write|cloud-read|git-read|impactful-write|destructive|sensitive|unknown","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record that answer with this command, replacing <json> with the answer and using no single quotes in it: ${command} Then retry the same command unchanged. If you cannot get a classification, retry once and the user will be asked.`;
 }
 export function hookResponse(
   harness: Request["harness"],

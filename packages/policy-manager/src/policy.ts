@@ -176,10 +176,11 @@ export function result(
 /** Self-reported confidence needed for the AI to approve an ambiguous request. */
 export const AMBIGUOUS_CONFIDENCE = 0.95;
 /**
- * Escalations that stay with a human in every profile. Categories `sensitive` (credentials,
- * secrets, protected paths and configuration) and `destructive` (unrecoverable loss) are excluded
- * by category; these are the remaining boundaries: the request itself cannot be trusted, an
- * organization or the profile asked for a human, or a repository rule forbids the write.
+ * Escalations that stay with a human in every profile. Category `sensitive` (credentials,
+ * secrets, protected paths and configuration) is excluded by category; these are the remaining
+ * boundaries: the request itself cannot be trusted, an organization or the profile asked for a
+ * human, or a repository rule forbids the write. `destructive` is classified: recoverable is
+ * approved, unrecoverable goes to a person.
  */
 const HUMAN_BOUNDARIES: RegExp[] = [
   /^Incomplete request/,
@@ -204,7 +205,6 @@ function markAmbiguous(decision: Decision, profile: Profile): Decision {
     decision.decision !== "human" ||
     decision.needsClassification ||
     decision.category === "sensitive" ||
-    decision.category === "destructive" ||
     HUMAN_BOUNDARIES.some((pattern) => pattern.test(decision.reason))
   )
     return decision;
@@ -214,7 +214,7 @@ function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
   const safe =
     ai.recoverable === true &&
     ai.confidence >= AMBIGUOUS_CONFIDENCE &&
-    !["sensitive", "destructive", "unknown"].includes(ai.category);
+    !["sensitive", "unknown"].includes(ai.category);
   const base = { ...decision, needsClassification: false, cache: "session" as const, ai };
   if (safe)
     return {
@@ -225,6 +225,15 @@ function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
       reason: "Ambiguous request judged recoverable and non-sensitive by the same-session AI",
     };
   const why = ai.rationale ? ` Rationale: ${redactText(ai.rationale, 200)}` : "";
+  // Possible unrecoverable loss is a person's decision, not a deny the model works around.
+  if (decision.category === "destructive" || ai.category === "destructive")
+    return {
+      ...base,
+      decision: "human",
+      cache: "none",
+      classification: "denied",
+      reason: `Destructive request not judged recoverable by the classifier (confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"}); a person decides.${why}`,
+    };
   return {
     ...base,
     decision: "deny",
