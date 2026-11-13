@@ -395,7 +395,10 @@ describe("deletion in scratch and temp directories", () => {
       expect(bash(command, outside).decision, command).toBe("approve");
   });
 
-  test("an existing path below where an earlier command copies or extracts is not trusted", () => {
+  // Each command runs Git for repository evidence, which is slow on Windows runners.
+  test("an existing path below where an earlier command copies or extracts is not trusted", {
+    timeout: 30_000,
+  }, () => {
     const dir = join(outside, "refill");
     mkdirSync(join(dir, "made", "inner"), { recursive: true });
     mkdirSync(join(dir, "ex", "out"), { recursive: true });
