@@ -1,5 +1,6 @@
-import { hash } from "./policy.js";
-import type { Decision, OutcomeReport, Request } from "./types.js";
+import { requestHash } from "./policy.js";
+import { HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
+import { CATEGORIES, type Decision, type OutcomeReport, type Request } from "./types.js";
 export function normalize(harness: Request["harness"], payload: Record<string, unknown>): Request {
   let input: unknown = payload.tool_input ?? payload.toolInput ?? payload.toolArgs ?? {};
   if (typeof input === "string") input = JSON.parse(input);
@@ -52,7 +53,7 @@ function classifyInstruction(
   context?: HookContext,
 ): string {
   const command = classifyCommand(harness, context);
-  return `Not run yet: this request needs classification before it can run (request ${decision.requestHash}; ${decision.reason}). Ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive. It answers with {"requestHash":"${decision.requestHash}","category":"code-read|worktree-write|cloud-read|git-read|impactful-write|destructive|sensitive|unknown","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record that answer with this command, replacing <json> with the answer and using no single quotes in it: ${command} Then retry the same command unchanged. If you cannot get a classification, retry once and the user will be asked.`;
+  return `Needs classification (not an error): not run yet. Ask the session's policy-manager agent whether this exact command is recoverable and non-sensitive, record its answer, then retry the same command unchanged. Rule: ${HUMAN_REVIEW_PRINCIPLE} Request ${decision.requestHash}: ${decision.reason}. Answer shape: {"requestHash":"${decision.requestHash}","category":"${CATEGORIES.join("|")}","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record it by replacing <json> in this command, with no single quotes in the answer: ${command} If no classification is available, retry once and the user will be asked.`;
 }
 export function hookResponse(
   harness: Request["harness"],
@@ -60,6 +61,7 @@ export function hookResponse(
   decision: Decision,
   context?: HookContext,
 ): Record<string, unknown> {
+  if (decision.decision === "native") return {};
   if (decision.decision === "deny") {
     const reason =
       decision.classification === "requested"
@@ -95,8 +97,13 @@ export function hookResponse(
     return decision.decision === "approve"
       ? { hookSpecificOutput: { hookEventName: phase, decision: { behavior: "allow" } } }
       : {};
+  // Codex rejects PreToolUse `permissionDecision: "allow"` without `updatedInput` ("unsupported
+  // permissionDecision:allow") and marks the hook failed. An approval there is no decision at all;
+  // if Codex would then prompt, its PermissionRequest hook (above) returns the allow.
   if (decision.decision === "approve")
-    return { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
+    return harness === "codex"
+      ? {}
+      : { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
   // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
   // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
   // so a decision that needs a human is a deny. Approving it in chat does not change the decision,
@@ -125,6 +132,17 @@ export function hookResponse(
   };
 }
 
+/** The exact stdout of a PreToolUse or PermissionRequest hook. Codex gets no output for no decision. */
+export function hookOutput(
+  harness: Request["harness"],
+  phase: string,
+  decision: Decision,
+  context?: HookContext,
+): string {
+  const response = hookResponse(harness, phase, decision, context);
+  return harness === "codex" && Object.keys(response).length === 0 ? "" : JSON.stringify(response);
+}
+
 export function executionReport(
   request: Request,
   phase: string,
@@ -145,7 +163,7 @@ export function executionReport(
   const unknown = exitCode === undefined && request.harness === "codex";
   const duration = payload.duration_ms ?? payload.durationMs;
   return {
-    requestHash: hash(request),
+    requestHash: requestHash(request),
     event: "execution-result",
     status:
       phase === "PostToolUseFailure"
