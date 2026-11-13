@@ -17,6 +17,11 @@ export interface Profile {
   humanPatterns: RegExp[];
   /** Absolute directories where permissive mode may write besides linked feature worktrees. */
   scratchRoots: string[];
+  /**
+   * MCP tools that approve without a prompt: exact `mcp__<server>__<tool>` names, or a name whose
+   * last segment ends in `*` (`mcp__github__get_*`). Unlisted MCP tools are left to the harness.
+   */
+  mcpReadOnly: string[];
   /** SHA-256 of the file the profile came from, for the audit log. */
   digest?: string;
 }
@@ -26,7 +31,27 @@ export const strictProfile: Profile = {
   cloudWrites: "human",
   humanPatterns: [],
   scratchRoots: [],
+  mcpReadOnly: [],
 };
+
+export const MAX_MCP_READ_ONLY = 200;
+/**
+ * `mcp__<server>__<tool>` where neither segment contains `__` (so the split is unambiguous); `*`
+ * only as the suffix of a non-empty tool segment.
+ */
+const MCP_ENTRY =
+  /^mcp__[A-Za-z0-9.-]+(?:_[A-Za-z0-9.-]+)*__[A-Za-z0-9.-]+(?:_[A-Za-z0-9.-]+)*(?:_?\*)?$/;
+
+/** Whether `tool` is listed in the profile's `mcpReadOnly`. */
+export function mcpReadOnly(profile: Profile, tool: string): boolean {
+  if (!tool.startsWith("mcp__")) return false;
+  return profile.mcpReadOnly.some((entry) => {
+    if (!entry.endsWith("*")) return tool === entry;
+    // The whole tool segment, not just the wildcard's part, must be free of `__`.
+    const server = entry.slice(0, entry.lastIndexOf("__") + 2);
+    return tool.startsWith(entry.slice(0, -1)) && !tool.slice(server.length).includes("__");
+  });
+}
 
 export function defaultProfilePath(): string {
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -73,6 +98,7 @@ export function parseProfile(text: string): Profile {
     "cloudWrites",
     "humanPatterns",
     "scratchRoots",
+    "mcpReadOnly",
     "description",
   ]);
   for (const key of Object.keys(value))
@@ -89,6 +115,15 @@ export function parseProfile(text: string): Profile {
     throw new ProfileError("humanPatterns must be short strings");
   if (!Array.isArray(roots) || roots.some((r) => typeof r !== "string" || !isAbsolute(r)))
     throw new ProfileError("scratchRoots must be absolute paths");
+  const mcp = value.mcpReadOnly ?? [];
+  if (
+    !Array.isArray(mcp) ||
+    mcp.length > MAX_MCP_READ_ONLY ||
+    mcp.some((entry) => typeof entry !== "string" || entry.length > 128 || !MCP_ENTRY.test(entry))
+  )
+    throw new ProfileError(
+      `mcpReadOnly must list at most ${MAX_MCP_READ_ONLY} names like mcp__server__tool, optionally ending in *`,
+    );
   let humanPatterns: RegExp[];
   try {
     humanPatterns = (patterns as string[]).map((p) => new RegExp(p));
@@ -108,6 +143,7 @@ export function parseProfile(text: string): Profile {
     cloudWrites,
     humanPatterns,
     scratchRoots: value.mode === "permissive" ? [...scratchRoots] : [],
+    mcpReadOnly: [...new Set(mcp as string[])],
     digest: createHash("sha256").update(text).digest("hex"),
   };
 }
