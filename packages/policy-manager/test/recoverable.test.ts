@@ -89,7 +89,8 @@ beforeAll(() => {
   git(repo, ["submodule", "add", "-q", subOrigin, "sub"]);
   git(repo, ["commit", "-qm", "sub"]);
   write(join(repo, "two.txt"), "2");
-  git(repo, ["add", "two.txt"]);
+  write(join(repo, "=node"), "a tracked file whose name zsh would expand");
+  git(repo, ["add", "two.txt", "=node"]);
   git(repo, ["commit", "-qm", "two"]);
   git(repo, ["push", "-q", "-u", "origin", "main"]);
   git(repo, ["checkout", "-q", "-b", "withf"]);
@@ -453,6 +454,58 @@ describe("files this session created", () => {
     } finally {
       cleanup("f.txt");
     }
+  });
+
+  test("a new file filled by anything but a known creating form is not the session's", () => {
+    // gzip writes the user's notes into notes.md.gz, a file born after the approval.
+    const s = session();
+    run(s, "gzip user/user3.md && touch user/user3.md.gz", () => {
+      write(user("user3.md.gz"), "compressed user notes");
+      rmSync(user("user3.md"));
+    });
+    try {
+      expect(rm(s, "rm user/user3.md.gz").decision).not.toBe("approve");
+    } finally {
+      write(user("user3.md"), "user notes user3.md");
+      rmSync(user("user3.md.gz"), { force: true });
+    }
+    // git stash pop restores a user's stashed file as a new inode.
+    const t = session();
+    run(t, "git stash pop && touch stashed.txt", () => write(join(wt, "stashed.txt"), "stashed"));
+    try {
+      expect(rm(t, "rm stashed.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("stashed.txt");
+    }
+    // The known forms still count.
+    const u = session();
+    run(u, "echo hi > made2.txt && touch made3.txt", () => {
+      write(join(wt, "made2.txt"), "hi\n");
+      write(join(wt, "made3.txt"), "");
+    });
+    try {
+      expect(rm(u, "rm made2.txt made3.txt").decision).toBe("approve");
+    } finally {
+      cleanup("made2.txt", "made3.txt");
+    }
+  });
+
+  test("a leading = is never a plain operand: zsh expands =name to a command's path", () => {
+    const s = session();
+    create(s, "=mytool");
+    try {
+      expect(rm(s, "rm =mytool").decision).not.toBe("approve");
+      expect(rm(s, "rm ./=mytool").decision).toBe("approve");
+    } finally {
+      cleanup("=mytool");
+    }
+    expect(decide("rm =node")).not.toBe("approve");
+    expect(decide("git rm -f =node")).not.toBe("approve");
+    expect(decide("rm ./=node")).toBe("approve");
+    expect(decide("git rm -f ./=node")).toBe("approve");
+    const c = session();
+    expect(rm(c, "rm =git").tier).toBeUndefined(); // not a worktree deletion for the classifier
+    expect(rm(c, "rm ./=git").tier).toBe("ambiguous");
   });
 
   test("worktree deletion is classified only when it is the script's whole effect", () => {

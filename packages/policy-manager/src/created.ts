@@ -98,6 +98,12 @@ function owns(created: CreatedFiles, path: string | undefined): boolean {
 }
 
 const WRITE_TOOLS = new Set(["Write", "create", "write_file", "Edit", "edit"]);
+/**
+ * Commands whose output content is the session's own: echo/printf-style writers behind a
+ * redirect, `touch`, `tee`, `cp` (the source survives), `mv` of the session's own file, and inert
+ * commands. Anything else may move a user's data into a new file.
+ */
+const CREATING = new Set(["touch", "tee", "cp", "mv", "cd", "pwd", "echo", "printf", "ls", "true"]);
 
 /**
  * Paths an approved request may create or rewrite: those that do not exist yet, or that are still
@@ -129,6 +135,11 @@ export function creationTargets(request: Request, created: CreatedFiles): Target
   } else {
     const command = input.command ?? input.cmd;
     const pipelines = typeof command === "string" ? parseShell(command) : undefined;
+    // A new inode proves nothing about its content: `gzip notes.md && touch notes.md.gz` or
+    // `git stash pop && touch x` put a user's data in a file born after the approval. So a script
+    // records creations only when every command in it is a known creating form or inert.
+    if (pipelines?.some((stages) => stages.some(({ argv }) => !CREATING.has(argv[0] ?? ""))))
+      return [];
     let cwd = request.cwd;
     for (const stages of pipelines ?? [])
       for (const { argv, redirects } of stages) {

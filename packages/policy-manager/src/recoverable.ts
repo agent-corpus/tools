@@ -174,7 +174,9 @@ function tracked(root: string, path: string): boolean {
   return git(root, ["--literal-pathspecs", "ls-files", "-z", "--", path]) !== "";
 }
 
-const PLAIN_OPERAND = /^[^~:-]/;
+// zsh expands a leading `~` and `=name` (the path of command `name`); `-` is an option and `:`
+// a Git pathspec magic. `./=name` stays a plain file.
+const PLAIN_OPERAND = /^[^~:=-]/;
 
 /**
  * Resolves an operand to what the command removes, inside a feature worktree, or undefined.
