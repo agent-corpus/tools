@@ -1,6 +1,6 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, posix, resolve } from "node:path";
+import { basename, isAbsolute, join, posix, resolve } from "node:path";
 import { canonical, resolveWord } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
@@ -478,6 +478,7 @@ function forget(state: State, names: Set<string>): void {
 
 const STATEFUL = new Set([
   "cd",
+  "chdir",
   "pushd",
   "popd",
   "export",
@@ -684,7 +685,8 @@ function runSimple(
   // `shift` moves every positional parameter down, and `set` with a non-option word (`set -e
   // pipefail`) replaces them; only `set --` is tracked.
   if (name === "shift" || name === "set") for (const p of POSITIONAL_NAMES) state.vars.set(p, null);
-  if (name === "cd") return changeDirectory(ctx, state, piped, envs, build);
+  // zsh `chdir` is `cd`; in bash it fails, which leaves the starting directory possible anyway.
+  if (name === "cd" || name === "chdir") return changeDirectory(ctx, state, piped, envs, build);
   if (name === "export") return exportVariables(ctx, node, state, piped, known, envs);
   if (name === "unset" || name === "read" || name === "printf" || name === "print") {
     const forgotten = new Set<string>();
@@ -740,7 +742,9 @@ function changeDirectory(
       !word ||
       word.includes(SUBSTITUTION) ||
       /^~|[*?[\]]/.test(word) ||
-      word.startsWith("-")
+      word.startsWith("-") ||
+      // CDPATH (from the environment the shell inherited) redirects a relative name.
+      (process.env.CDPATH && !/^(?:\.{1,2}(?:[\\/]|$)|[\\/])/.test(word) && !isAbsolute(word))
     )
       return human(request, "unknown", "Directory change requires human review");
     // bash and zsh `cd` is logical: `..` drops the last written component. In physical mode (`cd
@@ -879,7 +883,7 @@ function callFunction(
   // `return` can stop the body anywhere, so the state after the call is any point in it: what the
   // body assigns is unknown, and a directory change in between cannot be followed.
   const returns = mayRun(fn.body.body, new Set(["return"]), state.funcs);
-  const moves = mayRun(fn.body.body, new Set(["cd", "pushd", "popd"]), state.funcs);
+  const moves = mayRun(fn.body.body, new Set(["cd", "chdir", "pushd", "popd"]), state.funcs);
   const inner = { ...ctx, calls: ctx.calls + 1 };
   const target = fn.body.kind === "subshell" ? copy(state) : state;
   const body = runList(inner, fn.body.body, target);

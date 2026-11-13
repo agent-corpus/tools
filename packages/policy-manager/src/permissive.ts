@@ -1,4 +1,5 @@
-import { basename, dirname, resolve } from "node:path";
+import { statSync } from "node:fs";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import {
   branchEvidence,
   canonical,
@@ -1047,6 +1048,29 @@ function interpreterCodeRefusal(code: string): string | undefined {
   return undefined;
 }
 
+/** Commands that change the shell's directory. */
+const DIRECTORY_CHANGERS = new Set(["cd", "chdir", "pushd", "popd"]);
+/**
+ * Whether zsh AUTO_CD could run `word` as `cd word`: it names an existing directory and no
+ * executable of that name is on PATH.
+ */
+function autoCd(cwd: string, word: string): boolean {
+  if (word === ".") return false; // `source`
+  try {
+    if (!statSync(resolveWord(cwd, word)).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  if (/[\\/]/.test(word) || word === "..") return true;
+  return !(process.env.PATH ?? "").split(delimiter).some((dir) => {
+    try {
+      return dir !== "" && statSync(join(dir, word)).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+
 export function simpleDecision(
   request: Request,
   command: SimpleCommand,
@@ -1070,6 +1094,17 @@ export function simpleDecision(
   const looseAfterWrappers = command.loose?.slice(command.argv.length - unwrapped.argv.length);
   const argv = withOpaqueValues(unwrapped.argv, looseAfterWrappers);
   const program = basename(argv[0] ?? "");
+  // Every directory change must move the tracked cwd, which the flow evaluator does for `cd` and
+  // `chdir`. Behind a wrapper (`command cd`, `time cd`) or as a bare directory name (zsh AUTO_CD)
+  // the shell still changes directory, but nothing tracks it.
+  if (DIRECTORY_CHANGERS.has(program) && argv.length !== command.argv.length)
+    return human(request, "unknown", "A directory change behind a wrapper requires human review");
+  if (argv[0] !== undefined && autoCd(cwd, argv[0]))
+    return human(
+      request,
+      "unknown",
+      "A directory name used as a command (zsh AUTO_CD) requires human review",
+    );
   // Words a wrapper consumed (env assignments, options, durations) are gone from `argv`, but an
   // unquoted substitution in them can still split into extra words and pick a different program.
   if (

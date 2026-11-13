@@ -293,8 +293,52 @@ describe("deletion in scratch and temp directories", () => {
       "cd out/.. && rm -rf dist",
       "cd out && cd .. && echo x > w.txt",
       "cd out/.. && echo x > w.txt",
+      "cd out && chdir .. && rm -rf dist",
+      "chdir out/.. && rm -rf dist",
     ])
       refused(command, main);
+  });
+
+  test("every way of changing directory moves the cwd or goes to a person", () => {
+    const away = posix(main);
+    for (const command of [
+      `chdir ${away} && rm -rf dist`,
+      `chdir ${away}; rm -rf dist`,
+      `chdir ${away} && echo x > w.txt`,
+      `pushd ${away} && rm -rf dist`,
+      `popd && rm -rf dist`,
+      `builtin cd ${away} && rm -rf dist`,
+      `command cd ${away} && rm -rf dist`,
+      `time cd ${away} && rm -rf dist`,
+      `nocorrect cd ${away} && rm -rf dist`,
+      `\\cd ${away} && rm -rf dist`,
+      `${away} && rm -rf dist`,
+      ".. && rm -rf dist",
+      "cd - && rm -rf dist",
+      `OLDPWD=${away} cd - && rm -rf dist`,
+      `CDPATH=${posix(root)} cd main && rm -rf dist`,
+      "setopt chase_links && cd out/.. && rm -rf dist",
+      "setopt auto_cd && rm -rf dist",
+      "set -o physical && rm -rf dist",
+      "f() { chdir /etc; }; f; rm -rf dist",
+    ])
+      refused(command, outside);
+    // A tracked chdir into scratch still approves a scratch delete.
+    mkdirSync(join(outside, "chd", "dist"), { recursive: true });
+    approved(`chdir ${posix(join(outside, "chd"))} && rm -rf dist`, outside);
+  });
+
+  test("CDPATH inherited from the environment makes a relative cd unknown", () => {
+    const saved = process.env.CDPATH;
+    process.env.CDPATH = posix(root);
+    try {
+      refused("cd main && rm -rf dist", outside);
+      mkdirSync(join(outside, "cdp", "dist"), { recursive: true });
+      approved("cd ./cdp && rm -rf dist", outside);
+    } finally {
+      if (saved === undefined) delete process.env.CDPATH;
+      else process.env.CDPATH = saved;
+    }
   });
 
   test.skipIf(windows)("a backslash is a file-name character on POSIX", () => {
