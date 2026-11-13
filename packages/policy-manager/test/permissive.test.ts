@@ -84,9 +84,9 @@ describe("shell parser", () => {
     // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
     "echo ${PATH}",
     // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
-    "echo ${HOME:-x}",
+    "echo ${X:=x}",
     "echo $((1+2))",
-    "echo $'a'",
+    "echo $'a\\'b'",
     "echo $(unterminated",
     "echo `unterminated",
     "echo $(echo 'a)",

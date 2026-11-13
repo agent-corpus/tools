@@ -15,9 +15,19 @@ import { homedir } from "node:os";
 /** Stands for the unknown output of an expansion inside a word. */
 export const SUBSTITUTION = "";
 
+/** `${X:-w}`, `${X:+w}`, `${#X}`, `${X#p}`/`${X##p}`/`${X%p}`/`${X%%p}` and `${X:o:l}`. */
+export type ParamOp =
+  | { kind: "default"; word: string }
+  | { kind: "alternate"; word: string }
+  | { kind: "length" }
+  | { kind: "strip"; suffix: boolean; longest: boolean; pattern: string }
+  | { kind: "slice"; offset: number; length?: number };
+
 export interface VarRef {
+  /** A variable name, or a positional parameter (`1`..`9`, `@`, `*`). */
   name: string;
   quoted: boolean;
+  op?: ParamOp;
 }
 export interface UnknownPart {
   unknown: true;
@@ -71,6 +81,8 @@ export interface ForNode {
 }
 export interface WhileNode {
   kind: "while";
+  /** `until`: the body runs while the condition fails. */
+  until?: boolean;
   cond: ListNode;
   body: ListNode;
   redirects: Redir[];
@@ -87,7 +99,21 @@ export interface CaseNode {
   branches: Array<{ patterns: Word[]; body: ListNode }>;
   redirects: Redir[];
 }
-export type Command = Simple | Subshell | Group | ForNode | WhileNode | IfNode | CaseNode;
+/** `name() { ...; }` or `name() ( ... )`: defines the function, runs nothing. */
+export interface FunctionNode {
+  kind: "function";
+  name: string;
+  body: Group | Subshell;
+}
+export type Command =
+  | Simple
+  | Subshell
+  | Group
+  | ForNode
+  | WhileNode
+  | IfNode
+  | CaseNode
+  | FunctionNode;
 export interface PipelineNode {
   stages: Command[];
   negated: boolean;
@@ -238,9 +264,130 @@ function closingParen(command: string, start: number): number | undefined {
 }
 
 type Expansion =
-  | { kind: "text"; text: string; next: number }
-  | { kind: "var"; name: string; next: number }
+  | { kind: "text"; text: string; next: number; quoted?: boolean }
+  | { kind: "var"; name: string; next: number; op?: ParamOp }
   | { kind: "unknown"; next: number; inner?: string };
+
+const PARAM_WORD = /^[A-Za-z0-9_@%+=:,./-]*$/;
+const PARAM_PATTERN = /^[A-Za-z0-9_@%+=:,./*?-]+$/;
+
+/** The name and operation inside `${...}`, or undefined for a form that is not modelled. */
+function parameter(body: string): { name: string; op?: ParamOp } | undefined {
+  const NAME_OR_POSITION = "([A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*)";
+  let m = new RegExp(`^${NAME_OR_POSITION}$`).exec(body);
+  if (m) return { name: m[1] as string };
+  m = new RegExp(`^#${NAME_OR_POSITION}$`).exec(body);
+  if (m) return { name: m[1] as string, op: { kind: "length" } };
+  m = new RegExp(`^${NAME_OR_POSITION}(:?)([-+])(.*)$`).exec(body);
+  if (m && PARAM_WORD.test(m[4] as string))
+    return {
+      name: m[1] as string,
+      op: { kind: m[3] === "-" ? "default" : "alternate", word: m[4] as string },
+    };
+  m = new RegExp(`^${NAME_OR_POSITION}(##?|%%?)(.*)$`).exec(body);
+  if (m && PARAM_PATTERN.test(m[3] as string)) {
+    const op = m[2] as string;
+    return {
+      name: m[1] as string,
+      op: {
+        kind: "strip",
+        suffix: op.startsWith("%"),
+        longest: op.length === 2,
+        pattern: m[3] as string,
+      },
+    };
+  }
+  m = new RegExp(`^${NAME_OR_POSITION}:([0-9]+)(?::([0-9]+))?$`).exec(body);
+  if (m)
+    return {
+      name: m[1] as string,
+      op: {
+        kind: "slice",
+        offset: Number(m[2]),
+        ...(m[3] === undefined ? {} : { length: Number(m[3]) }),
+      },
+    };
+  return undefined;
+}
+
+function globRegex(pattern: string): RegExp {
+  const source = [...pattern]
+    .map((c) => (c === "*" ? ".*" : c === "?" ? "." : c.replace(/[.+^${}()|[\]\\/-]/g, "\\$&")))
+    .join("");
+  return new RegExp(`^${source}$`, "s");
+}
+
+/**
+ * Applies a parameter operation to a value that is set and not empty, which is the only kind of
+ * value the evaluator knows.
+ */
+export function applyParamOp(value: string, op: ParamOp | undefined): string {
+  if (!op || op.kind === "default") return value;
+  if (op.kind === "alternate") return op.word;
+  if (op.kind === "length") return String([...value].length);
+  if (op.kind === "slice")
+    return value.slice(op.offset, op.length === undefined ? undefined : op.offset + op.length);
+  const regex = globRegex(op.pattern);
+  const lengths = [...Array(value.length + 1).keys()];
+  if (op.longest) lengths.reverse();
+  for (const n of lengths) {
+    const piece = op.suffix ? value.slice(value.length - n) : value.slice(0, n);
+    if (regex.test(piece)) return op.suffix ? value.slice(0, value.length - n) : value.slice(n);
+  }
+  return value;
+}
+
+const ANSI_ESCAPES: Record<string, string> = {
+  a: "\x07",
+  b: "\b",
+  e: "\x1b",
+  E: "\x1b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  v: "\v",
+  "\\": "\\",
+  '"': '"',
+  "?": "?",
+};
+
+/**
+ * `$'...'` starting at `command[at] === "$"`. `\'` is refused so that the plain single-quote scan
+ * used to find the end of a substitution agrees with the shell; so are NUL, `\c`, `\u` and `\U`.
+ */
+function ansiString(command: string, at: number): Expansion | undefined {
+  let text = "";
+  for (let i = at + 2; i < command.length; i++) {
+    const c = command[i] as string;
+    if (c === "'") {
+      if (text.includes(SUBSTITUTION) || text.includes("\0")) return undefined;
+      return { kind: "text", text, next: i + 1, quoted: true };
+    }
+    if (c !== "\\") {
+      text += c;
+      continue;
+    }
+    const e = command[i + 1];
+    if (e === undefined || e === "'" || e === "c" || e === "u" || e === "U") return undefined;
+    const known = ANSI_ESCAPES[e];
+    if (known !== undefined) {
+      text += known;
+      i++;
+      continue;
+    }
+    const hex = e === "x" ? /^[0-9A-Fa-f]{1,2}/.exec(command.slice(i + 2)) : null;
+    const octal = /^[0-7]{1,3}/.exec(command.slice(i + 1));
+    if (hex) {
+      text += String.fromCharCode(Number.parseInt(hex[0], 16));
+      i += 1 + hex[0].length;
+    } else if (octal) {
+      text += String.fromCharCode(Number.parseInt(octal[0], 8) & 0xff);
+      i += octal[0].length;
+    } else text += c; // an unknown escape keeps its backslash; the next character follows
+  }
+  return undefined;
+}
 
 /**
  * Reads the expansion that starts at `command[at] === "$"`, or undefined for one that is not
@@ -268,15 +415,24 @@ function expansion(command: string, at: number, quoted = false): Expansion | und
     if (end === undefined) return undefined;
     return { kind: "unknown", next: end + 1, inner: command.slice(at + 2, end) };
   }
+  if (rest[0] === "'" && !quoted) return ansiString(command, at);
   let name: string | undefined;
+  let op: ParamOp | undefined;
   let next: number;
   if (rest[0] === "{") {
     const close = rest.indexOf("}");
-    name = close > 0 ? rest.slice(1, close) : undefined;
+    if (close <= 0) return undefined;
+    const body = rest.slice(1, close);
     next = at + close + 2;
-    if (name === undefined || (!NAME.test(name) && !UNKNOWN_PARAMETER.test(name))) return undefined;
-  } else if (rest[0] && "?#$".includes(rest[0])) {
+    if (UNKNOWN_PARAMETER.test(body)) return { kind: "unknown", next };
+    const parsed = parameter(body);
+    if (!parsed) return undefined;
+    ({ name, op } = parsed);
+  } else if (rest[0] && "?#$0".includes(rest[0])) {
     return { kind: "unknown", next: at + 2 };
+  } else if (rest[0] && /[1-9@*]/.test(rest[0])) {
+    name = rest[0];
+    next = at + 2;
   } else {
     name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest)?.[0];
     if (!name) return undefined;
@@ -285,9 +441,9 @@ function expansion(command: string, at: number, quoted = false): Expansion | und
   if (UNKNOWN_PARAMETER.test(name)) return { kind: "unknown", next };
   if (name === "HOME") {
     const text = home();
-    return text === undefined ? undefined : { kind: "text", text, next };
+    return text === undefined ? undefined : { kind: "text", text: applyParamOp(text, op), next };
   }
-  return { kind: "var", name, next };
+  return op ? { kind: "var", name, next, op } : { kind: "var", name, next };
 }
 
 // --- tokenizer --------------------------------------------------------------------------------
@@ -308,7 +464,8 @@ function tokenize(src: string): Token[] {
   let quotedAny = false;
   let headPlain = true;
   let assignName: string | undefined;
-  let braceChar = false;
+  let braceOpen = false;
+  let braceExpansion = false;
   let globChar = false;
   let quote = "";
   let pendingRedirect: { fd: string; op: Redir["op"] } | undefined;
@@ -325,8 +482,8 @@ function tokenize(src: string): Token[] {
   const endWord = () => {
     if (!active) return;
     flush();
-    const bare = parts.length === 1 && (parts[0] === "{" || parts[0] === "}");
-    if (braceChar && !(bare && !quotedAny && assignName === undefined)) reject();
+    // `{a,b}` and `{1..3}` expand to several words; `{}`, `@{u}` and a lone `{` are literal.
+    if (braceExpansion) reject();
     const word: Word = { parts, subs, quoted: quotedAny, assign: assignName, glob: globChar };
     parts = [];
     subs = [];
@@ -334,7 +491,8 @@ function tokenize(src: string): Token[] {
     quotedAny = false;
     headPlain = true;
     assignName = undefined;
-    braceChar = false;
+    braceOpen = false;
+    braceExpansion = false;
     globChar = false;
     if (pendingRedirect) {
       tokens.push({ t: "redir", redir: { ...pendingRedirect, target: word } });
@@ -352,10 +510,12 @@ function tokenize(src: string): Token[] {
     if (inner !== undefined) subs.push(inner);
   };
   const appendExpansion = (e: Expansion, quoted: boolean) => {
-    if (e.kind === "text") lit += e.text;
-    else if (e.kind === "var") {
+    if (e.kind === "text") {
+      lit += e.text;
+      if (e.quoted) quotedAny = true;
+    } else if (e.kind === "var") {
       flush();
-      parts.push({ name: e.name, quoted });
+      parts.push(e.op ? { name: e.name, quoted, op: e.op } : { name: e.name, quoted });
     } else appendUnknown(quoted, e.inner);
   };
 
@@ -443,11 +603,14 @@ function tokenize(src: string): Token[] {
       while (i + 1 < src.length && src[i + 1] !== "\n") i++;
       continue;
     }
+    // History expansion is off in the non-interactive shells that run these commands, but `!(`
+    // is an extended glob and `!!`/`!$` are worth no risk; `!=` is a comparison operator.
     if (
       char === "!" &&
-      !(active === false && (src[i + 1] === undefined || /\s/.test(src[i + 1] as string)))
+      !(active === false && (src[i + 1] === undefined || /\s/.test(src[i + 1] as string))) &&
+      src[i + 1] !== "="
     ) {
-      reject(); // history expansion and `!` inside words
+      reject();
     }
     if (char === " " || char === "\t") {
       endWord();
@@ -504,7 +667,15 @@ function tokenize(src: string): Token[] {
       continue;
     }
     if (char === "(") {
-      if (active || src[i + 1] === "(") reject();
+      // `name()` starts a function definition; the parser checks the rest.
+      const definition =
+        active &&
+        src[i + 1] === ")" &&
+        parts.length === 0 &&
+        !quotedAny &&
+        assignName === undefined &&
+        NAME.test(lit);
+      if ((active && !definition) || src[i + 1] === "(") reject();
       operator("(");
       continue;
     }
@@ -517,7 +688,9 @@ function tokenize(src: string): Token[] {
       // way the next word is the command, so a multi-digit prefix is not worth modelling.
       if (parts.length === 0 && /^[0-9]{2,}$/.test(lit)) reject();
     }
-    if (char === "{" || char === "}") braceChar = true;
+    if (char === "{") braceOpen = true;
+    else if (braceOpen && (char === "," || (char === "." && src[i + 1] === ".")))
+      braceExpansion = true;
     if (char === "*" || char === "?" || char === "[") globChar = true;
     if (char === ">" || char === "<") {
       if (src[i + 1] === "(") {
@@ -598,6 +771,20 @@ function tokenize(src: string): Token[] {
       headPlain = false;
     }
     if (assignName === undefined && !/[A-Za-z0-9_]/.test(char)) headPlain = false;
+    // An assignment value starting with `~` or `~/` is the home directory.
+    if (
+      char === "~" &&
+      assignName !== undefined &&
+      parts.length === 0 &&
+      lit === "" &&
+      !quotedAny &&
+      (src[i + 1] === undefined || /[/\s;&|)]/.test(src[i + 1] as string))
+    ) {
+      const path = homedir();
+      if (/[\s*?[\]'"$`~]/.test(path)) reject();
+      lit += path;
+      continue;
+    }
     lit += char;
     active = true;
   }
@@ -765,6 +952,24 @@ class Parser {
       return { kind: "subshell", body, redirects: this.redirects() };
     }
     const word = this.keyword(tok);
+    const open = this.tokens[this.pos + 1];
+    const close = this.tokens[this.pos + 2];
+    if (
+      word === undefined &&
+      tok?.t === "word" &&
+      open?.t === "op" &&
+      open.op === "(" &&
+      close?.t === "op" &&
+      close.op === ")"
+    ) {
+      const name = plainWord(tok.w);
+      if (name === undefined || !NAME.test(name) || depth >= MAX_DEPTH) reject();
+      this.pos += 3;
+      this.skipNewlines();
+      const body = this.command(depth + 1);
+      if ((body.kind !== "group" && body.kind !== "subshell") || body.redirects.length) reject();
+      return { kind: "function", name: name as string, body: body as Group | Subshell };
+    }
     if (word === undefined) return this.simple();
     if (depth >= MAX_DEPTH) reject();
     this.pos++;
@@ -801,7 +1006,13 @@ class Parser {
         this.expectKeyword("do");
         const body = this.list(new Set(["done"]), depth + 1);
         this.expectKeyword("done");
-        return { kind: "while", cond, body, redirects: this.redirects() };
+        return {
+          kind: "while",
+          cond,
+          body,
+          redirects: this.redirects(),
+          ...(word === "until" ? { until: true } : {}),
+        };
       }
       case "if": {
         const clauses: IfNode["clauses"] = [];

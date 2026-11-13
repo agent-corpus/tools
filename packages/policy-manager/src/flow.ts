@@ -1,11 +1,15 @@
+import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, posix, resolve } from "node:path";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
 import {
+  applyParamOp,
   type Command,
+  type FunctionNode,
   type ListNode,
+  type PipelineNode,
   parseScript,
   type Redir,
   type Simple,
@@ -33,25 +37,41 @@ const MAX_JUDGEMENTS = 400;
 const SIMPLE_VALUE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const UNSUPPORTED = "Unsupported shell syntax; expansions and subshells need human review";
+const MAX_CALL_DEPTH = 4;
+/** Positional parameters: never from the environment, unknown unless `set --` or a call set them. */
+const POSITIONAL = /^(?:[0-9]+|[@*])$/;
+/** Prefix of an entry in an assigned-name set that stands for a function definition. */
+const FUNCTION_MARK = "()";
 
 interface State {
   cwds: string[];
   /**
    * Variables the script assigned: their known values, or null when the value is unknown (it came
    * from a command, a glob or a loop). A name that is absent was never assigned here, so it is an
-   * environment variable of unknown content.
+   * environment variable of unknown content. A list with a value that is not a simple word (a
+   * loop item with spaces) is unknown everywhere except where `set --` splits it.
    */
   vars: Map<string, string[] | null>;
+  /** Functions the script defined; null when it may or may not be defined, or defined differently. */
+  funcs: Map<string, FunctionNode | null>;
 }
 interface Ctx {
   request: Request;
   profile: Profile;
   depth: number;
   loop: number;
+  /** Function calls in progress. */
+  calls: number;
+  /** False when the script could assign positional parameters through zsh's `argv` array. */
+  positional: boolean;
   box: { last?: Decision; calls: number };
 }
 
-const copy = (state: State): State => ({ cwds: [...state.cwds], vars: new Map(state.vars) });
+const copy = (state: State): State => ({
+  cwds: [...state.cwds],
+  vars: new Map(state.vars),
+  funcs: new Map(state.funcs),
+});
 
 function merge(a: State, b: State): State {
   const vars = new Map<string, string[] | null>();
@@ -61,12 +81,18 @@ function merge(a: State, b: State): State {
     const union = left && right ? [...new Set([...left, ...right])] : null;
     vars.set(name, union && union.length <= MAX_VARIANTS ? union : null);
   }
-  return { cwds: [...new Set([...a.cwds, ...b.cwds])], vars };
+  const funcs = new Map<string, FunctionNode | null>();
+  for (const name of new Set([...a.funcs.keys(), ...b.funcs.keys()])) {
+    const left = a.funcs.get(name);
+    funcs.set(name, left && left === b.funcs.get(name) ? left : null);
+  }
+  return { cwds: [...new Set([...a.cwds, ...b.cwds])], vars, funcs };
 }
 
 function replace(target: State, source: State): void {
   target.cwds = source.cwds;
   target.vars = source.vars;
+  target.funcs = source.funcs;
 }
 
 // --- words ------------------------------------------------------------------------------------
@@ -97,28 +123,63 @@ const ENVIRONMENT_OK = new Set([
   "LINES",
 ]);
 
+/**
+ * Programs whose output depends only on their literal arguments (and the directory), so a
+ * substitution of one can be computed: `$(dirname /a/b)` is `/a`. A function of the same name
+ * replaces the program, so a defined one makes the output unknown again.
+ */
+const PURE = new Set(["dirname", "basename", "pwd"]);
+const pureCache = new Map<string, Simple | null>();
+
+/** The single `dirname x`, `basename x [suffix]` or `pwd` command a substitution runs, if it is. */
+function pureCommand(inner: string): Simple | undefined {
+  let cached = pureCache.get(inner);
+  if (cached === undefined) {
+    const script = parseScript(inner);
+    const item = script?.items.length === 1 ? script.items[0] : undefined;
+    const node = item && !item.background && !item.node.rest.length ? item.node.first : undefined;
+    const stage = node && !node.negated && node.stages.length === 1 ? node.stages[0] : undefined;
+    const name = stage?.kind === "simple" ? plainText(stage.argv[0]) : undefined;
+    cached =
+      stage?.kind === "simple" &&
+      name !== undefined &&
+      PURE.has(name) &&
+      !stage.assigns.length &&
+      !stage.redirects.length &&
+      stage.argv.every((w) => !w.subs.length && !w.glob)
+        ? stage
+        : null;
+    if (pureCache.size > 256) pureCache.clear();
+    pureCache.set(inner, cached);
+  }
+  return cached ?? undefined;
+}
+
+function wordNames(word: Word, out: Set<string>): void {
+  for (const part of word.parts)
+    if (typeof part === "object" && "name" in part) out.add(part.name);
+    else if (typeof part === "object" && part.inner !== undefined) {
+      const pure = pureCommand(part.inner);
+      if (pure) for (const w of pure.argv) wordNames(w, out);
+    }
+}
+
 function environmentRefs(ctx: Ctx, words: Word[], state: State): Decision | undefined {
-  for (const word of words)
-    for (const part of word.parts)
-      if (
-        typeof part === "object" &&
-        "name" in part &&
-        !state.vars.has(part.name) &&
-        !ENVIRONMENT_OK.has(part.name)
-      )
-        return human(
-          ctx.request,
-          "unknown",
-          "An environment variable of unknown content requires human review",
-        );
+  const names = new Set<string>();
+  for (const word of words) wordNames(word, names);
+  for (const name of names)
+    if (!state.vars.has(name) && !ENVIRONMENT_OK.has(name) && !POSITIONAL.test(name))
+      return human(
+        ctx.request,
+        "unknown",
+        "An environment variable of unknown content requires human review",
+      );
   return undefined;
 }
 
 function knownVariables(words: Word[], state: State): Map<string, string[]> {
   const names = new Set<string>();
-  for (const word of words)
-    for (const part of word.parts)
-      if (typeof part === "object" && "name" in part) names.add(part.name);
+  for (const word of words) wordNames(word, names);
   const known = [...names].filter((name) => isKnown(state.vars.get(name)));
   const size = (list: string[]) => list.reduce((n, k) => n * (state.vars.get(k)?.length ?? 1), 1);
   known.sort((a, b) => (state.vars.get(b)?.length ?? 0) - (state.vars.get(a)?.length ?? 0));
@@ -133,23 +194,58 @@ function combinations(known: Map<string, string[]>): Array<Record<string, string
   return out;
 }
 
+/** Output of a pure substitution for one choice of values, or undefined when it is unknown. */
+function pureOutput(
+  inner: string,
+  known: Map<string, string[]>,
+  env: Record<string, string>,
+  state: State,
+): string | undefined {
+  const command = pureCommand(inner);
+  const name = command ? plainText(command.argv[0]) : undefined;
+  if (!command || name === undefined || state.funcs.has(name)) return undefined;
+  const args: string[] = [];
+  for (const word of command.argv.slice(1)) {
+    const { text } = instantiate(word, known, env, state);
+    if (!SIMPLE_VALUE.test(text) || text.startsWith("-")) return undefined;
+    args.push(text);
+  }
+  let output: string | undefined;
+  if (name === "pwd") output = args.length === 0 && state.cwds.length === 1 ? state.cwds[0] : "";
+  else if (name === "dirname" && args.length === 1) output = posix.dirname(args[0] as string);
+  else if (name === "basename" && (args.length === 1 || args.length === 2)) {
+    const [path, suffix] = args as [string, string | undefined];
+    const base = posix.basename(path);
+    output =
+      suffix && base !== suffix && base.endsWith(suffix) ? base.slice(0, -suffix.length) : base;
+  }
+  return output && SIMPLE_VALUE.test(output) ? output : undefined;
+}
+
 /** Text of a word for one choice of variable values; unknown parts become SUBSTITUTION. */
 function instantiate(
   word: Word,
   known: Map<string, string[]>,
   env: Record<string, string>,
+  state?: State,
 ): { text: string; loose: boolean } {
   let text = "";
   let loose = false;
   for (const part of word.parts) {
     if (typeof part === "string") text += part;
     else if ("unknown" in part) {
-      text += SUBSTITUTION;
-      loose ||= !part.quoted;
-    } else if (known.has(part.name)) text += env[part.name] ?? "";
+      const output =
+        state && part.inner !== undefined ? pureOutput(part.inner, known, env, state) : undefined;
+      if (output !== undefined) text += output;
+      else {
+        text += SUBSTITUTION;
+        loose ||= !part.quoted;
+      }
+    } else if (known.has(part.name)) text += applyParamOp(env[part.name] ?? "", part.op);
     else {
       text += SUBSTITUTION;
-      loose ||= !part.quoted;
+      // "$@" is one word per parameter even when quoted.
+      loose ||= !part.quoted || part.name === "@";
     }
   }
   return { text, loose };
@@ -200,7 +296,7 @@ function runRedirects(ctx: Ctx, redirs: Redir[], state: State): Decision | undef
   for (const env of combinations(known))
     for (const redir of redirs) {
       if (!redir.target) continue;
-      const redirect = toRedirect(redir, instantiate(redir.target, known, env).text);
+      const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
       if (!redirect) continue;
       for (const cwd of state.cwds) {
         const check = redirectDecision(ctx.request, redirect, ctx.profile, cwd);
@@ -260,13 +356,25 @@ function printTargets(args: Array<string | undefined>): { names: string[]; unrea
   return { names, unreadable: false };
 }
 
-function assignedInSimple(node: Simple, out: Set<string>): void {
+type Funcs = Map<string, FunctionNode | null>;
+/** `$@` and `$*` are never stored, so they stay unknown (and `*` is the forget-everything mark). */
+const POSITIONAL_NAMES = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+function assignedInSimple(node: Simple, out: Set<string>, funcs?: Funcs, seen?: Set<string>): void {
   if (!node.argv.length) {
     for (const a of node.assigns) out.add(a.name);
     return;
   }
-  const name = basename(plainText(node.argv[0]) ?? "");
+  const literal = plainText(node.argv[0]);
+  const fn = literal === undefined ? undefined : funcs?.get(literal);
+  if (literal !== undefined && fn && !seen?.has(literal)) {
+    // A call runs the body in this shell, so what the body assigns is assigned here.
+    const visited = new Set([...(seen ?? []), literal]);
+    assignedInList(fn.body.body, out, funcs, visited);
+  } else if (literal !== undefined && fn === null) out.add("*");
+  const name = basename(literal ?? "");
   const args = node.argv.slice(1).map(plainText);
+  if (name === "set" || name === "shift") for (const p of POSITIONAL_NAMES) out.add(p);
   if (SPECIAL_BUILTINS.has(name)) for (const a of node.assigns) out.add(a.name);
   if (name === "export")
     for (const arg of args) {
@@ -286,47 +394,66 @@ function assignedInSimple(node: Simple, out: Set<string>): void {
   if (name === "read") out.add("REPLY");
 }
 
-function assignedInList(list: ListNode, out: Set<string>): void {
+/**
+ * Names a list may assign, plus FUNCTION_MARK + name for each function it may define. With `funcs`,
+ * a call to a known function counts what its body assigns.
+ */
+function assignedInList(list: ListNode, out: Set<string>, funcs?: Funcs, seen?: Set<string>): void {
   for (const item of list.items) {
     const nodes = [item.node.first, ...item.node.rest.map((r) => r.node)];
-    for (const node of nodes) for (const stage of node.stages) assignedInCommand(stage, out);
+    for (const node of nodes)
+      for (const stage of node.stages) assignedInCommand(stage, out, funcs, seen);
   }
 }
 
-function assignedInCommand(command: Command, out: Set<string>): void {
+function assignedInCommand(
+  command: Command,
+  out: Set<string>,
+  funcs?: Funcs,
+  seen?: Set<string>,
+): void {
+  const list = (l: ListNode) => assignedInList(l, out, funcs, seen);
   switch (command.kind) {
     case "simple":
-      assignedInSimple(command, out);
+      assignedInSimple(command, out, funcs, seen);
       return;
     case "subshell":
     case "group":
-      assignedInList(command.body, out);
+      list(command.body);
       return;
     case "for":
       out.add(command.name);
-      assignedInList(command.body, out);
+      list(command.body);
       return;
     case "while":
-      assignedInList(command.cond, out);
-      assignedInList(command.body, out);
+      list(command.cond);
+      list(command.body);
       return;
     case "if":
       for (const clause of command.clauses) {
-        assignedInList(clause.cond, out);
-        assignedInList(clause.body, out);
+        list(clause.cond);
+        list(clause.body);
       }
-      if (command.otherwise) assignedInList(command.otherwise, out);
+      if (command.otherwise) list(command.otherwise);
       return;
     case "case":
-      for (const branch of command.branches) assignedInList(branch.body, out);
+      for (const branch of command.branches) list(branch.body);
+      return;
+    case "function":
+      out.add(FUNCTION_MARK + command.name);
       return;
   }
 }
 
-/** An assignment to a name the analysis could not read (`*`) makes every variable unknown. */
+/**
+ * An assignment to a name the analysis could not read (`*`) makes every variable unknown; a
+ * function that may have been redefined becomes uncertain.
+ */
 function forget(state: State, names: Set<string>): void {
+  for (const name of names)
+    if (name.startsWith(FUNCTION_MARK)) state.funcs.set(name.slice(FUNCTION_MARK.length), null);
   if (names.has("*")) state.vars.clear();
-  else for (const name of names) state.vars.set(name, null);
+  else for (const name of names) if (!name.startsWith(FUNCTION_MARK)) state.vars.set(name, null);
 }
 
 // --- simple commands --------------------------------------------------------------------------
@@ -405,14 +532,14 @@ function runSimple(
   const build = (env: Record<string, string>): SimpleCommand => {
     const loose: boolean[] = [];
     const argv = node.argv.map((word) => {
-      const expanded = instantiate(word, known, env);
+      const expanded = instantiate(word, known, env, state);
       loose.push(expanded.loose);
       return expanded.text;
     });
     const redirects: Redirect[] = [];
     for (const redir of node.redirects) {
       if (!redir.target) continue;
-      const redirect = toRedirect(redir, instantiate(redir.target, known, env).text);
+      const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
       if (redirect) redirects.push(redirect);
     }
     // Standard input is the heredoc or here-string only when nothing else also feeds it: a later
@@ -424,9 +551,9 @@ function runSimple(
     const only = inputs.length === 1 ? inputs[0] : undefined;
     if (only?.op === "<<") stdin = only.body ?? "";
     else if (only?.op === "<<<" && only.target)
-      stdin = `${instantiate(only.target, known, env).text}\n`;
+      stdin = `${instantiate(only.target, known, env, state).text}\n`;
     return {
-      env: node.assigns.map((a) => [a.name, instantiate(a.value, known, env).text]),
+      env: node.assigns.map((a) => [a.name, instantiate(a.value, known, env, state).text]),
       argv,
       redirects,
       subs: [],
@@ -437,14 +564,42 @@ function runSimple(
 
   // A builtin the analysis must track can hide behind a variable (`X=cd; $X /etc`) or a wrapper
   // that runs it in the current shell (`command cd /etc`, `time cd /etc`).
+  // Likewise a function: `time f` and `X=f; $X` run it, and only a direct call is followed.
   for (const env of envs) {
-    const effective = basename(unwrap(build(env).argv).argv[0] ?? "");
+    const argv = build(env).argv;
+    const effective = basename(unwrap(argv).argv[0] ?? "");
     if (STATEFUL.has(effective) && name !== effective)
       return human(
         request,
         "unknown",
         "A builtin behind a variable or wrapper requires human review",
       );
+    if (
+      (state.funcs.has(effective) && literal !== effective) ||
+      (state.funcs.has(argv[0] ?? "") && literal !== argv[0])
+    )
+      return human(
+        request,
+        "unknown",
+        "A function behind a variable or wrapper requires human review",
+      );
+  }
+  if (literal !== undefined && state.funcs.has(literal)) {
+    const fn = state.funcs.get(literal);
+    if (!fn)
+      return human(
+        request,
+        "unknown",
+        "A function that may or may not be defined here requires human review",
+      );
+    return callFunction(ctx, node, fn, state, known, envs);
+  }
+  if (literal === "set" && plainText(node.argv[1]) === "--" && !node.assigns.length) {
+    const refusal = runRedirects(ctx, node.redirects, state);
+    if (refusal) return refusal;
+    setPositional(ctx, state, node.argv.slice(2), known, envs);
+    ctx.box.last = result(request, "code-read", "Positional parameters", true);
+    return undefined;
   }
 
   if (!node.argv.length) {
@@ -457,7 +612,7 @@ function runSimple(
     for (const env of envs)
       for (const redir of node.redirects) {
         if (!redir.target) continue;
-        const redirect = toRedirect(redir, instantiate(redir.target, known, env).text);
+        const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
         if (!redirect) continue;
         for (const cwd of state.cwds) {
           const check = redirectDecision(request, redirect, profile, cwd);
@@ -465,7 +620,7 @@ function runSimple(
         }
       }
     for (const a of node.assigns) {
-      const texts = envs.map((env) => instantiate(a.value, known, env).text);
+      const texts = envs.map((env) => instantiate(a.value, known, env, state).text);
       if (texts.length && texts.every((t) => SIMPLE_VALUE.test(t))) {
         const set = [...new Set(texts)];
         if (set.length <= MAX_VARIANTS) {
@@ -493,6 +648,8 @@ function runSimple(
   // A prefix assignment before a special builtin outlives the command in some shells.
   if (name && SPECIAL_BUILTINS.has(name))
     for (const a of node.assigns) state.vars.set(a.name, null);
+  // `shift` moves every positional parameter down.
+  if (name === "shift") for (const p of POSITIONAL_NAMES) state.vars.set(p, null);
   if (name === "cd") return changeDirectory(ctx, state, piped, envs, build);
   if (name === "export") return exportVariables(ctx, node, state, piped, known, envs);
   if (name === "unset" || name === "read" || name === "printf" || name === "print") {
@@ -582,12 +739,288 @@ function exportVariables(
     }
     if (BANNED_ENV.test(assignment.name))
       return human(request, "unknown", "Environment override requires human review");
-    const texts = envs.map((env) => instantiate(assignment.value, known, env).text);
+    const texts = envs.map((env) => instantiate(assignment.value, known, env, state).text);
     if (texts.length && texts.every((t) => SIMPLE_VALUE.test(t)))
       state.vars.set(assignment.name, [...new Set(texts)]);
     else state.vars.set(assignment.name, null);
   }
   return undefined;
+}
+
+// --- positional parameters and functions ------------------------------------------------------
+
+function clearPositional(state: State): Map<string, string[] | null> {
+  const saved = new Map<string, string[] | null>();
+  for (const [name, values] of state.vars)
+    if (/^[0-9]+$/.test(name)) {
+      saved.set(name, values);
+      state.vars.delete(name);
+    }
+  return saved;
+}
+
+/**
+ * The values each argument word gives, in order. A word that could split into a different number
+ * of words (an unquoted unknown, a glob) makes every later position unknown; an unquoted variable
+ * whose known values are several plain words separated by blanks is split as the shell would.
+ */
+function argumentSlots(
+  words: Word[],
+  state: State,
+  known: Map<string, string[]>,
+  envs: Array<Record<string, string>>,
+): Array<string[] | null> {
+  const slots: Array<string[] | null> = [];
+  const add = (values: Set<string>) =>
+    slots.push(
+      values.size <= MAX_VARIANTS && [...values].every((v) => SIMPLE_VALUE.test(v))
+        ? [...values]
+        : null,
+    );
+  for (const word of words) {
+    const only = word.parts.length === 1 ? word.parts[0] : undefined;
+    const ref =
+      typeof only === "object" && "name" in only && !only.quoted && !only.op ? only : undefined;
+    const raw = ref ? state.vars.get(ref.name) : undefined;
+    if (raw?.length && !raw.every((value) => SIMPLE_VALUE.test(value))) {
+      const fields = raw.map((value) => value.split(/[ \t\n]+/).filter(Boolean));
+      if (fields.some((list) => !list.length || list.some((f) => !SIMPLE_VALUE.test(f))))
+        return slots;
+      const counts = new Set(fields.map((list) => list.length));
+      const shortest = Math.min(...counts);
+      for (let k = 0; k < shortest; k++) add(new Set(fields.map((list) => list[k] as string)));
+      if (counts.size > 1) return slots;
+      continue;
+    }
+    const texts = envs.map((env) => instantiate(word, known, env, state));
+    if (word.glob || texts.some((t) => t.loose)) return slots;
+    add(new Set(texts.map((t) => t.text)));
+  }
+  return slots;
+}
+
+/** Stores positional values; with tracking off (the script names zsh's `argv`) they are unknown. */
+function bindPositional(ctx: Ctx, state: State, slots: Array<string[] | null>): void {
+  for (const [index, values] of slots.entries())
+    if (index < POSITIONAL_NAMES.length)
+      state.vars.set(String(index + 1), ctx.positional ? values : null);
+}
+
+function setPositional(
+  ctx: Ctx,
+  state: State,
+  words: Word[],
+  known: Map<string, string[]>,
+  envs: Array<Record<string, string>>,
+): void {
+  const slots = argumentSlots(words, state, known, envs);
+  clearPositional(state);
+  bindPositional(ctx, state, slots);
+}
+
+/**
+ * A call runs the body in this shell with the arguments as positional parameters; the caller's
+ * parameters come back afterwards. Words were already checked by the caller.
+ */
+function callFunction(
+  ctx: Ctx,
+  node: Simple,
+  fn: FunctionNode,
+  state: State,
+  known: Map<string, string[]>,
+  envs: Array<Record<string, string>>,
+): Decision | undefined {
+  const { request } = ctx;
+  if (node.assigns.length)
+    return human(request, "unknown", "An assignment before a function call requires human review");
+  if (ctx.calls >= MAX_CALL_DEPTH)
+    return human(request, "unknown", "Function calls are nested too deeply");
+  const refusal = runRedirects(ctx, node.redirects, state);
+  if (refusal) return refusal;
+  const slots = argumentSlots(node.argv.slice(1), state, known, envs);
+  const saved = clearPositional(state);
+  bindPositional(ctx, state, slots);
+  const inner = { ...ctx, calls: ctx.calls + 1 };
+  const target = fn.body.kind === "subshell" ? copy(state) : state;
+  const body = runList(inner, fn.body.body, target);
+  if (body) return body;
+  clearPositional(state);
+  for (const [name, values] of saved) state.vars.set(name, values);
+  return undefined;
+}
+
+/**
+ * Names a shell may resolve before a function of the same name: zsh reserved words and precommand
+ * modifiers, and other builtins that run or look up commands.
+ */
+const NOT_A_FUNCTION = new Set([
+  "time",
+  "command",
+  "builtin",
+  "exec",
+  "noglob",
+  "nocorrect",
+  "coproc",
+  "nohup",
+  "source",
+  "eval",
+  "type",
+  "whence",
+  "which",
+  "hash",
+  "enable",
+  "disable",
+  "autoload",
+  "functions",
+  "unfunction",
+  "alias",
+]);
+
+function defineFunction(ctx: Ctx, node: FunctionNode, state: State): Decision | undefined {
+  // sh and dash find a special builtin before a function, so the call would not be followed.
+  if (
+    SPECIAL_BUILTINS.has(node.name) ||
+    STATEFUL.has(node.name) ||
+    NOT_A_FUNCTION.has(node.name) ||
+    BANNED_ENV.test(node.name)
+  )
+    return human(ctx.request, "unknown", "A function named like a builtin requires human review");
+  state.funcs.set(node.name, node);
+  ctx.box.last = result(ctx.request, "code-read", "Function definition", true);
+  return undefined;
+}
+
+/** Programs that never read standard input. */
+const NO_INPUT = new Set([
+  "echo",
+  "printf",
+  "true",
+  "false",
+  "test",
+  "[",
+  ":",
+  "basename",
+  "dirname",
+  "pwd",
+  "sleep",
+  "ls",
+  "mkdir",
+]);
+const GH_NO_INPUT = new Set([
+  "pr view",
+  "pr list",
+  "pr checks",
+  "pr diff",
+  "issue view",
+  "issue list",
+  "run view",
+  "run list",
+  "repo view",
+  "release view",
+  "release list",
+]);
+
+/**
+ * True when nothing in the list can read the standard input it inherits. A loop body that reads
+ * it would consume part of what `read` was going to see, so `read` could return any part of a line.
+ */
+function readsNoInput(list: ListNode, funcs: Funcs): boolean {
+  const words = (w: Word[]) =>
+    w.every((word) =>
+      word.subs.every((inner) => {
+        const script = parseScript(inner);
+        return !!script && readsNoInput(script, funcs);
+      }),
+    );
+  const ownInput = (redirs: Redir[]) =>
+    redirs.some((r) => r.fd === "0" && (r.op === "<" || r.op === "<<" || r.op === "<<<"));
+  const command = (c: Command): boolean => {
+    if (c.kind !== "function" && !words(c.redirects.flatMap((r) => (r.target ? [r.target] : []))))
+      return false;
+    switch (c.kind) {
+      case "simple": {
+        if (!words([...c.argv, ...c.assigns.map((a) => a.value)])) return false;
+        if (!c.argv.length || ownInput(c.redirects)) return true;
+        const [program, first, second] = c.argv.slice(0, 3).map(plainText);
+        if (program === undefined || funcs.has(program)) return false;
+        return NO_INPUT.has(program) || (program === "gh" && GH_NO_INPUT.has(`${first} ${second}`));
+      }
+      case "function":
+        return true;
+      case "for":
+        return words(c.words) && (ownInput(c.redirects) || readsNoInput(c.body, funcs));
+      case "case":
+        return (
+          words([c.word]) &&
+          (ownInput(c.redirects) || c.branches.every((b) => readsNoInput(b.body, funcs)))
+        );
+      case "if":
+        return (
+          ownInput(c.redirects) ||
+          (c.clauses.every((cl) => readsNoInput(cl.cond, funcs) && readsNoInput(cl.body, funcs)) &&
+            (!c.otherwise || readsNoInput(c.otherwise, funcs)))
+        );
+      case "while":
+        return (
+          ownInput(c.redirects) || (readsNoInput(c.cond, funcs) && readsNoInput(c.body, funcs))
+        );
+      case "subshell":
+      case "group":
+        return ownInput(c.redirects) || readsNoInput(c.body, funcs);
+    }
+  };
+  return list.items.every((item) =>
+    [item.node.first, ...item.node.rest.map((r) => r.node)].every((p) => p.stages.every(command)),
+  );
+}
+
+/**
+ * `while read a b; do ...; done <<< 'literal'` (or a quoted heredoc): what `read` assigns for each
+ * line of the input.
+ */
+function readValues(
+  node: Extract<Command, { kind: "while" }>,
+  state: State,
+): Array<Map<string, string[] | null>> | undefined {
+  if (node.until || !readsNoInput(node.body, state.funcs)) return undefined;
+  const item = node.cond.items.length === 1 ? node.cond.items[0] : undefined;
+  const pipeline = item && !item.background && !item.node.rest.length ? item.node.first : undefined;
+  const stage = pipeline?.stages.length === 1 && !pipeline.negated ? pipeline.stages[0] : undefined;
+  if (stage?.kind !== "simple" || stage.assigns.length || stage.redirects.length) return undefined;
+  const args = stage.argv.map(plainText);
+  if (args[0] !== "read") return undefined;
+  const raw = args.includes("-r");
+  const names = args.slice(1).filter((a) => a !== "-r");
+  if (!names.length || names.some((n) => n === undefined || !NAME.test(n) || BANNED_ENV.test(n)))
+    return undefined;
+  const inputs = node.redirects.filter((r) => r.fd === "0");
+  const input = inputs.length === 1 ? inputs[0] : undefined;
+  let text: string | undefined;
+  if (input?.op === "<<") text = `${input.body ?? ""}\n`;
+  else if (input?.op === "<<<" && input.target) {
+    const known = knownVariables([input.target], state);
+    const envs = combinations(known);
+    if (envs.length !== 1) return undefined;
+    text = `${instantiate(input.target, known, envs[0] as Record<string, string>, state).text}\n`;
+  }
+  if (text === undefined || text.includes(SUBSTITUTION) || (!raw && text.includes("\\")))
+    return undefined;
+  const lines = text.split("\n").slice(0, -1);
+  if (!lines.length || lines.length > MAX_VARIANTS) return undefined;
+  return lines.map((line) => {
+    const out = new Map<string, string[] | null>();
+    let rest = line.replace(/^[ \t]+|[ \t]+$/g, "");
+    for (const [index, name] of (names as string[]).entries()) {
+      let value = rest;
+      if (index < names.length - 1) {
+        const match = /^(\S*)[ \t]*(.*)$/.exec(rest) as RegExpExecArray;
+        value = match[1] as string;
+        rest = match[2] as string;
+      }
+      out.set(name as string, SIMPLE_VALUE.test(value) ? [value] : null);
+    }
+    return out;
+  });
 }
 
 // --- compound commands ------------------------------------------------------------------------
@@ -614,6 +1047,8 @@ function runCommand(
       return runIf(ctx, command, state);
     case "case":
       return runCase(ctx, command, state);
+    case "function":
+      return defineFunction(ctx, command, state);
   }
 }
 
@@ -637,18 +1072,30 @@ function runFor(
   let unknown = false;
   for (const env of combinations(known))
     for (const word of node.words) {
-      const text = instantiate(word, known, env).text;
-      if (SIMPLE_VALUE.test(text)) values.add(text);
+      const text = instantiate(word, known, env, state).text;
+      // A quoted item of several plain words ("o/r 12") is kept for `set -- $item` to split.
+      const fields = text.split(/[ \t\n]+/).filter(Boolean);
+      if (
+        SIMPLE_VALUE.test(text) ||
+        (word.quoted && fields.length && fields.every((f) => SIMPLE_VALUE.test(f)))
+      )
+        values.add(text);
       else unknown = true;
     }
   if (!values.size || values.size > MAX_VARIANTS) unknown = true;
   const changed = new Set<string>([node.name]);
-  assignedInList(node.body, changed);
-  const inner = copy(state);
-  forget(inner, changed);
-  inner.vars.set(node.name, unknown ? null : [...values]);
-  const body = runList({ ...ctx, loop: ctx.loop + 1 }, node.body, inner);
-  if (body) return body;
+  assignedInList(node.body, changed, state.funcs);
+  // Each pass is judged on its own, from a start where everything the body assigns is unknown, so
+  // values that belong together (the words of one item) stay together.
+  for (const value of unknown ? [null] : [...values]) {
+    if (++ctx.box.calls > MAX_JUDGEMENTS)
+      return human(ctx.request, "unknown", "Too many commands to verify");
+    const inner = copy(state);
+    forget(inner, changed);
+    inner.vars.set(node.name, value === null ? null : [value]);
+    const body = runList({ ...ctx, loop: ctx.loop + 1 }, node.body, inner);
+    if (body) return body;
+  }
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -659,13 +1106,22 @@ function runWhile(
   state: State,
 ): Decision | undefined {
   const changed = new Set<string>();
-  assignedInList(node.cond, changed);
-  assignedInList(node.body, changed);
+  assignedInList(node.cond, changed, state.funcs);
+  assignedInList(node.body, changed, state.funcs);
   const inner = copy(state);
   forget(inner, changed);
   const loop = { ...ctx, loop: ctx.loop + 1 };
-  const refusal = runList(loop, node.cond, inner) ?? runList(loop, node.body, inner);
+  const refusal = runList(loop, node.cond, inner);
   if (refusal) return refusal;
+  // With literal input, each pass is judged with what `read` took from its line.
+  for (const line of readValues(node, state) ?? [undefined]) {
+    if (++ctx.box.calls > MAX_JUDGEMENTS)
+      return human(ctx.request, "unknown", "Too many commands to verify");
+    const pass = line ? copy(inner) : inner;
+    if (line) for (const [name, values] of line) pass.vars.set(name, values);
+    const body = runList(loop, node.body, pass);
+    if (body) return body;
+  }
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -680,10 +1136,12 @@ function runIf(
   for (const [index, clause] of node.clauses.entries()) {
     // The first condition always runs; later ones only when every earlier one failed.
     const conditionState = index === 0 ? current : copy(current);
-    const refusal = runList(ctx, clause.cond, conditionState);
+    const outcome: { success?: State } = {};
+    const refusal = runList(ctx, clause.cond, conditionState, outcome);
     if (refusal) return refusal;
     if (index > 0) current = merge(current, conditionState);
-    const taken = copy(current);
+    // The body runs only when the condition succeeded: an `a && b` condition ran both.
+    const taken = copy(outcome.success ?? current);
     const body = runList(ctx, clause.body, taken);
     if (body) return body;
     branches.push(taken);
@@ -729,27 +1187,67 @@ function runCase(
 
 // --- lists, pipelines and the entry point -----------------------------------------------------
 
-function runList(ctx: Ctx, list: ListNode, state: State): Decision | undefined {
-  for (const item of list.items) {
+/**
+ * True when the pipeline always succeeds: `true`, `:`, or `cd` to an absolute directory that exists
+ * and can be entered now. Only used to know that an `&&` chain goes on past it; the directory it
+ * started from is still kept as possible.
+ */
+function cannotFail(node: PipelineNode, state: State): boolean {
+  const stage = node.stages.length === 1 && !node.negated ? node.stages[0] : undefined;
+  if (stage?.kind !== "simple" || stage.assigns.length || stage.redirects.length) return false;
+  const argv = stage.argv.map(plainText);
+  const [program, target] = argv;
+  if (program === undefined || state.funcs.has(program)) return false;
+  if ((program === "true" || program === ":") && argv.length === 1) return true;
+  if (program !== "cd" || argv.length !== 2 || target === undefined) return false;
+  const path =
+    target === "~" || target.startsWith("~/") ? join(homedir(), target.slice(1)) : target;
+  if (!path.startsWith("/") || /[*?[\]]/.test(path)) return false;
+  try {
+    if (!statSync(path).isDirectory()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** With `outcome`, also reports the state when the list's exit status is success. */
+function runList(
+  ctx: Ctx,
+  list: ListNode,
+  state: State,
+  outcome?: { success?: State },
+): Decision | undefined {
+  for (const [index, item] of list.items.entries()) {
+    const last = index === list.items.length - 1;
     // A background job runs in a subshell of its own.
     const target = item.background ? copy(state) : state;
     const { first, rest } = item.node;
     const refusal = runPipeline(ctx, first, target);
     if (refusal) return refusal;
-    if (!rest.length) continue;
+    if (!rest.length) {
+      if (last && outcome) outcome.success = copy(item.background ? state : target);
+      continue;
+    }
     // In `a && b || c` each later command runs only if the ones before it did, so it sees their
     // effects, but the chain may stop after any of them: the state afterwards is every prefix's.
+    // An all-`&&` chain cannot stop after a step that cannot fail, and succeeds only at the end.
+    const chain = rest.every((r) => r.op === "&&");
     let running = copy(target);
-    let possible = copy(target);
-    for (const next of rest) {
+    let possible = chain && cannotFail(first, target) ? undefined : copy(target);
+    for (const [step, next] of rest.entries()) {
       running = copy(running);
       const skipped = runPipeline(ctx, next.node, running);
       if (skipped) return skipped;
-      possible = merge(possible, running);
-      if (possible.cwds.length > MAX_DIRECTORIES)
+      if (!chain || step === rest.length - 1 || !cannotFail(next.node, running))
+        possible = possible ? merge(possible, running) : copy(running);
+      if (possible && possible.cwds.length > MAX_DIRECTORIES)
         return human(ctx.request, "unknown", "Too many directory changes to verify");
     }
-    replace(target, possible);
+    if (last && outcome)
+      outcome.success = copy(item.background ? state : chain ? running : (possible as State));
+    replace(target, possible as State);
   }
   return undefined;
 }
@@ -758,7 +1256,7 @@ function runPipeline(ctx: Ctx, node: { stages: Command[] }, state: State): Decis
   if (node.stages.length === 1) return runCommand(ctx, node.stages[0] as Command, state, 0, false);
   const changed = new Set<string>();
   for (const [index, stage] of node.stages.entries()) {
-    assignedInCommand(stage, changed);
+    assignedInCommand(stage, changed, state.funcs);
     const refusal = runCommand(ctx, stage, copy(state), index, true);
     if (refusal) return refusal;
   }
@@ -781,7 +1279,15 @@ export function commandDecision(
 ): Decision {
   const script = parseScript(command);
   if (!script) return human(request, "unknown", UNSUPPORTED);
-  const ctx: Ctx = { request, profile, depth, loop: 0, box: { calls: 0 } };
-  const refusal = runList(ctx, script, { cwds: [...start], vars: new Map() });
+  const ctx: Ctx = {
+    request,
+    profile,
+    depth,
+    loop: 0,
+    calls: 0,
+    positional: !/argv/.test(command),
+    box: { calls: 0 },
+  };
+  const refusal = runList(ctx, script, { cwds: [...start], vars: new Map(), funcs: new Map() });
   return refusal ?? ctx.box.last ?? human(request, "unknown", "Empty command");
 }
