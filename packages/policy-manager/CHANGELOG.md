@@ -1,5 +1,19 @@
 # @agent-corpus/policy-manager
 
+## 0.6.0
+
+### Minor Changes
+
+- [#32](https://github.com/agent-corpus/tools/pull/32) [`ff0df6b`](https://github.com/agent-corpus/tools/commit/ff0df6b3158bc883faa5bceb365d3e30916bfb79) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Codex no longer reports "unsupported permissionDecision:allow" on every approved tool call: an approval now sends no decision, and Codex's own prompt is approved through `PermissionRequest`. A session can now edit another repository's linked feature worktree with `cd <worktree> && ...` and create worktrees under `.worktrees/` or `.claude/worktrees/` from any clone, while writes to a main checkout still go to a person.
+
+- [#28](https://github.com/agent-corpus/tools/pull/28) [`dbbba05`](https://github.com/agent-corpus/tools/commit/dbbba058a6859f496fec7f20cfa53cf8dad8b39d) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Profiles can list read-only MCP tools in `mcpReadOnly` (exact `mcp__<server>__<tool>` names, or a tool-name prefix ending in `*`), and those tools run without a prompt; unlisted MCP tools are left to the harness's own permission flow. `setup-hook-claude` and `setup-hook-codex` add `mcp__.*` to the `PreToolUse` matcher (Codex users re-trust the hook in `/hooks`); Copilot is not supported.
+
+- [#29](https://github.com/agent-corpus/tools/pull/29) [`d0d341b`](https://github.com/agent-corpus/tools/commit/d0d341b738acc570cd50166a94904f6330c163ce) Thanks [@charlesprakash](https://github.com/charlesprakash)! - The permissive profile no longer prompts for deletions that can be undone or thrown away. This covers removing committed files or files the session itself created, and `git reset --hard`, `checkout --` or `restore` that discard nothing, all in a feature worktree. Other file deletions inside a feature worktree are approved only when the session classifier judges them recoverable. History, remote, cloud and publishing operations still go to a person.
+
+- [#31](https://github.com/agent-corpus/tools/pull/31) [`922639d`](https://github.com/agent-corpus/tools/commit/922639d8cb6b3fc2eaa6b538b8e68e537e4f3ba3) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Permissive mode now judges shell functions, `set --`, `for` loops over quoted items, `while read` over literal input, `${X%/*}`-style parameter forms and `$'...'` instead of sending them to a human. Unknown values still never become a program, option or path.
+
+- [#30](https://github.com/agent-corpus/tools/pull/30) [`b56b262`](https://github.com/agent-corpus/tools/commit/b56b2623df63b80602666eccb6b14ca21a0d904d) Thanks [@charlesprakash](https://github.com/charlesprakash)! - The permissive profile now approves writes to the system temp directory and deletions inside scratch or temp directories without asking, while policy state, repositories, and credential or protected paths stay guarded. The classification prompt reads as an instruction (`Needs classification (not an error)`), states the approval rule, and survives a retry with a different command description.
+
 ## 0.5.0
 
 ### Minor Changes
