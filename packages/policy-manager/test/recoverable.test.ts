@@ -4,6 +4,7 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -322,6 +323,73 @@ describe("files this session created", () => {
     } finally {
       git(wt, ["reset", "-q", "--hard", "HEAD"]);
       cleanup("f.txt");
+    }
+  });
+
+  test("mv or a patch move of someone else's file does not make it the session's", () => {
+    const s = session();
+    write(join(wt, "notes.md"), "user notes");
+    write(join(wt, "notes2.md"), "more user notes");
+    const mv = bash(s, "mv notes.md scratch.txt");
+    const patch: Request = {
+      sessionId: s.sessionId,
+      harness: "claude",
+      cwd: wt,
+      tool: "apply_patch",
+      input: {
+        command:
+          "*** Begin Patch\n*** Update File: notes2.md\n*** Move to: moved2.txt\n*** End Patch",
+      },
+    };
+    try {
+      expect(s.review(mv, undefined, "PreToolUse").decision).toBe("approve");
+      renameSync(join(wt, "notes.md"), join(wt, "scratch.txt"));
+      s.record({ requestHash: hash(mv), event: "execution-result", status: "succeeded" });
+      expect(rm(s, "rm scratch.txt").decision).not.toBe("approve");
+      expect(s.review(patch, undefined, "PreToolUse").decision).toBe("approve");
+      renameSync(join(wt, "notes2.md"), join(wt, "moved2.txt"));
+      s.record({ requestHash: hash(patch), event: "execution-result", status: "succeeded" });
+      expect(rm(s, "rm moved2.txt").decision).not.toBe("approve");
+      // A session-created file moved by the session stays the session's.
+      create(s, "own.txt");
+      const own = bash(s, "mv own.txt own2.txt");
+      expect(s.review(own, undefined, "PreToolUse").decision).toBe("approve");
+      renameSync(join(wt, "own.txt"), join(wt, "own2.txt"));
+      s.record({ requestHash: hash(own), event: "execution-result", status: "succeeded" });
+      expect(rm(s, "rm own2.txt").decision).toBe("approve");
+    } finally {
+      cleanup("notes.md", "notes2.md", "scratch.txt", "moved2.txt", "own.txt", "own2.txt");
+    }
+  });
+
+  test("worktree deletion the session cannot prove is classified, and follows the verdict", () => {
+    const verdict = (r: Request, recoverable: boolean, confidence = 0.95) => ({
+      requestHash: hash(r),
+      category: "destructive" as const,
+      confidence,
+      recoverable,
+    });
+    for (const [recoverable, confidence, expected] of [
+      [true, 0.95, "approve"],
+      [false, 0.99, "human"],
+      [true, 0.9, "human"],
+    ] as const) {
+      const s = session();
+      const r = bash(s, "rm new.txt");
+      expect(s.review(r, undefined, "PreToolUse")).toMatchObject({ classification: "requested" });
+      expect(s.classify(verdict(r, recoverable, confidence)).decision).toBe(expected);
+    }
+    // Outside the worktree, and history or remote destruction inside it, stay with a person.
+    for (const [command, cwd] of [
+      ["rm a.txt", repo],
+      ["git clean -fdx", wt],
+      ["git branch -D withf", wt],
+      ["git push --force origin feature", wt],
+    ] as const) {
+      const s = session();
+      const r = bash(s, command, cwd);
+      expect(s.review(r, undefined, "PreToolUse").tier).toBeUndefined();
+      expect(evaluate(r, verdict(r, true, 0.99), profile).decision).toBe("human");
     }
   });
 

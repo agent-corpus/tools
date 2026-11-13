@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
-import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
+import {
+  commandDecision,
+  permissiveRead,
+  permissiveWrite,
+  WORKTREE_DELETION,
+} from "./permissive.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
 import type { Category, Classification, Decision, Request } from "./types.js";
@@ -179,8 +184,8 @@ export const AMBIGUOUS_CONFIDENCE = 0.95;
  * Escalations that stay with a human in every profile. Category `sensitive` (credentials,
  * secrets, protected paths and configuration) is excluded by category; these are the remaining
  * boundaries: the request itself cannot be trusted, an organization or the profile asked for a
- * human, or a repository rule forbids the write. `destructive` is classified: recoverable is
- * approved, unrecoverable goes to a person.
+ * human, or a repository rule forbids the write. Of `destructive`, only deletion inside a linked
+ * feature worktree is classified: recoverable is approved, anything else goes to a person.
  */
 const HUMAN_BOUNDARIES: RegExp[] = [
   /^Incomplete request/,
@@ -205,6 +210,9 @@ function markAmbiguous(decision: Decision, profile: Profile): Decision {
     decision.decision !== "human" ||
     decision.needsClassification ||
     decision.category === "sensitive" ||
+    // Git history, remote, cloud, publish and HTTP deletions are not provably recoverable, and the
+    // classifier is not independent; only local deletion inside a feature worktree is classified.
+    (decision.category === "destructive" && decision.reason !== WORKTREE_DELETION) ||
     HUMAN_BOUNDARIES.some((pattern) => pattern.test(decision.reason))
   )
     return decision;

@@ -19,6 +19,7 @@ import {
   restoreRecoverable,
   rmRecoverable,
   soleEffect,
+  worktreeDeletion,
 } from "./recoverable.js";
 import { type Redirect, type SimpleCommand, SUBSTITUTION } from "./shell.js";
 import type { Decision, Request } from "./types.js";
@@ -282,6 +283,10 @@ function safeConfigWrite(rest: string[]): boolean {
 }
 
 const RECOVERABLE = "Removes only tracked content Git can restore, in a linked feature worktree";
+const SESSION_CREATED =
+  "Removes files this session created, unchanged since, in a feature worktree";
+/** The one destructive reason the session classifier may decide; every other stays a person's. */
+export const WORKTREE_DELETION = "Deleting files inside a linked feature worktree";
 
 /** Splits `args` at the first `--`: options and words before it, and the words after it. */
 function splitDashes(args: string[]): { before: string[]; after: string[] | undefined } {
@@ -756,14 +761,17 @@ export function simpleDecision(
   }
   if (["rm", "rmdir", "unlink", "shred", "srm"].includes(program) && deletesProtected(cwd, args))
     return human(request, "sensitive", "Deleting a protected or credential path requires a human");
-  if (
-    argv[0] === "rm" &&
-    command.argv[0] === "rm" &&
-    depth === 0 &&
-    soleEffect(request) &&
-    rmRecoverable(cwd, args)
-  )
-    return result(request, "worktree-write", RECOVERABLE, true);
+  if (argv[0] === "rm" && command.argv[0] === "rm") {
+    const kind = depth === 0 && soleEffect(request) ? rmRecoverable(cwd, args) : undefined;
+    if (kind)
+      return result(
+        request,
+        "worktree-write",
+        kind === "tracked" ? RECOVERABLE : SESSION_CREATED,
+        true,
+      );
+    if (worktreeDeletion(cwd, args)) return human(request, "destructive", WORKTREE_DELETION);
+  }
   if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
     return human(request, "destructive", "Destructive operation requires human approval");
   if (REMOTE_EXECUTORS.has(program))

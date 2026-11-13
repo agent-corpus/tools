@@ -222,37 +222,39 @@ describe("the AI never relaxes a deterministic boundary", () => {
 });
 
 describe("destructive requests follow recoverability", () => {
-  test("a destructive request the classifier judges recoverable is approved", () => {
+  test("the classification hint carries the shared principle", () => {
     const { session: s } = session();
-    const r = request("rm -rf build");
-    const first = s.review(r, undefined, "PreToolUse");
+    const first = s.review(ambiguous(), undefined, "PreToolUse");
     expect(first).toMatchObject({ decision: "deny", classification: "requested" });
     expect(JSON.stringify(hookResponse("claude", "PreToolUse", first))).toContain(
       HUMAN_REVIEW_PRINCIPLE,
     );
-    s.classify(verdict(r, { category: "destructive", confidence: 0.95 }));
-    expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
   });
 
-  test("an unrecoverable or unconfident destructive verdict goes to a person", () => {
-    for (const extra of [
-      { category: "destructive", recoverable: false },
-      { category: "destructive", confidence: 0.9 },
-      { category: "worktree-write", recoverable: false },
-    ] as const) {
-      const { session: s } = session();
-      const r = request("rm -rf build");
-      s.review(r, undefined, "PreToolUse");
-      const d = s.classify(verdict(r, extra));
-      expect(d.decision).toBe("human");
-      expect(hookResponse("claude", "PreToolUse", d)).toMatchObject({
-        hookSpecificOutput: { permissionDecision: "ask" },
-      });
-      expect(JSON.stringify(hookResponse("codex", "PreToolUse", d))).toContain(
-        '"permissionDecision":"deny"',
-      );
-      expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
-    }
+  // Deletion inside a linked feature worktree is classified; see recoverable.test.ts.
+  test.each([
+    "rm -rf build", // not in a linked feature worktree
+    "git push --force origin feature",
+    "git push origin +feature",
+    "git push origin --delete wip",
+    "git branch -D wip",
+    "git reflog expire --all",
+    "git stash drop",
+    "git clean -fdx",
+    "az group delete --name x",
+    "terraform destroy",
+    "npm publish",
+    "gh repo delete o/r",
+    "rm -rf ~/Documents",
+    "curl -X DELETE https://example.com/x",
+    "sudo ls",
+  ])("%s stays with a person even on a confident recoverable verdict", (command) => {
+    const r = request(command);
+    const d = evaluate(r, undefined, permissive);
+    expect(d.decision).toBe("human");
+    expect(d.tier).toBeUndefined();
+    const verdictFor = verdict(r, { category: "destructive", confidence: 0.99, recoverable: true });
+    expect(evaluate(r, verdictFor, permissive).decision).toBe("human");
   });
 
   test("an ambiguous request the AI calls destructive but unrecoverable goes to a person", () => {
@@ -523,6 +525,6 @@ describe("replay", () => {
       [line("echo $ONE"), line("echo $TWO"), line("rm -rf build"), line("ls")].join("\n"),
     );
     const report = replayTranscripts([file], permissive);
-    expect(report).toMatchObject({ commands: 4, approved: 1, classified: 3 });
+    expect(report).toMatchObject({ commands: 4, approved: 1, classified: 2 });
   });
 });

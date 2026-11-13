@@ -63,8 +63,12 @@ export function withCreated<T>(created: CreatedFiles | undefined, fn: () => T): 
 
 /** True when this session created `path` and nothing has replaced or changed it since. */
 export function createdBySession(path: string): boolean {
-  const recorded = current?.get(pathKey(path));
-  const now = recorded && stamp(path);
+  return current !== undefined && owns(current, path);
+}
+
+function owns(created: CreatedFiles, path: string | undefined): boolean {
+  const recorded = path === undefined ? undefined : created.get(pathKey(path));
+  const now = recorded && stamp(path as string);
   return (
     !!recorded &&
     !!now &&
@@ -93,9 +97,17 @@ export function creationTargets(request: Request, created: CreatedFiles): string
     const file = input.file_path ?? input.path;
     if (typeof file === "string") add(request.cwd, file);
   } else if (request.tool === "apply_patch" && typeof input.command === "string") {
-    for (const line of input.command.split("\n"))
-      for (const prefix of ["*** Add File: ", "*** Update File: ", "*** Move to: "])
-        if (line.startsWith(prefix)) add(request.cwd, line.slice(prefix.length));
+    let source: string | undefined;
+    for (const line of input.command.split("\n")) {
+      if (line.startsWith("*** Add File: ")) add(request.cwd, line.slice(14));
+      if (line.startsWith("*** Update File: ")) {
+        source = located(request.cwd, line.slice(17));
+        if (source) found.push(source);
+      }
+      // A move keeps the source's content, so the target is the session's only if the source was.
+      if (line.startsWith("*** Move to: ") && owns(created, source))
+        add(request.cwd, line.slice(13));
+    }
   } else {
     const command = input.command ?? input.cmd;
     const pipelines = typeof command === "string" ? parseShell(command) : undefined;
@@ -111,8 +123,15 @@ export function creationTargets(request: Request, created: CreatedFiles): string
           if ((r.op === ">" || r.op === ">>") && r.target !== "/dev/null") add(cwd, r.target);
         const words = args.filter((word) => !word.startsWith("-"));
         if (program === "touch" || program === "tee") for (const word of words) add(cwd, word);
-        if ((program === "cp" || program === "mv") && words.length >= 2)
-          add(cwd, words.at(-1) as string);
+        if (program === "cp" && words.length >= 2) add(cwd, words.at(-1) as string);
+        // `mv` keeps the source's inode and content: the target is the session's only when the
+        // source was, or `mv notes.md x; rm x` would delete someone else's file unprompted.
+        if (
+          program === "mv" &&
+          words.length === 2 &&
+          owns(created, located(cwd, words[0] as string))
+        )
+          add(cwd, words[1] as string);
       }
   }
   return [...new Set(found)].filter((path) => !exists(path) || created.has(pathKey(path)));

@@ -181,12 +181,8 @@ function exists(path: string): boolean {
   }
 }
 
-/**
- * `rm` that removes only tracked content identical to HEAD (no untracked, ignored, modified or
- * staged path under any operand, no submodule), or, without -r, an untracked file this session
- * created and nothing has changed since. No option beyond -f, -r, -R, -d and -v.
- */
-export function rmRecoverable(cwd: string, args: string[]): boolean {
+/** Operands and -r of an `rm` with only -f, -r, -R, -d and -v, or undefined. */
+function rmOperands(args: string[]): { operands: string[]; recursive: boolean } | undefined {
   const operands: string[] = [];
   let options = true;
   let recursive = false;
@@ -194,28 +190,54 @@ export function rmRecoverable(cwd: string, args: string[]): boolean {
     if (options && word === "--") options = false;
     else if (options && word.startsWith("-")) {
       // BSD rm stops at the first operand, so a later `-x` is a file name the checks never saw.
-      if (operands.length) return false;
+      if (operands.length) return undefined;
       if (
         !/^-[frRdv]+$/.test(word) &&
         !["--force", "--recursive", "--dir", "--verbose"].includes(word)
       )
-        return false;
+        return undefined;
       if (/^-[a-zA-Z]*[rR]/.test(word) || word === "--recursive") recursive = true;
     } else operands.push(word);
   }
-  if (!operands.length) return false;
+  return operands.length ? { operands, recursive } : undefined;
+}
+
+/**
+ * `rm` that removes only tracked content identical to HEAD (no untracked, ignored, modified or
+ * staged path under any operand, no submodule): "tracked". Or, without -r, also untracked files
+ * this session created and nothing has changed since: "session". Otherwise undefined.
+ */
+export function rmRecoverable(cwd: string, args: string[]): "tracked" | "session" | undefined {
+  const parsed = rmOperands(args);
+  if (!parsed) return undefined;
+  let kind: "tracked" | "session" = "tracked";
   try {
-    for (const operand of operands) {
+    for (const operand of parsed.operands) {
       const found = locate(cwd, operand);
-      if (!found || !exists(found.target)) return false;
+      if (!found || !exists(found.target)) return undefined;
       if (!tracked(found.root, found.rel)) {
-        if (recursive || found.trailing || !createdBySession(found.target)) return false;
+        if (parsed.recursive || found.trailing || !createdBySession(found.target)) return undefined;
+        kind = "session";
         continue;
       }
-      if (status(found.root, [found.rel], true).length) return false;
-      if (hiddenState(found.root, [found.rel])) return false;
+      if (status(found.root, [found.rel], true).length) return undefined;
+      if (hiddenState(found.root, [found.rel])) return undefined;
     }
-    return true;
+    return kind;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * An `rm` whose every operand is a plain path inside a linked feature worktree (not the worktree
+ * itself, nothing protected): local file deletion the classifier may judge. Anything else that is
+ * destructive stays a person's decision.
+ */
+export function worktreeDeletion(cwd: string, args: string[]): boolean {
+  const parsed = rmOperands(args);
+  try {
+    return !!parsed && parsed.operands.every((operand) => locate(cwd, operand) !== undefined);
   } catch {
     return false;
   }
