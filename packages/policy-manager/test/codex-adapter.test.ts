@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
-import { executionReport, hookResponse } from "../src/adapters.js";
+import { executionReport, hookOutput, hookResponse } from "../src/adapters.js";
 import { hookConfig } from "../src/config.js";
 import { PolicySession } from "../src/session.js";
 import { setupHook } from "../src/setup.js";
@@ -73,10 +73,21 @@ describe("Codex PreToolUse", () => {
     expect(reason).toContain("run it themselves");
     expect(reason).not.toContain("does not unblock it");
   });
-  test("an approval is an allow", () =>
-    expect(hookResponse("codex", "PreToolUse", decision("approve"))).toEqual({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
-    }));
+  // Codex 0.167 rejects `permissionDecision: "allow"` without `updatedInput` ("PreToolUse hook
+  // returned unsupported permissionDecision:allow") and marks the hook failed on every call. An
+  // approval is therefore no decision: empty output, exit 0.
+  test("an approval is no decision and no output", () => {
+    expect(hookResponse("codex", "PreToolUse", decision("approve"))).toEqual({});
+    expect(hookOutput("codex", "PreToolUse", decision("approve"))).toBe("");
+  });
+  test.each(CATEGORIES)("no Codex PreToolUse output (%s) is an allow or an ask", (category) => {
+    for (const kind of ["approve", "human", "deny"] as const) {
+      const text = hookOutput("codex", "PreToolUse", decision(kind, category));
+      expect(text).not.toContain('"allow"');
+      expect(text).not.toContain('"ask"');
+      expect(text).not.toContain("updatedInput");
+    }
+  });
   test.each(CATEGORIES)(
     "a human decision (%s) never produces an allow or ask shape",
     (category) => {
@@ -101,6 +112,63 @@ describe("Codex PreToolUse", () => {
       expect(pre.hookSpecificOutput?.permissionDecision).toBe("deny");
     },
   );
+});
+
+describe("exact hook output per harness", () => {
+  const deny: Decision = { ...decision("deny"), reason: "Blocked" };
+  test.each([
+    ["codex", "PreToolUse", "approve", ""],
+    [
+      "codex",
+      "PermissionRequest",
+      "approve",
+      '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}',
+    ],
+    ["codex", "PermissionRequest", "human", ""],
+    [
+      "codex",
+      "PreToolUse",
+      "deny",
+      '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Blocked"}}',
+    ],
+    [
+      "codex",
+      "PermissionRequest",
+      "deny",
+      '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Blocked"}}}',
+    ],
+    [
+      "claude",
+      "PreToolUse",
+      "approve",
+      '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}',
+    ],
+    [
+      "claude",
+      "PreToolUse",
+      "human",
+      '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Destructive operation requires human approval"}}',
+    ],
+    [
+      "claude",
+      "PermissionRequest",
+      "approve",
+      '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}',
+    ],
+    ["claude", "PermissionRequest", "human", "{}"],
+    ["copilot", "PreToolUse", "approve", '{"permissionDecision":"allow"}'],
+    [
+      "copilot",
+      "PreToolUse",
+      "human",
+      '{"permissionDecision":"ask","permissionDecisionReason":"Destructive operation requires human approval"}',
+    ],
+    ["copilot", "PermissionRequest", "approve", '{"behavior":"allow"}'],
+    ["copilot", "PermissionRequest", "human", "{}"],
+  ] as const)("%s %s %s", (harness, phase, kind, expected) => {
+    const d = kind === "deny" ? deny : decision(kind);
+    expect(hookOutput(harness, phase, d)).toBe(expected);
+  });
 });
 
 describe("Codex PermissionRequest", () => {

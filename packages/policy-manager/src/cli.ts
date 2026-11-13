@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { executionReport, hookResponse, normalize } from "./adapters.js";
+import { executionReport, hookOutput, normalize } from "./adapters.js";
 import { hookConfig } from "./config.js";
 import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
 import { replayTranscripts } from "./replay.js";
@@ -164,11 +164,11 @@ try {
           request,
           phase,
         })) as Decision;
-        console.log(
-          JSON.stringify(
-            hookResponse(harness, phase, decision, { cliPath, sessionId: request.sessionId }),
-          ),
-        );
+        const output = hookOutput(harness, phase, decision, {
+          cliPath,
+          sessionId: request.sessionId,
+        });
+        if (output) console.log(output);
       } else throw new Error("Unsupported hook event");
     }
   } else throw new Error(usage);

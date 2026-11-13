@@ -46,6 +46,12 @@ const FUNCTION_MARK = "()";
 interface State {
   cwds: string[];
   /**
+   * Set by `cd`: the directories the shell is still in if that `cd` failed. A following `&&` only
+   * runs after it succeeded, so it drops these; anything else may run after a failure, so it
+   * adds them back (`settle`).
+   */
+  failed?: string[];
+  /**
    * Variables the script assigned: their known values, or null when the value is unknown (it came
    * from a command, a glob or a loop). A name that is absent was never assigned here, so it is an
    * environment variable of unknown content.
@@ -69,11 +75,20 @@ interface Ctx {
 
 const copy = (state: State): State => ({
   cwds: [...state.cwds],
+  ...(state.failed ? { failed: [...state.failed] } : {}),
   vars: new Map(state.vars),
   funcs: new Map(state.funcs),
 });
 
+/** The last `cd` may have failed: every directory it could have left the shell in is possible. */
+function settle(state: State): void {
+  if (state.failed) state.cwds = [...new Set([...state.cwds, ...state.failed])];
+  delete state.failed;
+}
+
+/** Every directory either state could be in; neither input is changed. */
 function merge(a: State, b: State): State {
+  const cwds = [...a.cwds, ...(a.failed ?? []), ...b.cwds, ...(b.failed ?? [])];
   const vars = new Map<string, string[] | null>();
   for (const [name, left] of a.vars) {
     if (!b.vars.has(name)) continue; // assigned on one path only: an environment value is possible
@@ -86,11 +101,13 @@ function merge(a: State, b: State): State {
     const left = a.funcs.get(name);
     funcs.set(name, left && left === b.funcs.get(name) ? left : null);
   }
-  return { cwds: [...new Set([...a.cwds, ...b.cwds])], vars, funcs };
+  return { cwds: [...new Set(cwds)], vars, funcs };
 }
 
 function replace(target: State, source: State): void {
   target.cwds = source.cwds;
+  if (source.failed) target.failed = source.failed;
+  else delete target.failed;
   target.vars = source.vars;
   target.funcs = source.funcs;
 }
@@ -693,7 +710,8 @@ function changeDirectory(
       "unknown",
       "Directory change in a loop or pipeline requires human review",
     );
-  let cwds = [...state.cwds];
+  settle(state);
+  let cwds: string[] = [];
   for (const env of envs) {
     const target = build(env)
       .argv.slice(1)
@@ -709,11 +727,12 @@ function changeDirectory(
       word.startsWith("-")
     )
       return human(request, "unknown", "Directory change requires human review");
-    // `cd` can fail, so the directory it started from stays possible.
     cwds = [...new Set([...cwds, ...state.cwds.map((cwd) => resolve(cwd, word))])];
   }
-  if (cwds.length > MAX_DIRECTORIES)
+  if (!cwds.length || cwds.length + state.cwds.length > MAX_DIRECTORIES)
     return human(request, "unknown", "Too many directory changes to verify");
+  // `cd` can fail, so the directory it started from stays possible unless `&&` follows.
+  state.failed = state.cwds;
   state.cwds = cwds;
   ctx.box.last = result(request, "code-read", "Directory change", true);
   return undefined;
@@ -1028,6 +1047,12 @@ function runCommand(
   stage: number,
   piped: boolean,
 ): Decision | undefined {
+  // A compound command's redirections are opened before its body runs, in the directory it
+  // started in; a `cd` inside the body cannot move them.
+  if (command.kind !== "simple" && command.kind !== "function") {
+    const early = runRedirects(ctx, command.redirects, copy(state));
+    if (early) return early;
+  }
   switch (command.kind) {
     case "simple":
       return runSimple(ctx, command, state, stage, piped);
@@ -1130,8 +1155,10 @@ function runIf(
     const refusal = runList(ctx, clause.cond, conditionState, outcome);
     if (refusal) return refusal;
     if (index > 0) current = merge(current, conditionState);
-    // The body runs only when the condition succeeded: an `a && b` condition ran both.
+    // The body runs only when the condition succeeded: an `a && b` condition ran both, and a `cd`
+    // that ends the condition did change directory. Earlier clauses are already merged in.
     const taken = copy(outcome.success ?? current);
+    delete taken.failed;
     const body = runList(ctx, clause.body, taken);
     if (body) return body;
     branches.push(taken);
@@ -1214,6 +1241,8 @@ function runList(
 ): Decision | undefined {
   for (const [index, item] of list.items.entries()) {
     const last = index === list.items.length - 1;
+    // Each item runs whether or not the one before it succeeded.
+    settle(state);
     // A background job runs in a subshell of its own.
     const target = item.background ? copy(state) : state;
     const { first, rest } = item.node;
@@ -1228,25 +1257,50 @@ function runList(
     // An all-`&&` chain cannot stop after a step that cannot fail, and succeeds only at the end.
     const chain = rest.every((r) => r.op === "&&");
     let running = copy(target);
-    let possible = chain && cannotFail(ctx, first, target) ? undefined : copy(target);
+    let possible = copy(target);
+    // Variables after the chain: the steps it can stop after. Directories always use `possible`.
+    let assigned = chain && cannotFail(ctx, first, target) ? undefined : copy(target);
+    // While every operator so far is `&&`, a command runs only if everything before it succeeded,
+    // so a `cd` before it did change directory. After an `||` any earlier directory is possible.
+    let onlyAnd = true;
     for (const [step, next] of rest.entries()) {
       running = copy(running);
+      onlyAnd &&= next.op === "&&";
+      if (onlyAnd) delete running.failed;
+      else {
+        settle(running);
+        running.cwds = [...new Set([...running.cwds, ...possible.cwds])];
+      }
       const skipped = runPipeline(ctx, next.node, running);
       if (skipped) return skipped;
+      possible = merge(possible, running);
       if (!chain || step === rest.length - 1 || !cannotFail(ctx, next.node, running))
-        possible = possible ? merge(possible, running) : copy(running);
-      if (possible && possible.cwds.length > MAX_DIRECTORIES)
+        assigned = assigned ? merge(assigned, running) : copy(running);
+      if (possible.cwds.length > MAX_DIRECTORIES)
         return human(ctx.request, "unknown", "Too many directory changes to verify");
     }
+    if (assigned) {
+      possible.vars = assigned.vars;
+      possible.funcs = assigned.funcs;
+    }
     if (last && outcome)
-      outcome.success = copy(item.background ? state : chain ? running : (possible as State));
-    replace(target, possible as State);
+      outcome.success = copy(item.background ? state : chain ? running : possible);
+    replace(target, possible);
   }
   return undefined;
 }
 
-function runPipeline(ctx: Ctx, node: { stages: Command[] }, state: State): Decision | undefined {
-  if (node.stages.length === 1) return runCommand(ctx, node.stages[0] as Command, state, 0, false);
+function runPipeline(
+  ctx: Ctx,
+  node: { stages: Command[]; negated?: boolean },
+  state: State,
+): Decision | undefined {
+  if (node.stages.length === 1) {
+    const refusal = runCommand(ctx, node.stages[0] as Command, state, 0, false);
+    // `! cd x` succeeds exactly when the `cd` failed.
+    if (node.negated) settle(state);
+    return refusal;
+  }
   const changed = new Set<string>();
   for (const [index, stage] of node.stages.entries()) {
     assignedInCommand(stage, changed, state.funcs);

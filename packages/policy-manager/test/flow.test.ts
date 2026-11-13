@@ -910,7 +910,8 @@ describe("functions, positional parameters, parameter operations and read loops"
   // `cd` may fail and `$(pwd)` stays unknown.
   test.skipIf(process.platform === "win32")("$(pwd) is the single current directory", () => {
     expect(decide('ls "$(pwd)/src"').decision).toBe("approve");
-    expect(decide('cd .. && ls "$(pwd)/src"').decision).toBe("human");
+    // After `;` the cd may have failed, so two directories are possible.
+    expect(decide('cd ..; ls "$(pwd)/src"').decision).toBe("human");
   });
 
   test.skipIf(process.platform === "win32")(
@@ -926,10 +927,10 @@ describe("functions, positional parameters, parameter operations and read loops"
       ).toBe("human");
       expect(decide(`ls; cd ${wt} && S=src; ls $S`).decision).toBe("human");
       expect(decide(`bash -c 'cd ${wt} && S=src; ls $S'`).decision).toBe("human");
-      // The cd is still allowed to have failed when judging where later commands run.
-      expect(decide(`cd ${posix(scratch)} && echo x > n.txt`, join(root, "repo")).decision).toBe(
-        "human",
-      );
+      // After the chain, the cd is still allowed to have failed when judging where commands run.
+      expect(
+        decide(`cd ${posix(scratch)} && S=1; echo x > n.txt`, join(root, "repo")).decision,
+      ).toBe("human");
     },
   );
 
