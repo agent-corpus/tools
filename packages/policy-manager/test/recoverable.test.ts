@@ -572,6 +572,33 @@ describe("files this session created", () => {
     }
   });
 
+  test.skipIf(!links)("a .. after a symlinked directory is not resolved as text", () => {
+    // linkd -> symdir/deep, so the shell reads linkd/../notes.md as symdir/notes.md, a user's file.
+    mkdirSync(join(wt, "symdir", "deep"), { recursive: true });
+    symlinkSync(join("symdir", "deep"), join(wt, "linkd"));
+    write(join(wt, "symdir", "notes.md"), "user notes in symdir");
+    write(join(wt, "symdir", "n3.md"), "user notes n3 in symdir");
+    const s = session();
+    create(s, "notes.md");
+    create(s, "other.txt");
+    create(s, "n3.md");
+    create(s, "o3.txt");
+    try {
+      attempt(s, "cp linkd/../notes.md y.txt && mv other.txt linkd/../notes.md", () => {
+        write(join(wt, "y.txt"), "user notes in symdir");
+        renameSync(join(wt, "other.txt"), join(wt, "symdir", "notes.md"));
+      });
+      expect(rm(s, "rm y.txt").decision).not.toBe("approve");
+      attempt(s, "cd linkd && cp ../n3.md y3.txt && mv o3.txt ../n3.md", () => {
+        write(join(wt, "symdir", "deep", "y3.txt"), "user notes n3 in symdir");
+        renameSync(join(wt, "o3.txt"), join(wt, "symdir", "n3.md"));
+      });
+      expect(rm(s, "rm symdir/deep/y3.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("linkd", "symdir", "notes.md", "other.txt", "n3.md", "o3.txt", "y.txt");
+    }
+  });
+
   test("mv and cp count only from a file the session owns when the hook runs", () => {
     // Ownership cannot chain through earlier commands in the same script.
     const s = session();

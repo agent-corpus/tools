@@ -219,9 +219,13 @@ function markAmbiguous(decision: Decision, profile: Profile): Decision {
   return { ...decision, needsClassification: true, tier: "ambiguous" };
 }
 function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
+  // A `destructive` verdict approves only what the engine proved is a deletion inside a feature
+  // worktree; on anything else (an unparsable `rm -rf ~/{a,b}`) the label alone means a person.
+  const destructiveOk = ai.category !== "destructive" || decision.reason === WORKTREE_DELETION;
   const safe =
     ai.recoverable === true &&
     ai.confidence >= AMBIGUOUS_CONFIDENCE &&
+    destructiveOk &&
     !["sensitive", "unknown"].includes(ai.category);
   const base = { ...decision, needsClassification: false, cache: "session" as const, ai };
   if (safe)

@@ -112,7 +112,13 @@ const SYSTEM_BIN = /^\/(?:usr\/(?:local\/)?)?bin\/[^/]+$|^\/opt\/homebrew\/bin\/
  * `$`, glob or brace anywhere could expand to something else, so such a word is unprovable.
  */
 function literal(word: string): boolean {
-  return word.length > 0 && !/^[~=]/.test(word) && !/[$*?[\]{}]/.test(word);
+  return (
+    word.length > 0 &&
+    !/^[~=]/.test(word) &&
+    !/[$*?[\]{}\\]/.test(word) &&
+    // `link/../x` is resolved from the link's target by the kernel but as `./x` by `resolve()`.
+    !word.split("/").some((part, i) => part === ".." || (part === "." && i > 0))
+  );
 }
 
 /** The allowlisted program `word` names, or undefined (a relative path may be any script). */

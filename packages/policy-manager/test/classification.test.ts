@@ -257,6 +257,28 @@ describe("destructive requests follow recoverability", () => {
     expect(evaluate(r, verdictFor, permissive).decision).toBe("human");
   });
 
+  test("a destructive label approves nothing the engine did not prove is a worktree deletion", () => {
+    for (const command of [
+      "rm -rf ~/{Documents,x}",
+      "git push --force origin {feature,x}",
+      "git clean -fdx {a,b}",
+      "echo $SOME_VAR",
+    ]) {
+      const { session: s } = session();
+      const r = request(command);
+      expect(s.review(r, undefined, "PreToolUse").classification, command).toBe("requested");
+      const d = s.classify(verdict(r, { category: "destructive", confidence: 0.99 }));
+      expect(d.decision, command).toBe("human");
+    }
+    // A non-destructive label on an ambiguous request still follows the verdict, as on main.
+    const { session: s } = session();
+    const r = request("echo $SOME_VAR");
+    s.review(r, undefined, "PreToolUse");
+    expect(s.classify(verdict(r, { category: "code-read", confidence: 0.99 })).decision).toBe(
+      "approve",
+    );
+  });
+
   test("an ambiguous request the AI calls destructive but unrecoverable goes to a person", () => {
     const { session: s } = session();
     const r = ambiguous();
