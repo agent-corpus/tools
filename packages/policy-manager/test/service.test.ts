@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
@@ -96,6 +97,68 @@ test.each(["claude", "codex", "copilot"] as const)(
   },
   30000,
 );
+test("the hook's record command is approved, and the retry of the original then runs", () => {
+  const sessionId = `record-${randomUUID()}`;
+  const directory = sessionDirectory("claude", sessionId);
+  const config = mkdtempSync(join(tmpdir(), "pm-config-"));
+  const profileDirectory = join(config, "agent-corpus", "policy-manager");
+  mkdirSync(profileDirectory, { recursive: true });
+  writeFileSync(join(profileDirectory, "policy.json"), '{"version":1,"mode":"permissive"}', {
+    mode: 0o600,
+  });
+  const env = { ...process.env, XDG_CONFIG_HOME: config };
+  const hook = (command: string, description: string) =>
+    JSON.parse(
+      execFileSync(process.execPath, [cli, "hook", "claude", "PreToolUse"], {
+        encoding: "utf8",
+        env,
+        timeout: 15000,
+        input: JSON.stringify({
+          session_id: sessionId,
+          cwd: process.cwd(),
+          tool_name: "Bash",
+          tool_input: { command, description },
+        }),
+      }),
+    ).hookSpecificOutput;
+  try {
+    const blocked = hook("echo $RECORD_ROUND_TRIP", "first");
+    expect(blocked.permissionDecision).toBe("deny");
+    const reason: string = blocked.permissionDecisionReason;
+    const requestHash = /Request ([a-f0-9]{64}):/.exec(reason)?.[1] ?? "";
+    const template = /in the answer: (node .*<json>') If no/.exec(reason)?.[1] ?? "";
+    expect(template).toContain(`classify claude ${sessionId} <<< '<json>'`);
+    const json = JSON.stringify({
+      requestHash,
+      category: "code-read",
+      confidence: 0.97,
+      recoverable: true,
+      rationale: "prints a variable",
+    });
+    expect(hook(template.replace("<json>", json), "record").permissionDecision).toBe("allow");
+    expect(hook(`${template.replace("<json>", json)}; echo x`, "record").permissionDecision).toBe(
+      "ask",
+    );
+    // What the record command does when it runs.
+    const recorded = JSON.parse(
+      execFileSync(process.execPath, [cli, "classify", "claude", sessionId], {
+        encoding: "utf8",
+        env,
+        input: json,
+      }),
+    );
+    expect(recorded.decision).toBe("approve");
+    expect(hook("echo $RECORD_ROUND_TRIP", "retry").permissionDecision).toBe("allow");
+  } finally {
+    try {
+      execFileSync(process.execPath, [cli, "stop", "claude", sessionId], { env });
+    } catch {
+      /* The service may not have started. */
+    }
+    rmSync(directory, { recursive: true, force: true });
+    rmSync(config, { recursive: true, force: true });
+  }
+}, 30000);
 test.each(["claude", "codex", "copilot"] as const)(
   "%s config launches only a reviewed installed entrypoint",
   (harness) => {

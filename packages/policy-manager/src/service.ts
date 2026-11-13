@@ -21,7 +21,7 @@ function endpoint(directory: string): string {
     ? `\\\\.\\pipe\\acp-${hash(directory).slice(0, 32)}`
     : join(directory, "service.sock");
 }
-export async function serve(harness: string, sessionId: string): Promise<void> {
+export async function serve(harness: string, sessionId: string, cliPath?: string): Promise<void> {
   const directory = sessionDirectory(harness, sessionId),
     token = sessionToken(directory);
   let profile: Profile = strictProfile;
@@ -31,7 +31,7 @@ export async function serve(harness: string, sessionId: string): Promise<void> {
   } catch {
     profileFailure = true; // an unreadable or untrusted profile must never loosen policy
   }
-  const session = new PolicySession(directory, harness, sessionId, profile);
+  const session = new PolicySession(directory, harness, sessionId, profile, cliPath);
   const server = createServer((socket) => {
     socket.setTimeout(3000, () => socket.destroy());
     let data = "";

@@ -46,6 +46,37 @@ export function classifyCommand(
     ? `node "${cliPath}" classify ${harness} ${context.sessionId} <<< '${json}'`
     : `policy-manager classify ${harness} <session-id> <<< '${json}'`;
 }
+/**
+ * Whether `command` is exactly this session's record command from `classifyCommand`, answer
+ * included: one single-quoted literal JSON object, nothing before or after it. Inside single
+ * quotes the shell expands nothing, so the answer cannot run anything.
+ */
+export function isClassifyRecord(
+  command: string,
+  harness: Request["harness"],
+  context: HookContext,
+): boolean {
+  const template = classifyCommand(harness, context, "");
+  if (!template.startsWith('node "')) return false;
+  const head = template.slice(0, -1);
+  if (command.length > head.length + 4096 || !command.startsWith(head) || !command.endsWith("'"))
+    return false;
+  const json = command.slice(head.length, -1);
+  if (/['\0\r\n]/.test(json)) return false;
+  try {
+    const value: unknown = JSON.parse(json);
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+/** A command that looks like a policy-manager classification record, for any session or CLI. */
+export function looksLikeClassifyRecord(command: string): boolean {
+  return (
+    /\bclassify\s+["']?(?:claude|codex|copilot)\b/.test(command) &&
+    /policy-manager|cli\.js/.test(command)
+  );
+}
 /** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
 function classifyInstruction(
   harness: Request["harness"],
