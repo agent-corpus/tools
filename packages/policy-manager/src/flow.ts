@@ -1,6 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, posix, resolve } from "node:path";
+import { basename, isAbsolute, join, posix, resolve } from "node:path";
+import { canonical, type Fill, resolveWord, UNKNOWN_CWD } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -69,8 +70,18 @@ interface Ctx {
   calls: number;
   /** False when the script could assign positional parameters through zsh's `argv` array. */
   positional: boolean;
+  /** Inside a background job, or a script run where later commands can overtake it. */
+  reorder?: boolean;
   /** `first` is the script's first top-level pipeline, the only `cd` trusted not to fail. */
-  box: { last?: Decision; calls: number; first?: PipelineNode };
+  box: {
+    last?: Decision;
+    calls: number;
+    first?: PipelineNode;
+    /** Directories that earlier commands create, so a later `cd` into one is not unknown. */
+    created?: Set<string>;
+    /** Whether a symlink may exist that the hook could not see (see `Fill`). */
+    script: Fill["script"];
+  };
 }
 
 const copy = (state: State): State => ({
@@ -316,7 +327,13 @@ function runRedirects(ctx: Ctx, redirs: Redir[], state: State): Decision | undef
       const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
       if (!redirect) continue;
       for (const cwd of state.cwds) {
-        const check = redirectDecision(ctx.request, redirect, ctx.profile, cwd);
+        const check = redirectDecision(
+          ctx.request,
+          redirect,
+          ctx.profile,
+          cwd,
+          fillFor(ctx, false),
+        );
         if (check) return check;
       }
     }
@@ -477,6 +494,7 @@ function forget(state: State, names: Set<string>): void {
 
 const STATEFUL = new Set([
   "cd",
+  "chdir",
   "pushd",
   "popd",
   "export",
@@ -647,7 +665,7 @@ function runSimple(
         const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
         if (!redirect) continue;
         for (const cwd of state.cwds) {
-          const check = redirectDecision(request, redirect, profile, cwd);
+          const check = redirectDecision(request, redirect, profile, cwd, fillFor(ctx, piped));
           if (check) return check;
         }
       }
@@ -671,9 +689,24 @@ function runSimple(
     for (const cwd of state.cwds) {
       if (++ctx.box.calls > MAX_JUDGEMENTS)
         return human(request, "unknown", "Too many commands to verify");
-      const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd);
+      const fill = fillFor(ctx, piped);
+      const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd, fill);
       if (decision.decision !== "approve") return decision;
       ctx.box.last = decision;
+      if (!symlinkFree(unwrap(command.argv).argv)) {
+        if (ctx.box.script.approved)
+          return human(
+            request,
+            "unknown",
+            "A command that can create symlinks may run before an approved temp path",
+          );
+        ctx.box.script.tainted = true;
+      }
+      for (const dir of createdDirectories(unwrap(command.argv).argv)) {
+        if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
+        ctx.box.created ??= new Set();
+        ctx.box.created.add(resolve(cwd, dir));
+      }
     }
   }
 
@@ -683,7 +716,8 @@ function runSimple(
   // `shift` moves every positional parameter down, and `set` with a non-option word (`set -e
   // pipefail`) replaces them; only `set --` is tracked.
   if (name === "shift" || name === "set") for (const p of POSITIONAL_NAMES) state.vars.set(p, null);
-  if (name === "cd") return changeDirectory(ctx, state, piped, envs, build);
+  // zsh `chdir` is `cd`; in bash it fails, which leaves the starting directory possible anyway.
+  if (name === "cd" || name === "chdir") return changeDirectory(ctx, state, piped, envs, build);
   if (name === "export") return exportVariables(ctx, node, state, piped, known, envs);
   if (name === "unset" || name === "read" || name === "printf" || name === "print") {
     const forgotten = new Set<string>();
@@ -709,6 +743,165 @@ function runSimple(
     forget(state, forgotten);
   }
   return undefined;
+}
+
+/** In a loop, a pipeline or a background job, a later command can run first. */
+function fillFor(ctx: Ctx, piped: boolean): Fill {
+  return { script: ctx.box.script, reorder: ctx.loop > 0 || piped || !!ctx.reorder };
+}
+
+/**
+ * Programs that create no symlink: they read, print, or write regular files only. Shells are here
+ * because the script they run is judged with the same state.
+ */
+const SYMLINK_FREE = new Set([
+  ...[":", "[", "test", "true", "false", "echo", "printf", "print", "pwd", "sleep", "date"],
+  ...["cd", "chdir", "export", "set", "shift", "unset", "read", "local"],
+  ...["cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "paste", "diff", "cmp", "jq"],
+  ...["grep", "egrep", "fgrep", "rg", "sed", "ls", "stat", "file", "which", "type"],
+  ...["basename", "dirname", "realpath", "readlink", "mkdir", "touch", "tee"],
+  ...["rm", "rmdir", "unlink", "bash", "sh", "zsh", "dash"],
+  ...["seq", "mktemp", "chmod", "find", "curl", "du", "df", "tree", "column", "nl"],
+  ...["tac", "rev", "comm", "join", "fold", "od", "xxd", "shasum", "sha256sum", "md5sum", "md5"],
+  ...["whoami", "id", "uname", "hostname"],
+]);
+/** git subcommands that leave the working tree as it is, or only add a fresh `.git`. */
+const GIT_SYMLINK_FREE = new Set([
+  ...["status", "log", "diff", "show", "add", "commit", "init", "rev-parse", "ls-files"],
+  ...["branch", "config", "fetch", "remote", "describe", "push", "rev-list", "merge-base"],
+  ...["ls-remote", "cat-file", "for-each-ref", "symbolic-ref", "shortlog", "blame", "grep"],
+]);
+/** git options that run another program. */
+const GIT_RUNS = /^(?:-O|--open-files-in-pager|--upload-pack|--receive-pack|--exec|--ext-diff)/;
+/** gh commands that only talk to GitHub or print: `api`, or a group with one of its verbs. */
+const GH_SYMLINK_FREE: Record<string, Set<string>> = {
+  pr: new Set(["view", "list", "diff", "checks", "status", "create", "comment", "edit", "ready"]),
+  issue: new Set(["view", "list", "status", "create", "comment", "edit", "close", "reopen"]),
+  run: new Set(["view", "list", "watch", "rerun", "cancel"]),
+  repo: new Set(["view", "list"]),
+  release: new Set(["view", "list"]),
+  workflow: new Set(["view", "list"]),
+  label: new Set(["list"]),
+  auth: new Set(["status"]),
+  search: new Set(["prs", "issues", "repos", "code", "commits"]),
+};
+/**
+ * Whether a command is known to create no symlink. Anything else may plant one anywhere, so
+ * later temp paths in the script are no longer trusted. `cp` without options that copy links
+ * (`-R`, `-a`, `-P`, `-d`, long options) writes a regular file.
+ */
+function symlinkFree(argv: string[]): boolean {
+  const [path = "", ...args] = argv;
+  const program = basename(path);
+  if (program === "cp") return args.every((arg) => !arg.startsWith("-") || /^-[finpv]+$/.test(arg));
+  if (program === "git") {
+    // `-c` can set a pager or other program for this one command.
+    let index = 0;
+    while (args[index] === "-C" || args[index] === "--no-pager")
+      index += args[index] === "-C" ? 2 : 1;
+    const sub = args[index] ?? "";
+    const rest = args.slice(index + 1);
+    if (rest.some((arg) => GIT_RUNS.test(arg)) || (sub === "ls-remote" && rest.includes("-u")))
+      return false;
+    return GIT_SYMLINK_FREE.has(sub) || (sub === "worktree" && rest[0] === "list");
+  }
+  if (program === "gh") {
+    const [group = "", verb = ""] = args;
+    return group === "api" || !!GH_SYMLINK_FREE[group]?.has(verb);
+  }
+  return SYMLINK_FREE.has(program);
+}
+
+/** Where a loop or pipeline starts, so its end can tell whether it started a background job. */
+function reorderMark(ctx: Ctx): { approved: boolean; jobs: number } {
+  return { approved: ctx.box.script.approved, jobs: ctx.box.script.jobs };
+}
+/**
+ * Once a foreground loop or pipeline ends, nothing in it can run after a later command, unless
+ * it started a background job, which may still be running.
+ */
+function endReorder(ctx: Ctx, mark: { approved: boolean; jobs: number }): void {
+  if (ctx.loop === 0 && !ctx.reorder && ctx.box.script.jobs === mark.jobs)
+    ctx.box.script.approved = mark.approved;
+}
+
+/** git clone options that take a separate value. */
+const CLONE_VALUES = new Set([
+  "-b",
+  "--branch",
+  "-o",
+  "--origin",
+  "-c",
+  "--config",
+  "--depth",
+  "--reference",
+  "--separate-git-dir",
+  "-u",
+  "--upload-pack",
+  "--template",
+  "-j",
+  "--jobs",
+  "--filter",
+  "--shallow-since",
+  "--shallow-exclude",
+]);
+/** Positional words of `args`, skipping options and the values of those in `values`. */
+function positionals(args: string[], values: Set<string>): string[] {
+  const out: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index] ?? "";
+    if (word === "--") return [...out, ...args.slice(index + 1)];
+    if (values.has(word)) index++;
+    else if (!word.startsWith("-")) out.push(word);
+  }
+  return out;
+}
+/**
+ * Directories a command creates (as written, relative to its cwd): `mkdir` (with `-p`, every
+ * ancestor too), `git clone <url> [dir]`, `git worktree add <path>`, and the destination of `cp -r`
+ * or `mv`.
+ */
+function createdDirectories(argv: string[]): string[] {
+  const [program, ...args] = argv;
+  if (program === "mkdir") {
+    const parents = args.some((arg) => arg === "--parents" || /^-[^-]*p/.test(arg));
+    return positionals(args, new Set(["-m", "--mode"])).flatMap((dir) => {
+      if (!parents) return [dir];
+      const parts = dir.split("/");
+      return parts.map((_, index) => parts.slice(0, index + 1).join("/") || "/");
+    });
+  }
+  if (program === "git" && args[0] === "clone") {
+    const [url, dir] = positionals(args.slice(1), CLONE_VALUES);
+    if (dir) return [dir];
+    const name = url
+      ?.replace(/[\\/]+$/, "")
+      .split(/[/:]/)
+      .pop()
+      ?.replace(/\.git$/, "");
+    return name ? [name] : [];
+  }
+  if (program === "git" && args[0] === "worktree" && args[1] === "add") {
+    const [path] = positionals(args.slice(2), new Set(["-b", "-B", "--reason"]));
+    return path ? [path] : [];
+  }
+  if ((program === "cp" && args.some((arg) => /^-[^-]*[rRa]/.test(arg))) || program === "mv") {
+    const rest = positionals(args, new Set(["-t", "-S", "--suffix"]));
+    return rest.length > 1 ? [rest[rest.length - 1] as string] : [];
+  }
+  return [];
+}
+
+/** A relative `cd` target that does not start with `.`: CDPATH and CDABLE_VARS can redirect it. */
+function bareName(word: string): boolean {
+  return !isAbsolute(word) && !/^(?:\.{1,2}(?:[\\/]|$)|[\\/])/.test(word);
+}
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function changeDirectory(
@@ -739,10 +932,40 @@ function changeDirectory(
       !word ||
       word.includes(SUBSTITUTION) ||
       /^~|[*?[\]]/.test(word) ||
-      word.startsWith("-")
+      // `-N` and zsh `+N` pick directory-stack entries.
+      /^[+-]/.test(word) ||
+      // CDPATH (from the environment the shell inherited) redirects a relative name.
+      (process.env.CDPATH && bareName(word))
     )
       return human(request, "unknown", "Directory change requires human review");
-    cwds = [...new Set([...cwds, ...state.cwds.map((cwd) => resolve(cwd, word))])];
+    // bash and zsh `cd` is logical: `..` drops the last written component. In physical mode (`cd
+    // -P`, `set -P`, `setopt chase_links`) it leaves the symlink's target. When the two differ, which
+    // one the shell uses is unknown here, so a person decides.
+    let next: string[];
+    try {
+      next = state.cwds.map((cwd) => {
+        const logical = resolve(cwd, word);
+        if (canonical(logical) !== canonical(resolveWord(cwd, raw as string)))
+          throw new Error("Logical and physical directories differ");
+        // A bare name that is not a directory, and that no earlier command creates, fails in a
+        // plain shell; options set in rc files (zsh CDABLE_VARS, a CDPATH set there) can still send
+        // it anywhere. The shell is then somewhere unknown, so nothing relative is approved there.
+        // `created` is recorded when a command is judged, not when it runs; with CDABLE_VARS a
+        // variable of the same name wins when the directory was not made.
+        if (
+          bareName(word) &&
+          !isDirectory(logical) &&
+          (!ctx.box.created?.has(logical) ||
+            state.vars.has(word) ||
+            process.env[word] !== undefined)
+        )
+          return UNKNOWN_CWD;
+        return logical;
+      });
+    } catch {
+      return human(request, "unknown", "Directory change requires human review");
+    }
+    cwds = [...new Set([...cwds, ...next])];
   }
   if (!cwds.length || cwds.length + state.cwds.length > MAX_DIRECTORIES)
     return human(request, "unknown", "Too many directory changes to verify");
@@ -864,7 +1087,7 @@ function callFunction(
   // `return` can stop the body anywhere, so the state after the call is any point in it: what the
   // body assigns is unknown, and a directory change in between cannot be followed.
   const returns = mayRun(fn.body.body, new Set(["return"]), state.funcs);
-  const moves = mayRun(fn.body.body, new Set(["cd", "pushd", "popd"]), state.funcs);
+  const moves = mayRun(fn.body.body, new Set(["cd", "chdir", "pushd", "popd"]), state.funcs);
   const inner = { ...ctx, calls: ctx.calls + 1 };
   const target = fn.body.kind === "subshell" ? copy(state) : state;
   const body = runList(inner, fn.body.body, target);
@@ -1165,6 +1388,7 @@ function runFor(
 ): Decision | undefined {
   if (BANNED_ENV.test(node.name))
     return human(ctx.request, "unknown", "Environment override requires human review");
+  const mark = reorderMark(ctx);
   const refusal = runSubs(
     ctx,
     node.words.flatMap((w) => w.subs),
@@ -1196,6 +1420,7 @@ function runFor(
     const body = runList({ ...ctx, loop: ctx.loop + 1 }, node.body, inner);
     if (body) return body;
   }
+  endReorder(ctx, mark);
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -1210,6 +1435,7 @@ function runWhile(
   assignedInList(node.body, changed, state.funcs);
   const inner = copy(state);
   forget(inner, changed);
+  const mark = reorderMark(ctx);
   const loop = { ...ctx, loop: ctx.loop + 1 };
   const refusal = runList(loop, node.cond, inner);
   if (refusal) return refusal;
@@ -1222,6 +1448,7 @@ function runWhile(
     const body = runList(loop, node.body, pass);
     if (body) return body;
   }
+  endReorder(ctx, mark);
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -1331,7 +1558,8 @@ function runList(
     // A background job runs in a subshell of its own.
     const target = item.background ? copy(state) : state;
     const { first, rest } = item.node;
-    const refusal = runPipeline(ctx, first, target);
+    if (item.background) ctx.box.script.jobs++;
+    const refusal = runPipeline(item.background ? { ...ctx, reorder: true } : ctx, first, target);
     if (refusal) return refusal;
     if (!rest.length) {
       if (last && outcome) outcome.success = copy(item.background ? state : target);
@@ -1387,11 +1615,13 @@ function runPipeline(
     return refusal;
   }
   const changed = new Set<string>();
+  const mark = reorderMark(ctx);
   for (const [index, stage] of node.stages.entries()) {
     assignedInCommand(stage, changed, state.funcs);
     const refusal = runCommand(ctx, stage, copy(state), index, true);
     if (refusal) return refusal;
   }
+  endReorder(ctx, mark);
   // The last stage may run in the current shell, so what the stages assign is unknown afterwards.
   forget(state, changed);
   return undefined;
@@ -1408,6 +1638,7 @@ export function commandDecision(
   profile: Profile,
   depth = 0,
   start: string[] = [request.cwd],
+  fill?: Fill,
 ): Decision {
   const script = parseScript(command);
   if (!script) return human(request, "unknown", UNSUPPORTED);
@@ -1418,7 +1649,8 @@ export function commandDecision(
     loop: 0,
     calls: 0,
     positional: !/argv/.test(command),
-    box: { calls: 0 },
+    box: { calls: 0, script: fill?.script ?? { tainted: false, approved: false, jobs: 0 } },
+    ...(fill?.reorder ? { reorder: true } : {}),
   };
   const opening = script.items[0];
   if (depth === 0 && opening && !opening.background) ctx.box.first = opening.node.first;

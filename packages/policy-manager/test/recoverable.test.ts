@@ -37,6 +37,13 @@ function decide(command: string, cwd = wt) {
   const r: Request = { sessionId: "t", harness: "claude", cwd, tool: "Bash", input: { command } };
   return evaluate(r, undefined, profile).decision;
 }
+const SCRATCH = "Delete within a scratch directory";
+/** Not approved, or approved only as a scratch deletion: never by this layer's Git or session evidence. */
+function notRecoverable(command: string, cwd = wt) {
+  const r: Request = { sessionId: "t", harness: "claude", cwd, tool: "Bash", input: { command } };
+  const d = evaluate(r, undefined, profile);
+  return d.decision !== "approve" || d.reason === SCRATCH;
+}
 /** Runs `change`, checks, then puts the worktree back to HEAD with the fixture's loose files. */
 function scenario(change: () => void, check: () => void) {
   try {
@@ -206,8 +213,10 @@ describe("recoverable rm", () => {
     expect(decide("rm link")).toBe("approve"); // the tracked link itself
     expect(decide("rm link/b.txt")).toBe("approve"); // resolves to dir/b.txt
     expect(decide("rm outlink")).toBe("approve");
-    expect(decide("rm outlink/o.txt")).toBe("human");
-    expect(decide("rm -r outlink/")).toBe("human");
+    // The fixture's `outside` is in the system temp directory, where a scratch deletion may still
+    // approve it; never as recoverable worktree content.
+    expect(notRecoverable("rm outlink/o.txt")).toBe(true);
+    expect(notRecoverable("rm -r outlink/")).toBe(true);
     expect(decide("rm newlink")).toBe("human"); // untracked link
   });
 });
@@ -302,7 +311,9 @@ describe("files this session created", () => {
     try {
       rmSync(join(wt, "probe.mjs"));
       symlinkSync(join(outside, "o.txt"), join(wt, "probe.mjs"));
-      expect(rm(s, "rm probe.mjs").decision).not.toBe("approve");
+      // The link points into the system temp directory, so only a scratch deletion may approve it.
+      const swapped = rm(s, "rm probe.mjs");
+      expect(swapped.decision !== "approve" || swapped.reason === SCRATCH).toBe(true);
       rmSync(join(wt, "probe.mjs"));
       linkSync(join(outside, "o.txt"), join(wt, "probe.mjs"));
       expect(rm(s, "rm probe.mjs").decision).not.toBe("approve");
@@ -689,9 +700,14 @@ describe("files this session created", () => {
   });
 
   test("worktree deletion is classified only when it is the script's whole effect", () => {
+    // Classified as a worktree deletion: other escalations (a redirect outside any repository) may
+    // reach the classifier too, but a destructive verdict cannot approve those.
     const classified = (command: string, cwd = wt) => {
       const s = session();
-      return s.review(bash(s, command, cwd), undefined, "PreToolUse").tier === "ambiguous";
+      const d = s.review(bash(s, command, cwd), undefined, "PreToolUse");
+      return (
+        d.tier === "ambiguous" && d.reason === "Deleting files inside a linked feature worktree"
+      );
     };
     expect(classified("rm new.txt")).toBe(true);
     expect(classified("ls && rm new.txt; echo done")).toBe(true);

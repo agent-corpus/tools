@@ -10,10 +10,26 @@ import {
 } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
-import type { Category, Classification, Decision, Request } from "./types.js";
+import {
+  CATEGORIES,
+  type Category,
+  type Classification,
+  type Decision,
+  type Request,
+} from "./types.js";
 
 export function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+/** Shell tools whose `description` only labels the command. Elsewhere it can be content. */
+const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell"]);
+/** The correlation hash of a request, over its effect-relevant input only. */
+export function requestHash(request: Request): string {
+  if (!SHELL_TOOLS.has(request.tool)) return hash(request);
+  const input = Object.fromEntries(
+    Object.entries(request.input ?? {}).filter(([key]) => key !== "description"),
+  );
+  return hash({ ...request, input });
 }
 // Deliberately accepts one simple command. Shell syntax and expansions need human review.
 export function words(command: string): string[] | undefined {
@@ -173,7 +189,7 @@ export function result(
     decision: approve ? "approve" : "human",
     category,
     reason,
-    requestHash: hash(request),
+    requestHash: requestHash(request),
     cache: approve && category === "cloud-read" ? "session" : "none",
     cached: false,
   };
@@ -262,16 +278,7 @@ export function evaluate(
   if (ai) {
     // Self-reported confidence is not a probability or a substitute for verified effects.
     if (
-      ![
-        "code-read",
-        "worktree-write",
-        "cloud-read",
-        "git-read",
-        "impactful-write",
-        "destructive",
-        "sensitive",
-        "unknown",
-      ].includes(ai.category) ||
+      !(CATEGORIES as readonly string[]).includes(ai.category) ||
       ai.requestHash !== decision.requestHash ||
       !Number.isFinite(ai.confidence) ||
       ai.confidence < 0 ||

@@ -7,10 +7,16 @@ import {
   type Target,
   withCreated,
 } from "./created.js";
-import { evaluate, hash } from "./policy.js";
+import { evaluate, hash, requestHash as requestHashOf } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
-import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
+import {
+  CATEGORIES,
+  type Classification,
+  type Decision,
+  type OutcomeReport,
+  type Request,
+} from "./types.js";
 
 /** How long a classification outcome for one exact request is remembered. */
 const CLASSIFICATION_TTL_MS = 5 * 60_000;
@@ -74,16 +80,7 @@ export class PolicySession {
     audit(this.directory, { event: "request", ...requestSummary(request) });
     if (
       ai &&
-      (![
-        "code-read",
-        "worktree-write",
-        "cloud-read",
-        "git-read",
-        "impactful-write",
-        "destructive",
-        "sensitive",
-        "unknown",
-      ].includes(ai.category) ||
+      (!(CATEGORIES as readonly string[]).includes(ai.category) ||
         typeof ai.confidence !== "number" ||
         !Number.isFinite(ai.confidence) ||
         (ai.recoverable !== undefined && typeof ai.recoverable !== "boolean") ||
@@ -95,14 +92,18 @@ export class PolicySession {
         decision: "human",
         category: "unknown",
         reason: "Malformed AI classification",
-        requestHash: hash(request),
+        requestHash: requestHashOf(request),
       });
       throw new Error("Malformed AI classification");
     }
-    const key = hash([hash(request), "policy-v1", this.profile.digest ?? this.profile.mode]);
+    const key = hash([
+      requestHashOf(request),
+      "policy-v1",
+      this.profile.digest ?? this.profile.mode,
+    ]);
     const entry = this.cache.get(key);
     const cachedAi = entry && entry.expires > Date.now() ? entry.ai : undefined;
-    const requestHash = hash(request);
+    const requestHash = requestHashOf(request);
     const known = ai ? undefined : this.state(requestHash);
     if (ai)
       audit(this.directory, {
