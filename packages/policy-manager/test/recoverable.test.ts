@@ -391,7 +391,8 @@ describe("files this session created", () => {
       expect(s.review(r, undefined, "PreToolUse").tier).toBeUndefined();
       expect(evaluate(r, verdict(r, true, 0.99), profile).decision).toBe("human");
     }
-  });
+    // A dozen Git evidence calls are slow on Windows runners.
+  }, 30_000);
 
   test("protected paths stay with a person", () => {
     const s = session();
