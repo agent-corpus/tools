@@ -782,7 +782,23 @@ describe("functions, positional parameters, parameter operations and read loops"
     ["set -- rm -rf y; $1 $2 $3", "destructive"],
     ["set -- $(echo rm); $1 -rf y", "unknown"],
     ["set -- $UNKNOWN; $1", "unknown"],
-    ['for p in "rm -rf" "ls -l"; do set -- $p; $1 $2 y; done', "destructive"],
+    ['for p in "rm -rf" "ls -l"; do set -- $p; $1 $2 y; done', "unknown"],
+    // zsh keeps "ok src" as one word, so $2 is empty and the path is the home directory's
+    ['for p in "ok src"; do set -- $p; touch "$2$HOME/.probe"; done', "unknown"],
+    ['p="ok src"; f() { touch "$2$HOME/.probe"; }; f $p', "unknown"],
+    // `set` with a non-option word replaces the positional parameters
+    ['set -- ok; set -e pipefail; touch "$1"', "unknown"],
+    // functions zsh and bash run with no call
+    ["TRAPEXIT() { rm -rf x; }; echo hi", "unknown"],
+    ["TRAPZERR() { rm -rf x; }; false", "unknown"],
+    ["zshexit() { rm -rf x; }; echo hi", "unknown"],
+    ["chpwd() { rm -rf x; }; cd src", "unknown"],
+    ["precmd() { :; }", "unknown"],
+    ["command_not_found_handler() { rm -rf x; }; nosuchcmd", "unknown"],
+    ["command_not_found_handle() { rm -rf x; }; nosuchcmd", "unknown"],
+    // zsh expands a word starting with = to a command path
+    ["X=abc; touch ${X:+=git}", "unknown"],
+    ["touch ${X:-=git}", "unknown"],
     ['for p in "a *"; do set -- $p; cat $2; done', "unknown"],
     ['for p in "a b"; do set -- $p; done; $1 -rf y', "unknown"],
     ["set -- ls; f() { $1 -rf y; }; f rm", "destructive"],
@@ -904,6 +920,12 @@ describe("functions, positional parameters, parameter operations and read loops"
       expect(decide(`cd ${wt} && S=src; ls $S`).decision).toBe("approve");
       expect(decide(`L=${wt}/a.txt; wc -l $L; ls -la $(dirname $L)`).decision).toBe("approve");
       expect(decide(`cd ${wt} && rm -rf src`).decision).toBe("human");
+      // Only the script's first command is trusted: an earlier `mv` can make the cd fail.
+      expect(
+        decide(`X=$HOME/.probe; mv ${wt}/src ${wt}/e; cd ${wt}/src && X=ok; touch "$X"`).decision,
+      ).toBe("human");
+      expect(decide(`ls; cd ${wt} && S=src; ls $S`).decision).toBe("human");
+      expect(decide(`bash -c 'cd ${wt} && S=src; ls $S'`).decision).toBe("human");
       // The cd is still allowed to have failed when judging where later commands run.
       expect(decide(`cd ${posix(scratch)} && echo x > n.txt`, join(root, "repo")).decision).toBe(
         "human",
@@ -913,9 +935,12 @@ describe("functions, positional parameters, parameter operations and read loops"
 
   test("each loop item or input line is judged with the values that belong together", () => {
     const items = Array.from({ length: 10 }, (_, i) => `"o/r${i} ${i}"`).join(" ");
+    // zsh does not split an unquoted parameter, so the positions `set -- $p` gives are unknown.
     expect(decide(`for p in ${items}; do set -- $p; gh pr view $2 -R $1; done`).decision).toBe(
-      "approve",
+      "human",
     );
+    const words = Array.from({ length: 10 }, (_, i) => `o/r${i}`).join(" ");
+    expect(decide(`for r in ${words}; do gh pr view 1 -R $r; done`).decision).toBe("approve");
     const lines = Array.from({ length: 10 }, (_, i) => `o/r${i} ${i}`).join("\n");
     expect(
       decide(`while read r n; do gh pr view $n -R $r; done <<'EOF'\n${lines}\nEOF`).decision,

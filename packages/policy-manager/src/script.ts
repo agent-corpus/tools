@@ -268,7 +268,8 @@ type Expansion =
   | { kind: "var"; name: string; next: number; op?: ParamOp }
   | { kind: "unknown"; next: number; inner?: string };
 
-const PARAM_WORD = /^[A-Za-z0-9_@%+=:,./-]*$/;
+/** No leading `=`: zsh's EQUALS option expands `=cmd` to a command path. */
+const PARAM_WORD = /^(?:[A-Za-z0-9_@%+:,./-][A-Za-z0-9_@%+=:,./-]*)?$/;
 const PARAM_PATTERN = /^[A-Za-z0-9_@%+=:,./*?-]+$/;
 
 /** The name and operation inside `${...}`, or undefined for a form that is not modelled. */

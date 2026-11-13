@@ -48,8 +48,7 @@ interface State {
   /**
    * Variables the script assigned: their known values, or null when the value is unknown (it came
    * from a command, a glob or a loop). A name that is absent was never assigned here, so it is an
-   * environment variable of unknown content. A list with a value that is not a simple word (a
-   * loop item with spaces) is unknown everywhere except where `set --` splits it.
+   * environment variable of unknown content.
    */
   vars: Map<string, string[] | null>;
   /** Functions the script defined; null when it may or may not be defined, or defined differently. */
@@ -64,7 +63,8 @@ interface Ctx {
   calls: number;
   /** False when the script could assign positional parameters through zsh's `argv` array. */
   positional: boolean;
-  box: { last?: Decision; calls: number };
+  /** `first` is the script's first top-level pipeline, the only `cd` trusted not to fail. */
+  box: { last?: Decision; calls: number; first?: PipelineNode };
 }
 
 const copy = (state: State): State => ({
@@ -648,8 +648,9 @@ function runSimple(
   // A prefix assignment before a special builtin outlives the command in some shells.
   if (name && SPECIAL_BUILTINS.has(name))
     for (const a of node.assigns) state.vars.set(a.name, null);
-  // `shift` moves every positional parameter down.
-  if (name === "shift") for (const p of POSITIONAL_NAMES) state.vars.set(p, null);
+  // `shift` moves every positional parameter down, and `set` with a non-option word (`set -e
+  // pipefail`) replaces them; only `set --` is tracked.
+  if (name === "shift" || name === "set") for (const p of POSITIONAL_NAMES) state.vars.set(p, null);
   if (name === "cd") return changeDirectory(ctx, state, piped, envs, build);
   if (name === "export") return exportVariables(ctx, node, state, piped, known, envs);
   if (name === "unset" || name === "read" || name === "printf" || name === "print") {
@@ -761,8 +762,8 @@ function clearPositional(state: State): Map<string, string[] | null> {
 
 /**
  * The values each argument word gives, in order. A word that could split into a different number
- * of words (an unquoted unknown, a glob) makes every later position unknown; an unquoted variable
- * whose known values are several plain words separated by blanks is split as the shell would.
+ * of words (an unquoted unknown, a glob) makes every later position unknown. Known values are
+ * single plain words, so bash and zsh (which does not split unquoted parameters) agree.
  */
 function argumentSlots(
   words: Word[],
@@ -778,20 +779,6 @@ function argumentSlots(
         : null,
     );
   for (const word of words) {
-    const only = word.parts.length === 1 ? word.parts[0] : undefined;
-    const ref =
-      typeof only === "object" && "name" in only && !only.quoted && !only.op ? only : undefined;
-    const raw = ref ? state.vars.get(ref.name) : undefined;
-    if (raw?.length && !raw.every((value) => SIMPLE_VALUE.test(value))) {
-      const fields = raw.map((value) => value.split(/[ \t\n]+/).filter(Boolean));
-      if (fields.some((list) => !list.length || list.some((f) => !SIMPLE_VALUE.test(f))))
-        return slots;
-      const counts = new Set(fields.map((list) => list.length));
-      const shortest = Math.min(...counts);
-      for (let k = 0; k < shortest; k++) add(new Set(fields.map((list) => list[k] as string)));
-      if (counts.size > 1) return slots;
-      continue;
-    }
     const texts = envs.map((env) => instantiate(word, known, env, state));
     if (word.glob || texts.some((t) => t.loose)) return slots;
     add(new Set(texts.map((t) => t.text)));
@@ -876,6 +863,13 @@ const NOT_A_FUNCTION = new Set([
   "alias",
 ]);
 
+/**
+ * Functions a shell runs with no call: zsh's special functions (zshmisc "Special Functions": the
+ * hooks and TRAPxxx traps) and the not-found handlers of zsh and bash.
+ */
+const SHELL_HOOK =
+  /^(?:TRAP[A-Z0-9]+|chpwd|precmd|preexec|periodic|zshexit|zshaddhistory|command_not_found_handler|command_not_found_handle)$/;
+
 function defineFunction(ctx: Ctx, node: FunctionNode, state: State): Decision | undefined {
   // sh and dash find a special builtin before a function, so the call would not be followed.
   if (
@@ -885,6 +879,8 @@ function defineFunction(ctx: Ctx, node: FunctionNode, state: State): Decision | 
     BANNED_ENV.test(node.name)
   )
     return human(ctx.request, "unknown", "A function named like a builtin requires human review");
+  if (SHELL_HOOK.test(node.name))
+    return human(ctx.request, "unknown", "A shell hook function requires human review");
   state.funcs.set(node.name, node);
   ctx.box.last = result(ctx.request, "code-read", "Function definition", true);
   return undefined;
@@ -1073,13 +1069,7 @@ function runFor(
   for (const env of combinations(known))
     for (const word of node.words) {
       const text = instantiate(word, known, env, state).text;
-      // A quoted item of several plain words ("o/r 12") is kept for `set -- $item` to split.
-      const fields = text.split(/[ \t\n]+/).filter(Boolean);
-      if (
-        SIMPLE_VALUE.test(text) ||
-        (word.quoted && fields.length && fields.every((f) => SIMPLE_VALUE.test(f)))
-      )
-        values.add(text);
+      if (SIMPLE_VALUE.test(text)) values.add(text);
       else unknown = true;
     }
   if (!values.size || values.size > MAX_VARIANTS) unknown = true;
@@ -1192,14 +1182,17 @@ function runCase(
  * and can be entered now. Only used to know that an `&&` chain goes on past it; the directory it
  * started from is still kept as possible.
  */
-function cannotFail(node: PipelineNode, state: State): boolean {
+function cannotFail(ctx: Ctx, node: PipelineNode, state: State): boolean {
   const stage = node.stages.length === 1 && !node.negated ? node.stages[0] : undefined;
   if (stage?.kind !== "simple" || stage.assigns.length || stage.redirects.length) return false;
   const argv = stage.argv.map(plainText);
   const [program, target] = argv;
   if (program === undefined || state.funcs.has(program)) return false;
   if ((program === "true" || program === ":") && argv.length === 1) return true;
-  if (program !== "cd" || argv.length !== 2 || target === undefined) return false;
+  // An earlier command (`mv`, a background job) could remove the directory, so only the script's
+  // first command is trusted. Another process can still change it before the script runs.
+  if (program !== "cd" || argv.length !== 2 || target === undefined || node !== ctx.box.first)
+    return false;
   const path =
     target === "~" || target.startsWith("~/") ? join(homedir(), target.slice(1)) : target;
   if (!path.startsWith("/") || /[*?[\]]/.test(path)) return false;
@@ -1235,12 +1228,12 @@ function runList(
     // An all-`&&` chain cannot stop after a step that cannot fail, and succeeds only at the end.
     const chain = rest.every((r) => r.op === "&&");
     let running = copy(target);
-    let possible = chain && cannotFail(first, target) ? undefined : copy(target);
+    let possible = chain && cannotFail(ctx, first, target) ? undefined : copy(target);
     for (const [step, next] of rest.entries()) {
       running = copy(running);
       const skipped = runPipeline(ctx, next.node, running);
       if (skipped) return skipped;
-      if (!chain || step === rest.length - 1 || !cannotFail(next.node, running))
+      if (!chain || step === rest.length - 1 || !cannotFail(ctx, next.node, running))
         possible = possible ? merge(possible, running) : copy(running);
       if (possible && possible.cwds.length > MAX_DIRECTORIES)
         return human(ctx.request, "unknown", "Too many directory changes to verify");
@@ -1288,6 +1281,8 @@ export function commandDecision(
     positional: !/argv/.test(command),
     box: { calls: 0 },
   };
+  const opening = script.items[0];
+  if (depth === 0 && opening && !opening.background) ctx.box.first = opening.node.first;
   const refusal = runList(ctx, script, { cwds: [...start], vars: new Map(), funcs: new Map() });
   return refusal ?? ctx.box.last ?? human(request, "unknown", "Empty command");
 }
