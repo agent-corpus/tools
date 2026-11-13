@@ -228,9 +228,7 @@ describe("permissive profile", () => {
     ["git push --force-with-lease", "destructive"],
     ["git push origin +feature", "destructive"],
     ["git push --mirror origin", "destructive"],
-    ["git reset --hard HEAD~1", "destructive"],
     ["git clean -fd", "destructive"],
-    ["git checkout -- .", "destructive"],
     ["git restore src/a.ts", "destructive"],
     ["git stash drop", "destructive"],
     ["git config core.hooksPath /tmp/x", "sensitive"],
@@ -260,7 +258,6 @@ describe("permissive profile", () => {
     ["git push --force-with-leas origin feature", "destructive"],
     ["git push --forc origin feature", "destructive"],
     ["git push --mirro origin", "destructive"],
-    ["git reset --har HEAD~1", "destructive"],
     ["cd /etc && echo x > note.txt", "worktree-write"],
     // The fixtures sit in the temp dir, so `..` alone is disposable; `repo/` is a checkout.
     ["cd .. && rm -rf repo/x", "destructive"],
@@ -373,6 +370,8 @@ describe("permissive profile", () => {
     expect(decide("cd sub && echo x > note.txt", scratch).decision).toBe("approve");
     expect(decide("cd /etc && echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd /etc || echo x > note.txt", scratch).decision).toBe("human");
+    expect(decide("cd /etc && ls || echo x > note.txt", scratch).decision).toBe("human");
+    expect(decide("cd sub && cd /etc; echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd && ls", scratch).decision).toBe("approve");
     expect(decide("cd && echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd /tmp > /etc/hosts", scratch).decision).toBe("human");

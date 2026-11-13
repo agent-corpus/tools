@@ -21,6 +21,16 @@ import { commandDecision } from "./flow.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result } from "./policy.js";
 import type { Profile } from "./profile.js";
+import {
+  deletesProtected,
+  deletionScriptCwd,
+  gitRmRecoverable,
+  resetRecoverable,
+  restoreRecoverable,
+  rmRecoverable,
+  soleEffect,
+  worktreeDeletion,
+} from "./recoverable.js";
 import { type Redirect, type SimpleCommand, SUBSTITUTION } from "./shell.js";
 import type { Decision, Request } from "./types.js";
 
@@ -705,7 +715,49 @@ function safeConfigWrite(rest: string[]): boolean {
   return words.length >= 1 && words.length <= 2 && SAFE_CONFIG_KEYS.test(words[0] ?? "");
 }
 
-function gitDecision(request: Request, argv: string[], cwdForGit: string): Decision {
+const RECOVERABLE = "Removes only tracked content Git can restore, in a linked feature worktree";
+const SESSION_CREATED =
+  "Removes files this session created, unchanged since, in a feature worktree";
+/** The one destructive reason the session classifier may decide; every other stays a person's. */
+export const WORKTREE_DELETION = "Deleting files inside a linked feature worktree";
+
+/** Splits `args` at the first `--`: options and words before it, and the words after it. */
+function splitDashes(args: string[]): { before: string[]; after: string[] | undefined } {
+  const at = args.indexOf("--");
+  return at < 0
+    ? { before: args, after: undefined }
+    : { before: args.slice(0, at), after: args.slice(at + 1) };
+}
+
+/** Paths of `git checkout -- <paths>` or `git checkout .`, with at most -q; else undefined. */
+function checkoutPaths(rest: string[]): string[] | undefined {
+  const { before, after } = splitDashes(rest);
+  if (before.some((word) => !["-q", "--quiet"].includes(word) && word.startsWith("-")))
+    return undefined;
+  const positional = before.filter((word) => !word.startsWith("-"));
+  if (after) return positional.length ? undefined : after;
+  return positional.length === 1 && positional[0] === "." ? positional : undefined;
+}
+
+/** Paths and source of `git restore [-W] [-S] [-q] [--] <paths>`; else undefined. */
+function restorePaths(rest: string[]): { paths: string[]; fromHead: boolean } | undefined {
+  const { before, after } = splitDashes(rest);
+  const flags = before.filter((word) => word.startsWith("-"));
+  const known = ["--worktree", "--staged", "--quiet"];
+  if (flags.some((flag) => !/^-[SWq]+$/.test(flag) && !known.includes(flag))) return undefined;
+  const staged = flags.some((flag) => flag === "--staged" || /^-[SWq]*S/.test(flag));
+  return {
+    paths: [...before.filter((word) => !word.startsWith("-")), ...(after ?? [])],
+    fromHead: staged,
+  };
+}
+
+function gitDecision(
+  request: Request,
+  argv: string[],
+  cwdForGit: string,
+  sole: () => boolean,
+): Decision {
   const args = argv.slice(1);
   let index = 0;
   let cwd = cwdForGit;
@@ -737,8 +789,19 @@ function gitDecision(request: Request, argv: string[], cwdForGit: string): Decis
   }
   if (sub === "branch" && (has("-f", "--force") || cluster("f") || has("-M")))
     return human(request, "destructive", "Forced branch move requires human approval");
-  if (sub === "reset" && has("--hard"))
-    return human(request, "destructive", "git reset --hard discards work");
+  if (sub === "rm" && (has("-f", "--force") || cluster("f")))
+    return sole() && gitRmRecoverable(cwd, rest)
+      ? ok(RECOVERABLE)
+      : human(request, "destructive", "git rm --force can discard uncommitted changes");
+  if (sub === "reset" && has("--hard")) {
+    const plain =
+      !rest.includes("--") &&
+      positional.length <= 1 &&
+      flags.every((flag) => abbreviates(flag, "--hard") || ["-q", "--quiet"].includes(flag));
+    return plain && sole() && resetRecoverable(cwd, positional[0])
+      ? ok("Reset loses no uncommitted work, and dropped commits are on a remote ref")
+      : human(request, "destructive", "git reset --hard discards work");
+  }
   if (sub === "clean" && !has("-n", "--dry-run") && !cluster("n"))
     return human(request, "destructive", "git clean deletes untracked files");
   if (
@@ -747,10 +810,18 @@ function gitDecision(request: Request, argv: string[], cwdForGit: string): Decis
       rest.includes("--") ||
       positional.includes(".") ||
       positional.includes(":/"))
-  )
-    return human(request, "destructive", "git checkout would discard working-tree changes");
-  if (sub === "restore" && (!has("--staged", "-S") || has("--worktree", "-W") || cluster("W")))
-    return human(request, "destructive", "git restore would discard working-tree changes");
+  ) {
+    const paths = checkoutPaths(rest);
+    return paths && sole() && restoreRecoverable(cwd, paths, false)
+      ? ok("Checkout overwrites no working-tree change")
+      : human(request, "destructive", "git checkout would discard working-tree changes");
+  }
+  if (sub === "restore" && (!has("--staged", "-S") || has("--worktree", "-W") || cluster("W"))) {
+    const parsed = restorePaths(rest);
+    return parsed && sole() && restoreRecoverable(cwd, parsed.paths, parsed.fromHead)
+      ? ok("Restore overwrites no working-tree change")
+      : human(request, "destructive", "git restore would discard working-tree changes");
+  }
   if (sub === "switch" && has("-f", "--force", "--discard-changes"))
     return human(request, "destructive", "git switch would discard working-tree changes");
   if (sub === "stash" && ["drop", "clear"].includes(positional[0] ?? ""))
@@ -1231,8 +1302,25 @@ export function simpleDecision(
   }
   if (operands.paths.some((path) => sensitive(path)))
     return human(request, "sensitive", "Protected path requires human approval");
+  if (["rm", "rmdir", "unlink", "shred", "srm"].includes(program) && deletesProtected(cwd, args))
+    return human(request, "sensitive", "Deleting a protected or credential path requires a human");
   if (scratchDeletion(program, args, cwd, profile, fill))
     return result(request, "temp-write", "Delete within a scratch directory", true);
+  if (argv[0] === "rm" && command.argv[0] === "rm") {
+    const kind = depth === 0 && soleEffect(request) ? rmRecoverable(cwd, args) : undefined;
+    if (kind)
+      return result(
+        request,
+        "worktree-write",
+        kind === "tracked" ? RECOVERABLE : SESSION_CREATED,
+        true,
+      );
+    // Classified only when this `rm` is the script's whole effect, in its one known directory;
+    // otherwise this first refusal would hide every later command from the classifier's verdict.
+    const only = depth === 0 ? deletionScriptCwd(request) : undefined;
+    if (only !== undefined && resolve(only) === resolve(cwd) && worktreeDeletion(cwd, args))
+      return human(request, "destructive", WORKTREE_DELETION);
+  }
   if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
     return human(request, "destructive", "Destructive operation requires human approval");
   if (REMOTE_EXECUTORS.has(program))
@@ -1367,7 +1455,13 @@ export function simpleDecision(
     /(?:-X|--request)[=\s]?(?:DELETE|PUT)\b/i.test(joined)
   )
     return human(request, "destructive", "Destructive HTTP verbs require human approval");
-  if (program === "git") return gitDecision(request, argv, cwd);
+  if (program === "git")
+    return gitDecision(
+      request,
+      argv,
+      cwd,
+      () => argv[0] === "git" && command.argv[0] === "git" && depth === 0 && soleEffect(request),
+    );
   if (program === "gh") {
     const gh = ghDecision(request, argv);
     if (gh) return gh;

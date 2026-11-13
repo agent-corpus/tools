@@ -2,7 +2,7 @@ export { executionReport, hookOutput, hookResponse, normalize } from "./adapters
 export { branchEvidence, pathEvidence } from "./evidence.js";
 export { mergedEvidence } from "./merged.js";
 export { evaluate, hash, requestHash, words } from "./policy.js";
-export { APPROVAL_PRINCIPLE, HUMAN_ONLY_FOR } from "./principle.js";
+export { HUMAN_ONLY_FOR, HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
 export type { Profile } from "./profile.js";
 export {
   defaultProfilePath,

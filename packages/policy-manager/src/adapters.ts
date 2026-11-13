@@ -1,5 +1,5 @@
 import { requestHash } from "./policy.js";
-import { APPROVAL_PRINCIPLE } from "./principle.js";
+import { HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
 import { CATEGORIES, type Decision, type OutcomeReport, type Request } from "./types.js";
 export function normalize(harness: Request["harness"], payload: Record<string, unknown>): Request {
   let input: unknown = payload.tool_input ?? payload.toolInput ?? payload.toolArgs ?? {};
@@ -53,7 +53,7 @@ function classifyInstruction(
   context?: HookContext,
 ): string {
   const command = classifyCommand(harness, context);
-  return `Needs classification (not an error): not run yet. Ask the session's policy-manager agent whether this exact command is recoverable and non-sensitive, record its answer, then retry the same command unchanged. Rule: ${APPROVAL_PRINCIPLE} Request ${decision.requestHash}: ${decision.reason}. Answer shape: {"requestHash":"${decision.requestHash}","category":"${CATEGORIES.join("|")}","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record it by replacing <json> in this command, with no single quotes in the answer: ${command} If no classification is available, retry once and the user will be asked.`;
+  return `Needs classification (not an error): not run yet. Ask the session's policy-manager agent whether this exact command is recoverable and non-sensitive, record its answer, then retry the same command unchanged. Rule: ${HUMAN_REVIEW_PRINCIPLE} Request ${decision.requestHash}: ${decision.reason}. Answer shape: {"requestHash":"${decision.requestHash}","category":"${CATEGORIES.join("|")}","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record it by replacing <json> in this command, with no single quotes in the answer: ${command} If no classification is available, retry once and the user will be asked.`;
 }
 export function hookResponse(
   harness: Request["harness"],

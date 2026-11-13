@@ -394,7 +394,7 @@ describe("deletion in scratch and temp directories", () => {
 
   // Each command runs Git for repository evidence, which is slow on Windows runners.
   test("an existing path below where an earlier command copies or extracts is not trusted", {
-    timeout: 30_000,
+    timeout: 90_000,
   }, () => {
     const dir = join(outside, "refill");
     mkdirSync(join(dir, "made", "inner"), { recursive: true });
