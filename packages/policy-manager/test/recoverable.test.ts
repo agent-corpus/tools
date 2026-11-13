@@ -144,7 +144,8 @@ describe("recoverable rm", () => {
   test("the main clone and an absolute path outside the worktree stay human", () => {
     expect(decide("rm a.txt", repo)).toBe("human");
     expect(decide(`rm ${join(repo, "a.txt")}`)).toBe("human");
-    expect(decide(`rm ${join(wt, "a.txt")}`)).toBe("approve");
+    // Backslash paths are never approved; the shell reads them as escapes.
+    expect(decide(`rm ${join(wt, "a.txt")}`)).toBe(links ? "approve" : "human");
   });
 
   test("a modified, staged, or assume-unchanged file stays human", () => {
