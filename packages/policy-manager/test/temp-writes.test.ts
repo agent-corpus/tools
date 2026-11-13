@@ -370,6 +370,39 @@ describe("deletion in scratch and temp directories", () => {
       expect(bash(command, outside).decision, command).toBe("approve");
   });
 
+  test("a path below a directory an earlier command fills is not trusted", () => {
+    // A clone, copy, move or archive can bring a symlink that leaves temp.
+    for (const command of [
+      "git clone https://example.com/o/r.git cl && rm -rf cl/out/dist",
+      "git clone https://example.com/o/r.git cl && cd cl && rm -rf out/dist",
+      "git clone https://example.com/o/r.git cl && echo x > cl/out/w.txt",
+      "git clone https://example.com/o/r.git cl && touch cl/out/w.txt",
+      "cp -R sub made && rm -rf made/inner/dist",
+      "mv sub made && rm -rf made/inner/dist",
+      "cp -R sub made && cd made && rm -rf inner/dist",
+      "tar xf a.tar && rm -rf ex/out/dist",
+      "unzip a.zip && rm -rf ex/out/dist",
+      "for x in 1 2; do rm -rf cl/out/dist; git clone https://example.com/o/r.git cl; done",
+      "rm -rf cl/out/dist | git clone https://example.com/o/r.git cl",
+    ])
+      refused(command, outside);
+    // A missing directory that only mkdir created, and existing directories, stay approved.
+    for (const command of [
+      "mkdir -p fresh/out && rm -rf fresh/out/dist",
+      "git clone https://example.com/o/r.git cl2 && rm -rf cl2",
+      `git clone https://example.com/o/r.git cl3 && echo x > ${posix(outside)}/w.txt`,
+    ])
+      expect(bash(command, outside).decision, command).toBe("approve");
+  });
+
+  test("a variable named like a created directory makes the cd unknown (CDABLE_VARS)", () => {
+    for (const command of [
+      `made5=${posix(main)}; false && mkdir made5; cd made5 && rm -rf dist`,
+      `mkdir made6 && rmdir made6 && made6=${posix(main)} && cd made6 && rm -rf dist`,
+    ])
+      refused(command, outside);
+  });
+
   test("the reviewer's create-then-cd idioms are approved in a worktree", () => {
     for (const command of [
       "mkdir -p newdir && cd newdir && ls",

@@ -13,6 +13,7 @@ import {
   protectedPath,
   resolveWord,
   sensitive,
+  settled,
   tempRoots,
   tempWrite,
 } from "./evidence.js";
@@ -511,7 +512,13 @@ function knownFindExpression(words: string[]): boolean {
  * `rm`, `rmdir`, `unlink` or `find ... -delete` whose every target is disposable: strictly inside
  * a scratch root or the system temp directory (see `disposable`).
  */
-function scratchDeletion(program: string, args: string[], cwd: string, profile: Profile): boolean {
+function scratchDeletion(
+  program: string,
+  args: string[],
+  cwd: string,
+  profile: Profile,
+  populated: boolean,
+): boolean {
   const roots = [...profile.scratchRoots, ...tempRoots()];
   let targets: string[];
   if (program === "rm" || program === "rmdir" || program === "unlink") {
@@ -556,7 +563,7 @@ function scratchDeletion(program: string, args: string[], cwd: string, profile: 
     if (!knownFindExpression(args.slice(index))) return false;
     if (targets.length === 0) targets = ["."];
   } else return false;
-  return targets.length > 0 && targets.every((target) => disposable(cwd, target, roots));
+  return targets.length > 0 && targets.every((target) => disposable(cwd, target, roots, populated));
 }
 
 export function permissiveRead(cwd: string, input: string) {
@@ -583,7 +590,11 @@ export function permissiveRead(cwd: string, input: string) {
   }
 }
 
-export function permissiveWrite(cwd: string, input: string, profile: Profile) {
+/**
+ * `populated` means an earlier command in the same script may have created directories with
+ * content, so a path whose directory does not exist yet cannot be resolved.
+ */
+export function permissiveWrite(cwd: string, input: string, profile: Profile, populated = false) {
   let lexical: string | undefined;
   let path: string | undefined;
   try {
@@ -594,6 +605,12 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile) {
         allowed: false,
         category: "sensitive" as const,
         reason: "Protected path requires human approval",
+      };
+    if (populated && !settled(input, lexical))
+      return {
+        allowed: false,
+        category: "worktree-write" as const,
+        reason: "Write below a directory an earlier command creates requires human review",
       };
     // Never let a scratch root reach the policy service's own session directories.
     const target = path;
@@ -977,6 +994,7 @@ export function redirectDecision(
   redirect: Redirect,
   profile: Profile,
   cwd: string,
+  populated = false,
 ): Decision | undefined {
   if (redirect.target.includes(SUBSTITUTION))
     return human(request, "unknown", "Command substitution in a redirection requires human review");
@@ -989,7 +1007,7 @@ export function redirectDecision(
   const check =
     redirect.op === "<"
       ? permissiveRead(cwd, redirect.target)
-      : permissiveWrite(cwd, redirect.target, profile);
+      : permissiveWrite(cwd, redirect.target, profile, populated);
   return check.allowed ? undefined : human(request, check.category, check.reason);
 }
 
@@ -1093,12 +1111,13 @@ export function simpleDecision(
   depth: number,
   stageIndex: number,
   cwd: string,
+  populated = false,
 ): Decision {
   for (const [name] of command.env)
     if (BANNED_ENV.test(name))
       return human(request, "unknown", "Environment override requires human review");
   for (const redirect of command.redirects) {
-    const refusal = redirectDecision(request, redirect, profile, cwd);
+    const refusal = redirectDecision(request, redirect, profile, cwd, populated);
     if (refusal) return refusal;
   }
   const unwrapped = unwrap(command.argv);
@@ -1204,7 +1223,7 @@ export function simpleDecision(
   }
   if (operands.paths.some((path) => sensitive(path)))
     return human(request, "sensitive", "Protected path requires human approval");
-  if (scratchDeletion(program, args, cwd, profile))
+  if (scratchDeletion(program, args, cwd, profile, populated))
     return result(request, "temp-write", "Delete within a scratch directory", true);
   if (DESTRUCTIVE.has(program) || program.startsWith("mkfs"))
     return human(request, "destructive", "Destructive operation requires human approval");
@@ -1291,7 +1310,7 @@ export function simpleDecision(
         ? textOperands(program, args).files
         : args.filter((arg) => !arg.startsWith("-")).slice(1);
     for (const file of files) {
-      const check = permissiveWrite(cwd, file, profile);
+      const check = permissiveWrite(cwd, file, profile, populated);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   } else if (WRITERS.has(program)) {
@@ -1308,7 +1327,7 @@ export function simpleDecision(
       ...args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg)),
       ...optionValues,
     ]) {
-      const check = permissiveWrite(cwd, file, profile);
+      const check = permissiveWrite(cwd, file, profile, populated);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   }

@@ -151,6 +151,8 @@ Writes outside every repository to the system temp directory (`os.tmpdir()`, plu
 
 Deleting disposable files is approved too (`Delete within a scratch directory`): `rm`, `rmdir`, `unlink` and `find ... -delete` (without `-exec`, `-L` or `-follow`) when every target resolves strictly inside a `scratchRoots` entry or the system temp directory, never the root itself. A glob may appear only in the last component, and its directory must itself be strictly inside a root, so `rm -rf /tmp/*` still asks. Targets in or holding a Git repository (unpushed work), `acp-*` policy state, and protected or credential names still go to a person.
 
+A path is resolved when the hook runs, before the script does. So once a command that can create directories with content (`git clone`, `cp -R`, `mv`, `tar`, anything but `mkdir` and a few inert builtins) has run earlier in the same script, a write or delete whose directory does not exist yet goes to a person: the new directory could hold a symlink that leaves the root. Inside a loop or a pipeline, where a later command can run first, the same holds for every command.
+
 Credential-path checks skip words that are text, not paths: a `sed` script (but not the files its `r`, `w` or `e` commands name, nor `-f`), a `grep` or `rg` pattern, and `gh` `--body`, `--title`, `--jq`, `--template` and `--notes` values. Other programs keep the conservative check.
 
 #### Shell syntax in permissive mode

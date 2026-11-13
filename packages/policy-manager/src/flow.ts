@@ -77,6 +77,8 @@ interface Ctx {
     first?: PipelineNode;
     /** Directories that earlier commands create, so a later `cd` into one is not unknown. */
     created?: Set<string>;
+    /** An earlier command may have created directories with content (a clone, a copy, an archive). */
+    populated?: boolean;
   };
 }
 
@@ -323,7 +325,13 @@ function runRedirects(ctx: Ctx, redirs: Redir[], state: State): Decision | undef
       const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
       if (!redirect) continue;
       for (const cwd of state.cwds) {
-        const check = redirectDecision(ctx.request, redirect, ctx.profile, cwd);
+        const check = redirectDecision(
+          ctx.request,
+          redirect,
+          ctx.profile,
+          cwd,
+          populatedNow(ctx, false),
+        );
         if (check) return check;
       }
     }
@@ -655,7 +663,7 @@ function runSimple(
         const redirect = toRedirect(redir, instantiate(redir.target, known, env, state).text);
         if (!redirect) continue;
         for (const cwd of state.cwds) {
-          const check = redirectDecision(request, redirect, profile, cwd);
+          const check = redirectDecision(request, redirect, profile, cwd, populatedNow(ctx, piped));
           if (check) return check;
         }
       }
@@ -679,9 +687,11 @@ function runSimple(
     for (const cwd of state.cwds) {
       if (++ctx.box.calls > MAX_JUDGEMENTS)
         return human(request, "unknown", "Too many commands to verify");
-      const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd);
+      const populated = populatedNow(ctx, piped);
+      const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd, populated);
       if (decision.decision !== "approve") return decision;
       ctx.box.last = decision;
+      if (!INERT.has(unwrap(command.argv).argv[0] ?? "")) ctx.box.populated = true;
       for (const dir of createdDirectories(unwrap(command.argv).argv)) {
         if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
         ctx.box.created ??= new Set();
@@ -723,6 +733,47 @@ function runSimple(
     forget(state, forgotten);
   }
   return undefined;
+}
+
+/** Programs that never create a directory or a symlink. */
+const INERT = new Set([
+  "cd",
+  "chdir",
+  "export",
+  "set",
+  "shift",
+  "unset",
+  "read",
+  "local",
+  "mkdir",
+  "echo",
+  "printf",
+  "print",
+  "true",
+  "false",
+  ":",
+  "pwd",
+  "test",
+  "[",
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "grep",
+  "rg",
+  "touch",
+  "rm",
+  "rmdir",
+  "sleep",
+  "date",
+]);
+/**
+ * Whether a path whose directory does not exist yet may first be created with content by another
+ * command: an earlier one, or, in a loop or pipeline, a later one that runs first.
+ */
+function populatedNow(ctx: Ctx, piped: boolean): boolean {
+  return !!ctx.box.populated || ctx.loop > 0 || piped;
 }
 
 /** git clone options that take a separate value. */
@@ -850,7 +901,15 @@ function changeDirectory(
         // A bare name that is not a directory, and that no earlier command creates, fails in a
         // plain shell; options set in rc files (zsh CDABLE_VARS, a CDPATH set there) can still send
         // it anywhere. The shell is then somewhere unknown, so nothing relative is approved there.
-        if (bareName(word) && !isDirectory(logical) && !ctx.box.created?.has(logical))
+        // `created` is recorded when a command is judged, not when it runs; with CDABLE_VARS a
+        // variable of the same name wins when the directory was not made.
+        if (
+          bareName(word) &&
+          !isDirectory(logical) &&
+          (!ctx.box.created?.has(logical) ||
+            state.vars.has(word) ||
+            process.env[word] !== undefined)
+        )
           return UNKNOWN_CWD;
         return logical;
       });

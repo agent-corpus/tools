@@ -217,7 +217,21 @@ function holdsRepository(path: string): boolean {
  * repository (unpushed work). A glob is allowed only in the last component, and then its
  * directory must itself be strictly inside a root.
  */
-export function disposable(cwd: string, input: string, roots: string[]): boolean {
+/**
+ * Whether the directory a path is looked up through exists now. When it does not, a command that
+ * runs earlier in the same script can create it with a symlink inside (`git clone`, `cp -R`, `tar`),
+ * so the path cannot be resolved when the hook runs.
+ */
+export function settled(input: string, lexical: string): boolean {
+  return existsSync(/[\\/]\.?$/.test(input) ? lexical : dirname(lexical));
+}
+
+export function disposable(
+  cwd: string,
+  input: string,
+  roots: string[],
+  populated = false,
+): boolean {
   try {
     let target = input;
     if (/[*?[]/.test(input)) {
@@ -229,6 +243,7 @@ export function disposable(cwd: string, input: string, roots: string[]): boolean
     const lexical = resolveWord(cwd, target);
     const path = canonical(lexical);
     if (
+      (populated && !settled(target, lexical)) ||
       policyState(lexical) ||
       policyState(path) ||
       sensitive(lexical) ||
