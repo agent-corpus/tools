@@ -18,8 +18,9 @@ import { PolicySession } from "../src/session.js";
 import type { Request } from "../src/types.js";
 
 const links = process.platform !== "win32";
-// Every decision here reads live Git evidence, which is slow on Windows runners.
-vi.setConfig({ testTimeout: 30_000 });
+// Every decision here reads live Git evidence, which is slow on Windows runners. Scoped to this
+// file's suites: `vi.setConfig` would also override other files' explicit timeouts in the worker.
+const SLOW = { timeout: 30_000 };
 let root: string, repo: string, wt: string, outside: string;
 const profile = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
 
@@ -121,7 +122,7 @@ beforeAll(() => {
 });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-describe("recoverable rm", () => {
+describe("recoverable rm", SLOW, () => {
   test.each([
     "rm a.txt",
     "rm -f a.txt dir/b.txt",
@@ -221,7 +222,7 @@ describe("recoverable rm", () => {
   });
 });
 
-describe("cd into a worktree", () => {
+describe("cd into a worktree", SLOW, () => {
   // A Windows path in shell text has backslashes, which are escapes; such commands stay human.
   test.skipIf(!links)("`cd <worktree> && rm` is judged only in the worktree", () => {
     expect(decide(`cd ${wt} && rm a.txt`, repo)).toBe("approve");
@@ -232,7 +233,7 @@ describe("cd into a worktree", () => {
   });
 });
 
-describe("files this session created", () => {
+describe("files this session created", SLOW, () => {
   let n = 0;
   function session(id = `s${n++}`) {
     const directory = mkdtempSync(join(root, "audit-"));
@@ -780,7 +781,7 @@ describe("files this session created", () => {
   });
 });
 
-describe("git rm", () => {
+describe("git rm", SLOW, () => {
   test("plain git rm keeps relying on git's own safety check", () =>
     expect(decide("git rm new.txt")).toBe("approve"));
   test("git rm --force needs the same evidence as rm", () => {
@@ -803,7 +804,7 @@ describe("git rm", () => {
   });
 });
 
-describe("git reset --hard, checkout and restore", () => {
+describe("git reset --hard, checkout and restore", SLOW, () => {
   test("clean worktree: reset, checkout and restore lose nothing", () => {
     expect(decide("git reset --hard")).toBe("approve");
     expect(decide("git reset --hard HEAD")).toBe("approve");
