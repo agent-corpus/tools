@@ -63,11 +63,39 @@ describe("script parser", () => {
     "echo {a,b}",
     "echo a{b,c}",
     "echo {1..3}",
-    "echo {}",
-    "f() { ls; }",
+    "echo {x}{a,b}",
+    'echo {"a",b}',
+    "echo {a{x}b,c}",
+    "f() ls",
+    "f() { ls; } > out",
+    "1f() { ls; }",
+    "f(x) { ls; }",
     "(( 1 + 1 ))",
     "echo $((1+2))",
-    "echo $'a'",
+    "echo $'a\\'b'",
+    "echo $'\\0'",
+    "echo $'\\x00'",
+    "echo $'\\cA'",
+    "echo $'\\u0041'",
+    "echo $'unterminated",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${X:=y}",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${X:?y}",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${!X}",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${X/a/b}",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${X:-$(rm -rf y)}",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${X:-a b}",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${X#[ab]}",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell syntax under test
+    "echo ${X: -1}",
+    "echo !(x)",
+    "echo a!(b)",
     "echo a (b)",
     "ls (a)",
     "if true; then ls",
@@ -321,7 +349,6 @@ describe("evaluation of scripts", () => {
     ["for c in ls rm; do $c -rf y; done", "destructive"],
     ["X=/etc; cat $X/passwd > /dev/null; rm -rf $X", "destructive"],
     ["X=.ssh; cat ~/$X/id_rsa", "sensitive"],
-    ["D=~/.aws; ls $D", "unknown"],
     ["F=.config/gh/hosts.yml; cat ~/$F", "sensitive"],
     ["O=.claude/settings.json; echo x > $O", "sensitive"],
     ["O=/etc/passwd; echo x > $O", "worktree-write"],
@@ -382,7 +409,7 @@ describe("evaluation of scripts", () => {
     ["mapfile -t A < f", "unknown"],
     ["getopts ab o", "unknown"],
     ["set -o vi", "unknown"],
-    ["set -- a b", "unknown"],
+    ["set -e -- a b", "unknown"],
     ["eval 'rm -rf x'", "destructive"],
     ["X='rm -rf y'; eval $X", "unknown"],
     ["source ./x.sh", "destructive"],
@@ -717,3 +744,275 @@ describe("evaluation of scripts", () => {
     expect(decide("D=C:/Users/x; ls $D").decision).toBe("approve");
   });
 });
+
+/* biome-ignore-start lint/suspicious/noTemplateCurlyInString: shell syntax under test */
+describe("functions, positional parameters, parameter operations and read loops", () => {
+  test.each([
+    // functions: every call is judged with its arguments
+    ["X=rm; f() { $X -rf y; }; f", "destructive"],
+    ['f() { rm -rf "$1"; }; f x', "destructive"],
+    ["f() { $1 -rf y; }; f rm", "destructive"],
+    ["f() { $1 -rf y; }; f $(echo ls)", "unknown"],
+    ["f() { g; }; g() { rm -rf x; }; f", "destructive"],
+    ["f() ( rm -rf x ); f", "destructive"],
+    ["f() { ls; }; f | cat; g() { rm -rf x; }; echo | g", "destructive"],
+    // a function named like a program replaces it, behind a wrapper or variable too
+    ["ls() { rm -rf x; }; ls", "destructive"],
+    ["ls() { rm -rf x; }; time ls", "unknown"],
+    ["ls() { rm -rf x; }; nohup ls", "unknown"],
+    ["X=ls; ls() { rm -rf y; }; $X", "unknown"],
+    ["f() { f; }; f", "unknown"],
+    ["f() { cd /etc; }; f; echo x > a.txt", "worktree-write"],
+    ["if true; then f() { ls; }; fi; f", "unknown"],
+    ["f() { ls; }; for i in a; do f() { rm -rf x; }; done; f", "unknown"],
+    ["f() { ls; }; if true; then f() { rm -rf x; }; fi; f", "unknown"],
+    // a call inside a loop assigns what the body assigns, so the next pass sees it
+    ["X=echo; f() { X=rm; }; for i in a b; do $X -rf y; f; done", "unknown"],
+    ["X=echo; f() { X=rm; }; while true; do $X -rf y; f; done", "unknown"],
+    // sh finds a special builtin before a function
+    ["eval() { :; }; eval 'rm -rf x'", "unknown"],
+    ["cd() { :; }; cd /etc", "unknown"],
+    ["export() { :; }", "unknown"],
+    ['f() { echo "$1"; }; f "$GITHUB_TOKEN"', "unknown"],
+    ["f() { ls; }; X=1 f", "unknown"],
+    // zsh runs the last stage of a pipeline in this shell, so a definition there may persist
+    ["echo | g() { rm -rf x; }; g", "unknown"],
+    ["for p in a; do echo $(rm -rf x); done", "destructive"],
+    ["IFS=, read a b <<< x,rm", "unknown"],
+    ["IFS=,; while read a b; do echo x > $b; done <<< 'x,.claude/x'", "unknown"],
+    ["f() { echo $1; }; f a > .claude/x", "sensitive"],
+    // set -- assigns positional parameters
+    ["set -- rm -rf y; $1 $2 $3", "destructive"],
+    ["set -- $(echo rm); $1 -rf y", "unknown"],
+    ["set -- $UNKNOWN; $1", "unknown"],
+    ['for p in "rm -rf" "ls -l"; do set -- $p; $1 $2 y; done', "unknown"],
+    // zsh keeps "ok src" as one word, so $2 is empty and the path is the home directory's
+    ['for p in "ok src"; do set -- $p; touch "$2$HOME/.probe"; done', "unknown"],
+    ['p="ok src"; f() { touch "$2$HOME/.probe"; }; f $p', "unknown"],
+    // `set` with a non-option word replaces the positional parameters
+    ['set -- ok; set -e pipefail; touch "$1"', "unknown"],
+    // `return` can stop a body anywhere, so what it assigns afterwards is unknown
+    ["f() { return; X=ok; }; X=$HOME/.probe; f; touch $X", "unknown"],
+    ['f() { [ -n "$1" ] || return 1; X=ok; }; X=$HOME/.probe; f ""; touch $X', "unknown"],
+    ['f() { if [ -z "$1" ]; then return; fi; X=ok; }; X=$HOME/.probe; f; touch $X', "unknown"],
+    ["f() { g; X=ok; }; g() { return; }; X=$HOME/.probe; f; touch $X", "unknown"],
+    ['f() { [ -n "$1" ] || return 0; cd src; }; f && echo x > probe-n.txt', "unknown"],
+    ["f() { X=return; $X; Y=ok; }; Y=$HOME/.probe; f; touch $Y", "unknown"],
+    // once a function is recorded, removing a definition could unshadow the real program
+    ["touch() { echo no; }; unset touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset X touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; \\unset touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; f() { unset touch; }; f; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unfunction touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unhash -f touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; disable -f touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset touch -v; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset X -v touch; touch $HOME/.probe", "unknown"],
+    ["touch() { echo no; }; unset -v -f touch; touch $HOME/.probe", "unknown"],
+    // a cd in a function the body defines, or that a called function defines, may run before return
+    ['f() { [ -n "$1" ] || return 0; h() { cd src; }; h; }; f && echo x > probe-n.txt', "unknown"],
+    [
+      'g() { h() { cd src; }; }; f() { [ -n "$1" ] || return 0; g; h; }; f && echo x > probe-n.txt',
+      "unknown",
+    ],
+    [
+      'h() { :; }; f() { [ -n "$1" ] || return 0; h() { cd src; }; h; }; f && echo x > probe-n.txt',
+      "unknown",
+    ],
+    // zsh reads $10 as the tenth parameter, bash and sh as $1 then 0
+    ['f() { touch "$10$HOME/.probe"; }; f x', "unknown"],
+    ['set -- x; touch "$10$HOME/.probe"', "unknown"],
+    // functions zsh and bash run with no call
+    ["TRAPEXIT() { rm -rf x; }; echo hi", "unknown"],
+    ["TRAPZERR() { rm -rf x; }; false", "unknown"],
+    ["zshexit() { rm -rf x; }; echo hi", "unknown"],
+    ["chpwd() { rm -rf x; }; cd src", "unknown"],
+    ["precmd() { :; }", "unknown"],
+    ["command_not_found_handler() { rm -rf x; }; nosuchcmd", "unknown"],
+    ["command_not_found_handle() { rm -rf x; }; nosuchcmd", "unknown"],
+    // zsh expands a word starting with = to a command path
+    ["X=abc; touch ${X:+=git}", "unknown"],
+    ["touch ${X:-=git}", "unknown"],
+    ['for p in "a *"; do set -- $p; cat $2; done', "unknown"],
+    ['for p in "a b"; do set -- $p; done; $1 -rf y', "unknown"],
+    ["set -- ls; f() { $1 -rf y; }; f rm", "destructive"],
+    // shift and zsh's argv array move or replace the positional parameters
+    ["set -- ls rm; shift; $1 -rf y", "unknown"],
+    ["f() { shift; $1 -rf y; }; f ls rm", "unknown"],
+    ["for i in a; do $1 -rf y; shift; done", "unknown"],
+    ["f() { argv=rm; $1 -rf y; }; f ls", "unknown"],
+    ["set -- ls; argv=rm; $1 -rf y", "unknown"],
+    // zsh resolves reserved words and precommand modifiers before a function
+    ["command() { :; }; command rm -rf x", "unknown"],
+    ["time() { :; }; time rm -rf x", "unknown"],
+    ["noglob() { :; }; noglob rm -rf x", "unknown"],
+    ["builtin() { :; }; builtin rm -rf x", "unknown"],
+    ["exec() { :; }; exec rm -rf x", "unknown"],
+    ["set -- ls; f() { set -- rm; $1 -rf y; }; f", "destructive"],
+    ["$1 -rf y", "unknown"],
+    ['"$@"', "unknown"],
+    ['echo x | xargs "$@"', "unknown"],
+    // parameter operations on known values are computed; on anything else the value is unknown
+    ["X=src/a; rm ${X%/*}", "destructive"],
+    ["X=rm; ${X:-ls} -rf y", "destructive"],
+    ["X=a; ${X:+rm} -rf y", "destructive"],
+    ["X=rmdir; ${X:0:2} -rf y", "destructive"],
+    ["X=xrm; ${X#x} -rf y", "destructive"],
+    ["X=a/b/rm; ${X##*/} -rf y", "destructive"],
+    ["X=rm.sh; ${X%.sh} -rf y", "destructive"],
+    ["X=.ssh; cat ~/${X:-x}/id_rsa", "sensitive"],
+    ["${UNSET:-rm} -rf y", "unknown"],
+    ["echo ${GITHUB_TOKEN:0:4}", "unknown"],
+    ["echo ${#GITHUB_TOKEN}", "unknown"],
+    ["echo ${GITHUB_TOKEN:+x}", "unknown"],
+    ["X=$(ls); cat ${X%/*}", "unknown"],
+    // ANSI-C quoting is a literal, judged like any other
+    ["$'rm' -rf y", "destructive"],
+    ["$'\\x72m' -rf y", "destructive"],
+    ["$'\\162m' -rf y", "destructive"],
+    ["git push $'--force' origin x", "destructive"],
+    ["cat $'\\x7e/.ssh/id_rsa'", "sensitive"],
+    ['[ "$X" != y ] && echo y', "unknown"],
+    // while read over literal input: each line's fields, when nothing in the body reads stdin
+    ["while read c; do echo x > $c; done <<'EOF'\nsrc/a\n.claude/x\nEOF", "sensitive"],
+    ["while read -r a b; do echo x > $b; done <<< 'x .claude/x'", "sensitive"],
+    // a program named by a variable could read stdin, so the values are not trusted
+    ["while read c; do $c -rf y; done <<'EOF'\nls\nEOF", "unknown"],
+    ["while read c; do $c; head -c2; done <<'EOF'\nls\nxxrm\nEOF", "unknown"],
+    ["while read c; do echo $(cat); $c; done <<'EOF'\nls\nEOF", "unknown"],
+    ["while read c; do f; $c; done <<'EOF'\nls\nEOF", "unknown"],
+    ["until read c; do $c; done <<'EOF'\nls\nEOF", "unknown"],
+    ['while read c; do $c x; done <<< "$(echo rm)"', "unknown"],
+    ["while read c; do ls $c; done <<'EOF'\n~/.ssh\nEOF", "unknown"],
+    ["while read c; do ls $c; done <<'EOF'\n/home/u/.ssh\nEOF", "sensitive"],
+    ["while read a; do ls $a; done <<'EOF'\nsrc .ssh\nEOF", "unknown"],
+    ["while read c; do ls $c; done <<'EOF' <evil\nsrc\nEOF", "unknown"],
+    ["while read PATH; do ls; done <<'EOF'\n/tmp\nEOF", "unknown"],
+    ["while read c; do echo $c; done <<'EOF'\nls\nEOF\nrm -rf y", "destructive"],
+    // computed substitutions: only dirname, basename and pwd of known words
+    ["rm -rf $(dirname /tmp/x/y)", "destructive"],
+    ["$(basename /bin/rm) -rf y", "destructive"],
+    ["cat $(dirname /home/u/.ssh/x)/id_rsa", "sensitive"],
+    ["dirname() { echo rm; }; $(dirname x) -rf y", "unknown"],
+    ["cat $(dirname $UNKNOWN)/x", "unknown"],
+    ["cat $(dirname $(ls))/x", "unknown"],
+    ["cat $(dirname -z x)/y", "unknown"],
+    ["cat $(dirname a b)/y", "unknown"],
+    ["cat $(git rev-parse --show-toplevel)/x", "unknown"],
+    ["cat $(echo src)/x", "unknown"],
+    // an && chain only goes on past a cd that cannot fail; a failing one leaves the environment
+    ["cd /nonexistent-x9 && T=a; echo $T", "unknown"],
+    ["cd relative && T=a; echo $T", "unknown"],
+    ["cd $UNKNOWN && T=a; echo $T", "unknown"],
+    ["if false && X=a; then :; fi; echo $X", "unknown"],
+    ["if X=a || false; then :; else Y=b; fi; echo $Y", "unknown"],
+    ["true && X=rm; if true; then $X -rf y; fi", "destructive"],
+  ])("sends %j to a human (%s)", (command, category) => {
+    const d = decide(command);
+    expect(d.decision).toBe("human");
+    expect(d.category).toBe(category);
+  });
+
+  test.each([
+    "echo {}",
+    "git rev-parse main@{upstream}",
+    "[ a != b ] && echo differ",
+    "printf '%s' $'a\\tb'",
+    "X=src; ls ${X}",
+    "X=src/a.txt; ls ${X%/*}",
+    "X=src/a.txt; echo ${X##*/}",
+    "X=abcdef; echo ${X:0:3} ${#X}",
+    "X=src; ls ${X:-other}",
+    'f() { ls "$1"; }; f src',
+    'f() { [ -n "$1" ] || return 1; echo $1; }; f a',
+    'f() { [ -n "$1" ] || return 1; X=src; }; f a; echo $X',
+    "f() { ls; }; X=1; unset -v X; f",
+    "touch() { echo no; }; X=1; unset -v X touch; touch x",
+    'f() { echo "${1}0"; }; f a',
+    'f() { echo "$@"; }; f a b',
+    "f() {\n  ls $1\n}\nf src; f .",
+    'pid() { echo "$1"; }; echo "a $(pid x) b"',
+    'for p in "o/r 1" "o/s 2"; do set -- $p; echo $1 $2; done',
+    "set -- src; ls $1",
+    "while read -r r n; do printf '%s#%s\\n' $r $n; ls $n; done <<'EOF'\na src\nb .\nEOF",
+    // the caller's positional parameters come back after a call
+    "f() { set -- rm; }; set -- ls; f; $1 -la",
+    "while read -r r n; do gh pr view $n -R $r --json state; done <<'EOF'\no/r 1\no/s 2\nEOF",
+    "ls -la $(dirname src/a.txt)",
+    "ls $(basename /x/src)",
+    "X=~/notes; echo $X",
+    "if V=$(date) && M=src; then :; else M=src; fi; ls $M",
+  ])("approves %j", (command) => expect(decide(command).decision).toBe("approve"));
+
+  // A Windows path (drive letter, backslashes) is never a simple absolute value, so there the
+  // `cd` may fail and `$(pwd)` stays unknown.
+  test.skipIf(process.platform === "win32")("$(pwd) is the single current directory", () => {
+    expect(decide('ls "$(pwd)/src"').decision).toBe("approve");
+    // After `;` the cd may have failed, so two directories are possible.
+    expect(decide('cd ..; ls "$(pwd)/src"').decision).toBe("human");
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a cd to an existing directory lets an && chain go on, and the old directory stays",
+    () => {
+      const wt = posix(worktree);
+      expect(decide(`cd ${wt} && S=src; ls $S`).decision).toBe("approve");
+      expect(decide(`L=${wt}/a.txt; wc -l $L; ls -la $(dirname $L)`).decision).toBe("approve");
+      expect(decide(`cd ${wt} && rm -rf src`).decision).toBe("human");
+      // Only the script's first command is trusted: an earlier `mv` can make the cd fail.
+      expect(
+        decide(`X=$HOME/.probe; mv ${wt}/src ${wt}/e; cd ${wt}/src && X=ok; touch "$X"`).decision,
+      ).toBe("human");
+      expect(decide(`ls; cd ${wt} && S=src; ls $S`).decision).toBe("human");
+      expect(decide(`bash -c 'cd ${wt} && S=src; ls $S'`).decision).toBe("human");
+      // After the chain, the cd is still allowed to have failed when judging where commands run.
+      expect(
+        decide(`cd ${posix(scratch)} && S=1; echo x > n.txt`, join(root, "repo")).decision,
+      ).toBe("human");
+    },
+  );
+
+  test("each loop item or input line is judged with the values that belong together", () => {
+    const items = Array.from({ length: 10 }, (_, i) => `"o/r${i} ${i}"`).join(" ");
+    // zsh does not split an unquoted parameter, so the positions `set -- $p` gives are unknown.
+    expect(decide(`for p in ${items}; do set -- $p; gh pr view $2 -R $1; done`).decision).toBe(
+      "human",
+    );
+    const words = Array.from({ length: 10 }, (_, i) => `o/r${i}`).join(" ");
+    expect(decide(`for r in ${words}; do gh pr view 1 -R $r; done`).decision).toBe("approve");
+    const lines = Array.from({ length: 10 }, (_, i) => `o/r${i} ${i}`).join("\n");
+    expect(
+      decide(`while read r n; do gh pr view $n -R $r; done <<'EOF'\n${lines}\nEOF`).decision,
+    ).toBe("approve");
+    // Pairing does not hide a dangerous item.
+    expect(decide(`for p in ${items} "rm -rf"; do set -- $p; $1 $2 y; done`).decision).toBe(
+      "human",
+    );
+    expect(
+      decide("while read a b; do echo x > $b; done <<'EOF'\nx src/a\ny .claude/z\nEOF").category,
+    ).toBe("sensitive");
+  });
+
+  test("nested loops over literal items stay within the judgement cap", () => {
+    const items = Array.from({ length: 16 }, (_, i) => `v${i}`).join(" ");
+    const nested = [1, 2, 3, 4, 5]
+      .map((n) => `for x${n} in ${items}; do`)
+      .concat(["X=1;", "done; done; done; done; done"])
+      .join(" ");
+    const started = Date.now();
+    const d = decide(nested);
+    expect(d.decision).toBe("human");
+    expect(d.reason).toContain("Too many commands");
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  test("a home directory in an assignment is still a protected path", () => {
+    // On Windows the home path has backslashes, so the value is unknown instead of sensitive.
+    for (const command of ["D=~/.aws; ls $D", "D=~; cat $D/.ssh/id_rsa"]) {
+      const d = decide(command);
+      expect(d.decision).toBe("human");
+      expect(["sensitive", "unknown"]).toContain(d.category);
+    }
+  });
+});
+/* biome-ignore-end lint/suspicious/noTemplateCurlyInString: shell syntax under test */
