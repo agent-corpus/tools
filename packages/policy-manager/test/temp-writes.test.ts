@@ -258,6 +258,20 @@ describe("deletion in scratch and temp directories", () => {
     expect(write("~/policy-test-x").decision).toBe("human");
   });
 
+  test("functions, loops and cd do not launder a target", () => {
+    for (const command of [
+      "f() { rm -rf ~/policy-test-x; }; f",
+      "for d in ~/policy-test-x; do rm -rf $d; done",
+      `cd ${posix(outside)} && rm -rf ~`,
+      `cd ${posix(outside)} && find sub -delete ${posix(main)}`,
+      "f() { echo x > ~/policy-test-x; }; f",
+      `cd ${posix(main)} && rm -rf a.txt`,
+    ])
+      refused(command, outside);
+    mkdirSync(join(outside, "loop", "a"), { recursive: true });
+    approved(`f() { rm -rf ${posix(outside)}/loop/a; }; f`);
+  });
+
   test("zsh =name (an executable's path) is never a temp target", () => {
     for (const command of [
       "rm -rf =node",

@@ -890,7 +890,8 @@ describe("functions, positional parameters, parameter operations and read loops"
     ["while read PATH; do ls; done <<'EOF'\n/tmp\nEOF", "unknown"],
     ["while read c; do echo $c; done <<'EOF'\nls\nEOF\nrm -rf y", "destructive"],
     // computed substitutions: only dirname, basename and pwd of known words
-    ["rm -rf $(dirname /tmp/x/y)", "destructive"],
+    // Not /tmp: a temp-directory target is a disposable deletion.
+    ["rm -rf $(dirname /srv/x/y)", "destructive"],
     ["$(basename /bin/rm) -rf y", "destructive"],
     ["cat $(dirname /home/u/.ssh/x)/id_rsa", "sensitive"],
     ["dirname() { echo rm; }; $(dirname x) -rf y", "unknown"],
