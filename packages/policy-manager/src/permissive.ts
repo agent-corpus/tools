@@ -1,7 +1,8 @@
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import {
   branchEvidence,
   canonical,
+  git,
   inside,
   isProtectedPath,
   pathEvidence,
@@ -334,6 +335,8 @@ function gitDecision(request: Request, argv: string[], cwdForGit: string): Decis
       "destructive",
       "Repository history or object pruning requires human approval",
     );
+  if (sub === "worktree" && positional[0] === "add")
+    return worktreeAdd(request, cwd, rest.slice(rest.indexOf("add") + 1)) ?? ok();
   if (
     sub === "worktree" &&
     ["remove", "prune"].includes(positional[0] ?? "") &&
@@ -352,6 +355,57 @@ function gitDecision(request: Request, argv: string[], cwdForGit: string): Decis
   )
     return human(request, "impactful-write", "Changing remotes requires human approval");
   return ok();
+}
+
+/**
+ * `git worktree add` from any clone is approved, except that the main checkout's working tree
+ * stays protected: a new worktree inside it must go under `.worktrees/` or `.claude/worktrees/`.
+ * `-B` resets an existing branch, so it needs a human.
+ */
+function worktreeAdd(request: Request, cwd: string, args: string[]): Decision | undefined {
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i] as string;
+    if (word === "--") {
+      positional.push(...args.slice(i + 1));
+      break;
+    }
+    if (word.startsWith("--")) {
+      // Only --reason takes a value (the next word unless given inline as `--reason=x`). Every
+      // other long option of `worktree add` is a switch: --orphan, --lock, --track, --force, ...
+      if (!word.includes("=") && abbreviates(word, "--reason")) i++;
+    } else if (word.startsWith("-") && word.length > 1) {
+      // A cluster of short flags (`-qb`, `-fB`): the first `b` or `B` takes the rest of the word
+      // as its value (`-bname`), or the next word when it ends the cluster.
+      const letters = word.slice(1);
+      const at = letters.search(/[bB]/);
+      if (letters[at] === "B")
+        return human(request, "destructive", "git worktree add -B resets an existing branch");
+      if (at === letters.length - 1) i++;
+    } else positional.push(word);
+  }
+  const path = positional[0];
+  if (!path) return undefined;
+  try {
+    const common = canonical(resolve(cwd, git(cwd, ["rev-parse", "--git-common-dir"])));
+    if (basename(common) !== ".git") return undefined; // a bare repository has no working tree
+    const main = dirname(common);
+    const target = canonical(resolve(cwd, path));
+    if (!inside(main, target)) return undefined;
+    if (
+      [resolve(main, ".worktrees"), resolve(main, ".claude", "worktrees")].some(
+        (parent) => inside(parent, target) && target !== parent,
+      )
+    )
+      return undefined;
+  } catch {
+    return undefined; // not a repository: git refuses the command itself
+  }
+  return human(
+    request,
+    "worktree-write",
+    "Write requires a linked worktree on a feature branch: a new worktree inside the main checkout goes under .worktrees/ or .claude/worktrees/",
+  );
 }
 
 function gitPush(request: Request, cwd: string, rest: string[]): Decision {
