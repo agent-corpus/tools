@@ -1,10 +1,19 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { evaluate } from "../src/policy.js";
+import { evaluate, hash } from "../src/policy.js";
 import { parseProfile } from "../src/profile.js";
+import { PolicySession } from "../src/session.js";
 import type { Request } from "../src/types.js";
 
 const links = process.platform !== "win32";
@@ -80,6 +89,11 @@ beforeAll(() => {
   git(repo, ["add", "two.txt"]);
   git(repo, ["commit", "-qm", "two"]);
   git(repo, ["push", "-q", "-u", "origin", "main"]);
+  git(repo, ["checkout", "-q", "-b", "withf"]);
+  write(join(repo, "f.txt"), "from git");
+  git(repo, ["add", "f.txt"]);
+  git(repo, ["commit", "-qm", "f"]);
+  git(repo, ["checkout", "-q", "main"]);
   git(repo, ["worktree", "add", "-q", "-b", "feature", wt]);
   git(wt, ["submodule", "update", "-q", "--init"]);
   write(join(wt, "mixed", "u.txt"), "untracked sibling");
@@ -184,6 +198,137 @@ describe("recoverable rm", () => {
     expect(decide("rm outlink/o.txt")).toBe("human");
     expect(decide("rm -r outlink/")).toBe("human");
     expect(decide("rm newlink")).toBe("human"); // untracked link
+  });
+});
+
+describe("cd into a worktree", () => {
+  // A Windows path in shell text has backslashes, which are escapes; such commands stay human.
+  test.skipIf(!links)("`cd <worktree> && rm` is judged only in the worktree", () => {
+    expect(decide(`cd ${wt} && rm a.txt`, repo)).toBe("approve");
+    expect(decide(`cd ${wt} && rm -r dir && rm a.txt`, repo)).toBe("approve");
+    expect(decide(`cd ${wt}; rm a.txt`, repo)).toBe("human"); // runs in the main clone if cd fails
+    expect(decide(`cd ${wt} && ls || rm a.txt`, repo)).toBe("human");
+    expect(decide(`cd ${wt} || rm a.txt`, repo)).toBe("human");
+  });
+});
+
+describe("files this session created", () => {
+  let n = 0;
+  function session(id = `s${n++}`) {
+    const directory = mkdtempSync(join(root, "audit-"));
+    return new PolicySession(directory, "claude", id, profile);
+  }
+  const bash = (s: PolicySession, command: string, cwd = wt): Request => ({
+    sessionId: s.sessionId,
+    harness: "claude",
+    cwd,
+    tool: "Bash",
+    input: { command },
+  });
+  /** Approves, runs and reports a Write of `file` in the worktree, as the hooks would. */
+  function create(s: PolicySession, file: string, text = "probe") {
+    const r: Request = {
+      sessionId: s.sessionId,
+      harness: "claude",
+      cwd: wt,
+      tool: "Write",
+      input: { file_path: join(wt, file), content: text },
+    };
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
+    write(join(wt, file), text);
+    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+  }
+  const rm = (s: PolicySession, command: string, cwd = wt) =>
+    s.review(bash(s, command, cwd), undefined, "PreToolUse");
+  const cleanup = (...files: string[]) => {
+    for (const file of files) rmSync(join(wt, file), { recursive: true, force: true });
+  };
+
+  test("its own untracked file is removed without a prompt, also after cd", () => {
+    const s = session();
+    create(s, "probe.mjs");
+    try {
+      expect(rm(s, "rm probe.mjs").decision).toBe("approve");
+      expect(rm(s, "rm -f probe.mjs").decision).toBe("approve");
+      if (links) expect(rm(s, `cd ${wt} && rm probe.mjs`, repo).decision).toBe("approve");
+      expect(rm(s, "rm probe.mjs a.txt").decision).toBe("approve");
+    } finally {
+      cleanup("probe.mjs");
+    }
+  });
+
+  test("a file a shell redirect created counts too", () => {
+    const s = session();
+    const r = bash(s, "echo hi > made.txt");
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
+    write(join(wt, "made.txt"), "hi\n");
+    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+    try {
+      expect(rm(s, "rm made.txt").decision).toBe("approve");
+    } finally {
+      cleanup("made.txt");
+    }
+  });
+
+  test("another session's file, a changed file, or -r goes to the classifier", () => {
+    const s = session();
+    create(s, "probe.mjs");
+    try {
+      const other = rm(session(), "rm probe.mjs");
+      expect(other).toMatchObject({ decision: "deny", classification: "requested" });
+      expect(rm(s, "rm -r probe.mjs").decision).not.toBe("approve");
+      appendFileSync(join(wt, "probe.mjs"), "changed elsewhere");
+      expect(rm(s, "rm probe.mjs")).toMatchObject({ tier: "ambiguous" });
+      expect(rm(s, "rm new.txt")).toMatchObject({ tier: "ambiguous" }); // never this session's
+    } finally {
+      cleanup("probe.mjs");
+    }
+  });
+
+  test.skipIf(!links)("a symlink or hard link swapped in after creation is not its file", () => {
+    const s = session();
+    create(s, "probe.mjs");
+    try {
+      rmSync(join(wt, "probe.mjs"));
+      symlinkSync(join(outside, "o.txt"), join(wt, "probe.mjs"));
+      expect(rm(s, "rm probe.mjs").decision).not.toBe("approve");
+      rmSync(join(wt, "probe.mjs"));
+      linkSync(join(outside, "o.txt"), join(wt, "probe.mjs"));
+      expect(rm(s, "rm probe.mjs").decision).not.toBe("approve");
+    } finally {
+      cleanup("probe.mjs");
+    }
+  });
+
+  test("a directory holding its files and others is not approved", () => {
+    const s = session();
+    create(s, "scratchdir/mine.txt");
+    write(join(wt, "scratchdir", "theirs.txt"), "not this session's");
+    try {
+      expect(rm(s, "rm -r scratchdir").decision).not.toBe("approve");
+      expect(rm(s, "rm scratchdir/mine.txt").decision).toBe("approve");
+      expect(rm(s, "rm scratchdir/theirs.txt").decision).not.toBe("approve");
+    } finally {
+      cleanup("scratchdir");
+    }
+  });
+
+  test("a file git checkout overwrote after creation is not its file", () => {
+    const s = session();
+    create(s, "f.txt", "session text");
+    try {
+      git(wt, ["checkout", "withf", "--", "f.txt"]);
+      expect(rm(s, "rm f.txt").decision).not.toBe("approve");
+    } finally {
+      git(wt, ["reset", "-q", "--hard", "HEAD"]);
+      cleanup("f.txt");
+    }
+  });
+
+  test("protected paths stay with a person", () => {
+    const s = session();
+    expect(rm(s, "rm .github/w.yml")).toMatchObject({ decision: "human", category: "sensitive" });
+    expect(rm(s, "rm -rf .claude")).toMatchObject({ decision: "human", category: "sensitive" });
   });
 });
 

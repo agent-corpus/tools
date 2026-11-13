@@ -367,6 +367,8 @@ describe("permissive profile", () => {
     expect(decide("cd sub && echo x > note.txt", scratch).decision).toBe("approve");
     expect(decide("cd /etc && echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd /etc || echo x > note.txt", scratch).decision).toBe("human");
+    expect(decide("cd /etc && ls || echo x > note.txt", scratch).decision).toBe("human");
+    expect(decide("cd sub && cd /etc; echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd && ls", scratch).decision).toBe("approve");
     expect(decide("cd && echo x > note.txt", scratch).decision).toBe("human");
     expect(decide("cd /tmp > /etc/hosts", scratch).decision).toBe("human");

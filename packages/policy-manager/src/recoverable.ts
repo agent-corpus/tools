@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { createdBySession } from "./created.js";
 import { canonical, inside, isProtectedPath, protectedPath, sensitive } from "./evidence.js";
 import { parseShell } from "./shell.js";
 import type { Request } from "./types.js";
@@ -133,7 +134,10 @@ const PLAIN_OPERAND = /^[^~:-]/;
  * Parent symlinks are followed; a final symlink is the link itself unless a trailing slash
  * follows it.
  */
-function locate(cwd: string, operand: string): { root: string; rel: string } | undefined {
+function locate(
+  cwd: string,
+  operand: string,
+): { root: string; rel: string; target: string; trailing: boolean } | undefined {
   if (!operand || !PLAIN_OPERAND.test(operand) || /[*?[\]\\]/.test(operand)) return undefined;
   const parts = operand.split("/");
   const trailing = parts.at(-1) === "";
@@ -150,7 +154,22 @@ function locate(cwd: string, operand: string): { root: string; rel: string } | u
   if (!tree || !inside(tree.root, target) || target === tree.root) return undefined;
   const rel = relative(tree.root, target).split(sep).join("/");
   if (!rel || protectedPath(rel)) return undefined;
-  return { root: tree.root, rel };
+  return { root: tree.root, rel, target, trailing };
+}
+
+/** A deletion operand that names a credential or protected path, as written or resolved. */
+export function deletesProtected(cwd: string, args: string[]): boolean {
+  return args
+    .filter((word) => !word.startsWith("-"))
+    .some((word) => {
+      try {
+        const lexical = resolve(cwd, word);
+        const real = canonical(lexical);
+        return [lexical, real].some((path) => sensitive(path) || isProtectedPath(path));
+      } catch {
+        return false;
+      }
+    });
 }
 
 function exists(path: string): boolean {
@@ -163,12 +182,14 @@ function exists(path: string): boolean {
 }
 
 /**
- * `rm` that removes only tracked content identical to HEAD: no untracked, ignored, modified or
- * staged path under any operand, no submodule, and no option beyond -f, -r, -R, -d and -v.
+ * `rm` that removes only tracked content identical to HEAD (no untracked, ignored, modified or
+ * staged path under any operand, no submodule), or, without -r, an untracked file this session
+ * created and nothing has changed since. No option beyond -f, -r, -R, -d and -v.
  */
 export function rmRecoverable(cwd: string, args: string[]): boolean {
   const operands: string[] = [];
   let options = true;
+  let recursive = false;
   for (const word of args) {
     if (options && word === "--") options = false;
     else if (options && word.startsWith("-")) {
@@ -179,14 +200,18 @@ export function rmRecoverable(cwd: string, args: string[]): boolean {
         !["--force", "--recursive", "--dir", "--verbose"].includes(word)
       )
         return false;
+      if (/^-[a-zA-Z]*[rR]/.test(word) || word === "--recursive") recursive = true;
     } else operands.push(word);
   }
   if (!operands.length) return false;
   try {
     for (const operand of operands) {
       const found = locate(cwd, operand);
-      if (!found || !exists(join(found.root, found.rel))) return false;
-      if (!tracked(found.root, found.rel)) return false;
+      if (!found || !exists(found.target)) return false;
+      if (!tracked(found.root, found.rel)) {
+        if (recursive || found.trailing || !createdBySession(found.target)) return false;
+        continue;
+      }
       if (status(found.root, [found.rel], true).length) return false;
       if (hiddenState(found.root, [found.rel])) return false;
     }

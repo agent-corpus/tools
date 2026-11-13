@@ -48,7 +48,7 @@ interface Ctx {
   profile: Profile;
   depth: number;
   loop: number;
-  box: { last?: Decision; calls: number };
+  box: { last?: Decision; calls: number; cd?: { before: string[]; after: string[] } };
 }
 
 const copy = (state: State): State => ({ cwds: [...state.cwds], vars: new Map(state.vars) });
@@ -536,6 +536,7 @@ function changeDirectory(
       "Directory change in a loop or pipeline requires human review",
     );
   let cwds = [...state.cwds];
+  const after = new Set<string>();
   for (const env of envs) {
     const target = build(env)
       .argv.slice(1)
@@ -552,10 +553,12 @@ function changeDirectory(
     )
       return human(request, "unknown", "Directory change requires human review");
     // `cd` can fail, so the directory it started from stays possible.
-    cwds = [...new Set([...cwds, ...state.cwds.map((cwd) => resolve(cwd, word))])];
+    for (const cwd of state.cwds) after.add(resolve(cwd, word));
+    cwds = [...new Set([...cwds, ...after])];
   }
   if (cwds.length > MAX_DIRECTORIES)
     return human(request, "unknown", "Too many directory changes to verify");
+  ctx.box.cd = { before: [...state.cwds], after: [...after] };
   state.cwds = cwds;
   ctx.box.last = result(request, "code-read", "Directory change", true);
   return undefined;
@@ -734,6 +737,7 @@ function runList(ctx: Ctx, list: ListNode, state: State): Decision | undefined {
     // A background job runs in a subshell of its own.
     const target = item.background ? copy(state) : state;
     const { first, rest } = item.node;
+    ctx.box.cd = undefined;
     const refusal = runPipeline(ctx, first, target);
     if (refusal) return refusal;
     if (!rest.length) continue;
@@ -741,10 +745,17 @@ function runList(ctx: Ctx, list: ListNode, state: State): Decision | undefined {
     // effects, but the chain may stop after any of them: the state afterwards is every prefix's.
     let running = copy(target);
     let possible = copy(target);
-    for (const next of rest) {
+    let cd = plainCd(first) ? lastCd(ctx) : undefined;
+    for (const [index, next] of rest.entries()) {
       running = copy(running);
+      // After a lone `cd` followed only by `&&`, every later command runs only if the cd succeeded,
+      // so only in the new directory. A later `||` could run after a failed cd, so it keeps both.
+      // The chain may still stop after the cd, so `possible` keeps both.
+      if (cd && rest.slice(index).every((r) => r.op === "&&")) running.cwds = cd.after;
+      ctx.box.cd = undefined;
       const skipped = runPipeline(ctx, next.node, running);
       if (skipped) return skipped;
+      cd = plainCd(next.node) ? lastCd(ctx) : undefined;
       possible = merge(possible, running);
       if (possible.cwds.length > MAX_DIRECTORIES)
         return human(ctx.request, "unknown", "Too many directory changes to verify");
@@ -752,6 +763,22 @@ function runList(ctx: Ctx, list: ListNode, state: State): Decision | undefined {
     replace(target, possible);
   }
   return undefined;
+}
+
+/** The directory change the last pipeline made (read through a call, past TS narrowing). */
+const lastCd = (ctx: Ctx) => ctx.box.cd;
+
+/** A pipeline that is only `cd <word>`: its exit status is the `cd`'s. */
+function plainCd(node: { stages: Command[]; negated: boolean }): boolean {
+  const stage = node.stages[0];
+  return (
+    !node.negated &&
+    node.stages.length === 1 &&
+    stage?.kind === "simple" &&
+    !stage.assigns.length &&
+    !stage.redirects.length &&
+    plainText(stage.argv[0]) === "cd"
+  );
 }
 
 function runPipeline(ctx: Ctx, node: { stages: Command[] }, state: State): Decision | undefined {

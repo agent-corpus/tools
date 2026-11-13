@@ -1,4 +1,5 @@
 import { audit, requestSummary } from "./audit.js";
+import { type CreatedFiles, creationTargets, pathKey, stamp, withCreated } from "./created.js";
 import { evaluate, hash } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
@@ -26,6 +27,9 @@ export class PolicySession {
   private states = new Map<string, ClassificationState>();
   /** Requests the AI approved, counted once each however often they are retried. */
   private approvedByAi = new Set<string>();
+  /** Files this session created, and the paths each approved request may create. */
+  private created: CreatedFiles = new Map();
+  private creating = new Map<string, string[]>();
   constructor(
     readonly directory: string,
     readonly harness: string,
@@ -102,7 +106,9 @@ export class PolicySession {
         ...(ai.recoverable === undefined ? {} : { recoverable: ai.recoverable }),
         ...(ai.rationale ? { rationale: redactText(ai.rationale, 200) } : {}),
       });
-    let decision = evaluate(request, ai ?? cachedAi ?? known?.ai, this.profile);
+    let decision = withCreated(this.created, () =>
+      evaluate(request, ai ?? cachedAi ?? known?.ai, this.profile),
+    );
     if (decision.tier === "ambiguous") {
       if (ai && !decision.classification) this.remember(requestHash, { invalid: true });
       else if (ai) {
@@ -180,6 +186,14 @@ export class PolicySession {
       if (this.pending.size >= 64) this.pending.delete(this.pending.keys().next().value ?? "");
       this.pending.set(decision.requestHash, request);
     }
+    if (decision.decision === "approve") {
+      const targets = creationTargets(request, this.created);
+      if (targets.length) {
+        if (this.creating.size >= 256)
+          this.creating.delete(this.creating.keys().next().value ?? "");
+        this.creating.set(decision.requestHash, targets);
+      }
+    }
     const { ai: classification, ...safe } = decision;
     audit(this.directory, {
       event: "decision",
@@ -231,6 +245,17 @@ export class PolicySession {
         ...(report.durationMs === undefined ? {} : { durationMs: report.durationMs }),
         summary: "Harness-reported execution result",
       });
+      // A path that was new (or already this session's) before the tool ran, and is a regular file
+      // now, is this session's, with the identity it has now.
+      for (const path of this.creating.get(report.requestHash) ?? []) {
+        const now = stamp(path);
+        if (!now) this.created.delete(pathKey(path));
+        else {
+          if (this.created.size >= 4096) this.created.clear();
+          this.created.set(pathKey(path), now);
+        }
+      }
+      this.creating.delete(report.requestHash);
     } else throw new Error("Invalid outcome event");
   }
   classify(classification: Classification): Decision {

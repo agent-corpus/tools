@@ -13,6 +13,7 @@ import { mergedEvidence, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result } from "./policy.js";
 import type { Profile } from "./profile.js";
 import {
+  deletesProtected,
   gitRmRecoverable,
   resetRecoverable,
   restoreRecoverable,
@@ -753,6 +754,8 @@ export function simpleDecision(
         return human(request, "sensitive", "Protected path requires human approval");
     }
   }
+  if (["rm", "rmdir", "unlink", "shred", "srm"].includes(program) && deletesProtected(cwd, args))
+    return human(request, "sensitive", "Deleting a protected or credential path requires a human");
   if (
     argv[0] === "rm" &&
     command.argv[0] === "rm" &&
