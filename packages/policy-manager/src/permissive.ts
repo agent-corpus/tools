@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { lstatSync, readdirSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import {
   branchEvidence,
@@ -752,11 +752,47 @@ function restorePaths(rest: string[]): { paths: string[]; fromHead: boolean } | 
   };
 }
 
+/**
+ * `git worktree remove --force <path>` where `path` is a linked worktree of this repository (never
+ * the main one) strictly inside a temp or scratch root and outside the main checkout.
+ */
+function disposableWorktree(cwd: string, args: string[], roots: string[], fill?: Fill): boolean {
+  if (fill?.script.tainted) return false;
+  const paths: string[] = [];
+  let ended = false;
+  for (const arg of args) {
+    if (!ended && arg === "--") ended = true;
+    else if (!ended && arg.startsWith("-")) {
+      if (!/^-f+$/.test(arg) && !abbreviates(arg, "--force")) return false;
+    } else paths.push(arg);
+  }
+  if (paths.length !== 1) return false;
+  try {
+    const target = canonical(resolveWord(cwd, paths[0] as string));
+    if (policyState(target) || !roots.some((root) => root !== target && inside(root, target)))
+      return false;
+    const listed = git(cwd, ["worktree", "list", "--porcelain"])
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => canonical(line.slice("worktree ".length)));
+    const [main, ...linked] = listed;
+    if (main === undefined || inside(main, target) || !linked.includes(target)) return false;
+    // Removal deletes the whole directory, so no other checkout may live inside it.
+    if (listed.some((path) => path !== target && inside(target, path))) return false;
+    if (fill?.reorder) fill.script.approved = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function gitDecision(
   request: Request,
   argv: string[],
   cwdForGit: string,
   sole: () => boolean,
+  roots: string[],
+  fill?: Fill,
 ): Decision {
   const args = argv.slice(1);
   let index = 0;
@@ -844,7 +880,12 @@ function gitDecision(
     ["remove", "prune"].includes(positional[0] ?? "") &&
     (has("-f", "--force") || positional[0] === "prune")
   )
-    return human(request, "destructive", "Forced worktree removal requires human approval");
+    return positional[0] === "remove" && disposableWorktree(cwd, rest.slice(1), roots, fill)
+      ? ok("Removes a linked worktree inside a temp or scratch directory")
+      : positional[0] === "prune" &&
+          rest.slice(1).every((arg) => ["-n", "-v", "--dry-run", "--verbose"].includes(arg))
+        ? ok("Prunes only records of worktrees whose directories are gone")
+        : human(request, "destructive", "Forced worktree removal requires human approval");
   if (
     sub === "config" &&
     !has("--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin") &&
@@ -1023,6 +1064,9 @@ const AWS_METADATA_GETTERS = new Set([
   "get-log-events",
 ]);
 
+/** az operations that only read but whose verb is not list or show. */
+const AZ_READ_OPERATIONS = new Set(["boards query"]);
+
 function readVerb(argv: string[]): boolean {
   const [tool] = argv;
   const firstOption = argv.findIndex((arg) => arg.startsWith("-"));
@@ -1035,7 +1079,11 @@ function readVerb(argv: string[]): boolean {
   if (argv.some((arg) => /^--(?:endpoint|endpoint-url|api-endpoint|debug|profile-file)/.test(arg)))
     return false;
   if (/token|secret|password|credential|key/i.test(verb)) return false;
-  if (tool === "az") return /^(?:list|show|exists|list-[a-z-]+|show-[a-z-]+)$/.test(verb);
+  if (tool === "az")
+    return (
+      /^(?:list|show|exists|list-[a-z-]+|show-[a-z-]+)$/.test(verb) ||
+      AZ_READ_OPERATIONS.has(operation.join(" "))
+    );
   if (tool === "aws") {
     // `get-*` is not safe as a family: it includes secret, password, token and access-detail
     // retrieval. Only `describe-`/`list-` and an explicit set of metadata getters are automatic.
@@ -1183,6 +1231,149 @@ function autoCd(cwd: string, word: string): boolean {
   });
 }
 
+const PRINTERS = new Set(["echo", "printf"]);
+const GLOB = /[*?[]/;
+/** At most this many directory entries are matched against a glob operand. */
+const GLOB_ENTRIES = 5000;
+
+/**
+ * Whether a word that may be a file operand names a credential: by name, as resolved against the
+ * working directory (a symlink to a key, or a cwd inside `~/.ssh`), or, for a glob in its last
+ * component, by any entry it would match.
+ */
+function sensitiveOperand(cwd: string, word: string): boolean {
+  if (word === "") return false;
+  if (sensitive(word)) return true;
+  try {
+    if (GLOB.test(word)) {
+      const parts = word.split(/[\\/]/);
+      const last = parts.pop() ?? "";
+      if (parts.some((part) => GLOB.test(part))) return false;
+      const dir = resolveWord(cwd, parts.length ? parts.join("/") || "/" : ".");
+      if (sensitive(dir) || sensitive(canonical(dir))) return true;
+      const pattern = globPattern(last);
+      const entries = readdirSync(dir).slice(0, GLOB_ENTRIES);
+      // `*` skips dot files unless the pattern itself starts with a dot.
+      return entries.some(
+        (name) =>
+          (!name.startsWith(".") || last.startsWith(".")) &&
+          pattern.test(name) &&
+          (sensitive(name) || sensitive(canonical(join(dir, name)))),
+      );
+    }
+    const lexical = resolveWord(cwd, word);
+    if (!lstatExists(lexical)) return false;
+    return sensitive(lexical) || sensitive(canonical(lexical));
+  } catch {
+    return false;
+  }
+}
+
+function lstatExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A shell glob for one path component: `*`, `?` and bracket classes. */
+function globPattern(glob: string): RegExp {
+  let source = "";
+  for (let index = 0; index < glob.length; index++) {
+    const char = glob[index] as string;
+    if (char === "*") source += ".*";
+    else if (char === "?") source += ".";
+    else if (char === "[") {
+      const close = glob.indexOf("]", index + 2);
+      if (close < 0) source += "\\[";
+      else {
+        const body = glob
+          .slice(index + 1, close)
+          .replace(/^[!^]/, "^")
+          .replace(/\\/g, "\\\\");
+        source += `[${body}]`;
+        index = close;
+      }
+    } else source += char.replace(/[.+^${}()|[\]\\/-]/g, "\\$&");
+  }
+  try {
+    return new RegExp(`^${source}$`, "s");
+  } catch {
+    return /^/; // an unparsable class matches everything, which only sends more to a person
+  }
+}
+
+/** Index of chmod's mode or chown's owner (`+x`, `u+w`, `user:group`), which names no file. */
+function modeIndex(program: string, args: string[]): number | undefined {
+  if (!["chmod", "chown"].includes(program) || args.some((arg) => arg.startsWith("--reference")))
+    return undefined;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] ?? "";
+    if (arg === "--") return index + 1 < args.length ? index + 1 : undefined;
+    // `chmod -w file`: a mode may start with `-`.
+    if (arg.startsWith("-") && !(program === "chmod" && /^-[rwxXst]+$/.test(arg))) continue;
+    return index;
+  }
+  return undefined;
+}
+
+/**
+ * Sources and written targets of `cp` and `ln`: sources are only read (a symlink's target is not
+ * touched), so they take the read check. Undefined when the split is uncertain (backup suffixes),
+ * and every operand is then checked as a write.
+ */
+function copySources(
+  program: string,
+  args: string[],
+  cwd: string,
+): { sources: string[]; targets: string[] } | undefined {
+  if (program !== "cp" && program !== "ln") return undefined;
+  const operands: string[] = [];
+  let target: string | undefined;
+  let ended = false;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] ?? "";
+    if (ended || !arg.startsWith("-") || arg === "-") {
+      operands.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      ended = true;
+      continue;
+    }
+    if (arg.startsWith("--")) {
+      const name = arg.split("=")[0] ?? "";
+      if (/^--(?:b|s(?:u|$))/.test(name)) return undefined; // --backup, --suffix
+      if (name.length > 3 && "--target-directory".startsWith(name)) {
+        if (target !== undefined) return undefined;
+        target = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[++index];
+        if (target === undefined) return undefined;
+      }
+      continue;
+    }
+    const letters = arg.slice(1);
+    if (/[bS]/.test(letters)) return undefined;
+    const at = letters.indexOf("t");
+    if (at >= 0) {
+      if (target !== undefined) return undefined;
+      target = at + 1 < letters.length ? letters.slice(at + 1) : args[++index];
+      if (target === undefined) return undefined;
+    }
+  }
+  if (target !== undefined) return { sources: operands, targets: [target] };
+  if (operands.length >= 2) return { sources: operands.slice(0, -1), targets: operands.slice(-1) };
+  // `ln -s path` links `basename(path)` in the working directory.
+  if (program === "ln" && operands.length === 1) {
+    const only = operands[0] ?? "";
+    const name = basename(only.replace(/[\\/]+$/, ""));
+    if (!name || name === "." || name === "..") return undefined;
+    return { sources: operands, targets: [resolve(cwd, name)] };
+  }
+  return undefined;
+}
+
 export function simpleDecision(
   request: Request,
   command: SimpleCommand,
@@ -1295,10 +1486,14 @@ export function simpleDecision(
   for (const [index, word] of args.entries()) {
     if (operands.text.has(index)) continue;
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
-    if (candidate.includes("/") || candidate.startsWith(".")) {
-      if (sensitive(candidate))
-        return human(request, "sensitive", "Protected path requires human approval");
-    }
+    // echo and printf read no file, so only a path-like word is judged, by name.
+    const pathLike = candidate.includes("/") || candidate.startsWith(".");
+    if (
+      PRINTERS.has(program)
+        ? pathLike && sensitive(candidate)
+        : sensitiveOperand(cwd, candidate) || (candidate !== word && sensitiveOperand(cwd, word))
+    )
+      return human(request, "sensitive", "Protected path requires human approval");
   }
   if (operands.paths.some((path) => sensitive(path)))
     return human(request, "sensitive", "Protected path requires human approval");
@@ -1419,10 +1614,16 @@ export function simpleDecision(
           : undefined);
       return value === undefined ? [] : [value];
     });
-    for (const file of [
-      ...args.filter((arg) => !arg.startsWith("-") && !/^[0-9]+$/.test(arg)),
-      ...optionValues,
-    ]) {
+    const split = copySources(program, args, cwd);
+    const mode = modeIndex(program, args);
+    const operands = args.filter(
+      (arg, index) => index !== mode && !arg.startsWith("-") && !/^[0-9]+$/.test(arg),
+    );
+    for (const file of split?.sources ?? []) {
+      const check = permissiveRead(cwd, file);
+      if (!check.allowed) return human(request, check.category, check.reason);
+    }
+    for (const file of [...(split?.targets ?? operands), ...optionValues]) {
       const check = permissiveWrite(cwd, file, profile, fill);
       if (!check.allowed) return human(request, check.category, check.reason);
     }
@@ -1461,6 +1662,8 @@ export function simpleDecision(
       argv,
       cwd,
       () => argv[0] === "git" && command.argv[0] === "git" && depth === 0 && soleEffect(request),
+      [...profile.scratchRoots, ...tempRoots()],
+      fill,
     );
   if (program === "gh") {
     const gh = ghDecision(request, argv);
