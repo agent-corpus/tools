@@ -441,6 +441,13 @@ describe("deletion in scratch and temp directories", () => {
       "pax -r < a.pax && rm -rf ex/out/dist",
       "python3 -c 'print(1)' && rm -rf ex/out/dist",
       "rm -rf ex/out/dist | cp -R sub ex",
+      "gh repo clone o/r mad12 && rm -rf mad12/inner/dist",
+      "gh pr checkout 1 && echo x > w.txt",
+      "git -C . pull && echo x > w.txt",
+      "git worktree add ../mad14 && echo x > w.txt",
+      "wget -r ftp://example.com/x && echo x > w.txt",
+      "for f in a b; do echo $f > o$f; cp -R sub ex; done",
+      "echo x > w.txt & node x.js",
     ])
       refused(command, dir);
     // Commands that create no symlink keep later temp paths trusted.
@@ -453,6 +460,11 @@ describe("deletion in scratch and temp directories", () => {
       "cp -p f new2 && /bin/cp f new3 && rm -rf new2 new3",
       "grep -l x f | sort > new4 && rm new4",
       "bash -c 'echo x > new5' && rm new5",
+      // Read-only gh and git, and a loop or pipeline that has ended before the next command.
+      "gh pr view 1 --json body > body.md && rm body.md",
+      "git -C . status && git push origin x && seq 3 > n.txt",
+      "echo x | tee a.txt; node x.js",
+      "for f in a b; do echo $f > o$f; done; node x.js",
     ])
       expect(bash(command, dir).decision, command).toBe("approve");
   });

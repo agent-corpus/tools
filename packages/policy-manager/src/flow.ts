@@ -761,12 +761,18 @@ const SYMLINK_FREE = new Set([
   ...["grep", "egrep", "fgrep", "rg", "sed", "ls", "stat", "file", "which", "type"],
   ...["basename", "dirname", "realpath", "readlink", "mkdir", "touch", "tee"],
   ...["rm", "rmdir", "unlink", "bash", "sh", "zsh", "dash"],
+  ...["seq", "mktemp", "chmod", "find", "curl", "du", "df", "tree", "column", "nl"],
+  ...["tac", "rev", "comm", "join", "fold", "od", "xxd", "shasum", "sha256sum", "md5sum", "md5"],
+  ...["whoami", "id", "uname", "hostname"],
 ]);
 /** git subcommands that leave the working tree as it is, or only add a fresh `.git`. */
 const GIT_SYMLINK_FREE = new Set([
   ...["status", "log", "diff", "show", "add", "commit", "init", "rev-parse", "ls-files"],
-  ...["branch", "config", "fetch", "remote", "describe"],
+  ...["branch", "config", "fetch", "remote", "describe", "push", "rev-list", "merge-base"],
+  ...["ls-remote", "cat-file", "for-each-ref", "symbolic-ref", "shortlog", "blame", "grep"],
 ]);
+/** gh words that put files on disk: clones, checkouts, downloads, extensions, codespace copies. */
+const GH_WRITES = /^(?:clone|checkout|co|download|extension|ext|codespace|cs|sync|--clone.*)$/;
 /**
  * Whether a command is known to create no symlink. Anything else may plant one anywhere, so
  * later temp paths in the script are no longer trusted. `cp` without options that copy links
@@ -777,10 +783,19 @@ function symlinkFree(argv: string[]): boolean {
   const program = basename(path);
   if (program === "cp") return args.every((arg) => !arg.startsWith("-") || /^-[finpv]+$/.test(arg));
   if (program === "git") {
-    const sub = args.find((arg) => !arg.startsWith("-"));
-    return args[0] === sub && GIT_SYMLINK_FREE.has(sub ?? "");
+    let index = 0;
+    while (args[index]?.startsWith("-"))
+      index += ["-C", "-c"].includes(args[index] as string) ? 2 : 1;
+    const sub = args[index] ?? "";
+    return GIT_SYMLINK_FREE.has(sub) || (sub === "worktree" && args[index + 1] === "list");
   }
+  if (program === "gh") return !args.some((arg) => GH_WRITES.test(arg));
   return SYMLINK_FREE.has(program);
+}
+
+/** Once a foreground loop or pipeline ends, nothing in it can run after a later command. */
+function endReorder(ctx: Ctx, approved: boolean): void {
+  if (ctx.loop === 0 && !ctx.reorder) ctx.box.script.approved = approved;
 }
 
 /** git clone options that take a separate value. */
@@ -1346,6 +1361,7 @@ function runFor(
 ): Decision | undefined {
   if (BANNED_ENV.test(node.name))
     return human(ctx.request, "unknown", "Environment override requires human review");
+  const approved = ctx.box.script.approved;
   const refusal = runSubs(
     ctx,
     node.words.flatMap((w) => w.subs),
@@ -1377,6 +1393,7 @@ function runFor(
     const body = runList({ ...ctx, loop: ctx.loop + 1 }, node.body, inner);
     if (body) return body;
   }
+  endReorder(ctx, approved);
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -1391,6 +1408,7 @@ function runWhile(
   assignedInList(node.body, changed, state.funcs);
   const inner = copy(state);
   forget(inner, changed);
+  const approved = ctx.box.script.approved;
   const loop = { ...ctx, loop: ctx.loop + 1 };
   const refusal = runList(loop, node.cond, inner);
   if (refusal) return refusal;
@@ -1403,6 +1421,7 @@ function runWhile(
     const body = runList(loop, node.body, pass);
     if (body) return body;
   }
+  endReorder(ctx, approved);
   forget(state, changed);
   return runRedirects(ctx, node.redirects, state);
 }
@@ -1568,11 +1587,13 @@ function runPipeline(
     return refusal;
   }
   const changed = new Set<string>();
+  const approved = ctx.box.script.approved;
   for (const [index, stage] of node.stages.entries()) {
     assignedInCommand(stage, changed, state.funcs);
     const refusal = runCommand(ctx, stage, copy(state), index, true);
     if (refusal) return refusal;
   }
+  endReorder(ctx, approved);
   // The last stage may run in the current shell, so what the stages assign is unknown afterwards.
   forget(state, changed);
   return undefined;
