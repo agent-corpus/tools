@@ -284,6 +284,30 @@ describe("deletion in scratch and temp directories", () => {
     approved("rm -rf plain/../plain", away);
   });
 
+  test("cd is logical: cd link && cd .. returns beside the link", () => {
+    // `main/out` links into the temp directory; the shell's `cd ..` from it lands in `main`.
+    mkdirSync(join(outside, "build", "out"), { recursive: true });
+    link(join(outside, "build", "out"), join(main, "out"), true);
+    for (const command of [
+      "cd out && cd .. && rm -rf dist",
+      "cd out/.. && rm -rf dist",
+      "cd out && cd .. && echo x > w.txt",
+      "cd out/.. && echo x > w.txt",
+    ])
+      refused(command, main);
+  });
+
+  test.skipIf(windows)("a backslash is a file-name character on POSIX", () => {
+    const name = `${posix(main)}/x${"\\..".repeat(16)}\\tmp\\policy-test-y`;
+    for (const command of [
+      `echo x > '${name}'`,
+      `mkdir -p '${name}'`,
+      `rm -rf '${name}'`,
+      `cp a.txt '${name}'`,
+    ])
+      refused(command, outside);
+  });
+
   test("functions, loops and cd do not launder a target", () => {
     for (const command of [
       "f() { rm -rf ~/policy-test-x; }; f",

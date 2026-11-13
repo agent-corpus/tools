@@ -1,7 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, posix } from "node:path";
-import { resolveWord } from "./evidence.js";
+import { basename, join, posix, resolve } from "node:path";
+import { canonical, resolveWord } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -743,10 +743,17 @@ function changeDirectory(
       word.startsWith("-")
     )
       return human(request, "unknown", "Directory change requires human review");
-    // `..` after a symlink leaves the link's target, not the link, as the kernel does.
+    // bash and zsh `cd` is logical: `..` drops the last written component. In physical mode (`cd
+    // -P`, `set -P`, `setopt chase_links`) it leaves the symlink's target. When the two differ, which
+    // one the shell uses is unknown here, so a person decides.
     let next: string[];
     try {
-      next = state.cwds.map((cwd) => resolveWord(cwd, raw as string));
+      next = state.cwds.map((cwd) => {
+        const logical = resolve(cwd, word);
+        if (canonical(logical) !== canonical(resolveWord(cwd, raw as string)))
+          throw new Error("Logical and physical directories differ");
+        return logical;
+      });
     } catch {
       return human(request, "unknown", "Directory change requires human review");
     }

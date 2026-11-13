@@ -11,6 +11,10 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
+/** Path separators: `/`, and `\` only on Windows; on POSIX `\` is a file-name character. */
+const SEPARATOR = process.platform === "win32" ? /[\\/]/ : /\//;
+const SEPARATORS = process.platform === "win32" ? /[\\/]+/ : /\/+/;
+
 /**
  * A shell word as an absolute path, with a leading `~` expanded as the shell does. `~user`, `~+`,
  * `~-` and zsh's `=name` (the path of an executable) cannot be resolved here and throw.
@@ -21,7 +25,7 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 export function resolveWord(cwd: string, word: string): string {
   let base: string;
   let rest: string;
-  if (/^~(?:[\\/]|$)/.test(word)) {
+  if (word === "~" || (SEPARATOR.test(word.slice(1, 2)) && word.startsWith("~"))) {
     base = homedir();
     rest = word.slice(2);
   } else if (word.startsWith("~") || word.startsWith("=")) {
@@ -33,7 +37,7 @@ export function resolveWord(cwd: string, word: string): string {
     base = cwd;
     rest = word;
   }
-  const parts = rest.split(/[\\/]+/);
+  const parts = rest.split(SEPARATORS);
   if (!parts.includes("..")) return resolve(base, rest);
   let current = resolve(base);
   for (const part of parts) {
@@ -208,7 +212,7 @@ export function disposable(cwd: string, input: string, roots: string[]): boolean
   try {
     let target = input;
     if (/[*?[]/.test(input)) {
-      const parts = input.split(/[\\/]/);
+      const parts = input.split(SEPARATOR);
       const last = parts.pop() ?? "";
       if (!last || last.startsWith(".") || parts.some((part) => /[*?[]/.test(part))) return false;
       target = parts.join("/") || (parts.length ? "/" : ".");
