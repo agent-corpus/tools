@@ -328,23 +328,27 @@ function sedScriptPaths(script: string): string[] {
 function textOperands(
   program: string,
   args: string[],
-): { text: Set<number>; paths: string[]; files: string[] } {
+): { text: Set<number>; paths: string[]; files: string[]; patterns: Set<number> } {
   const text = new Set<number>();
   const files: string[] = [];
+  // Values of file-name pattern options (`--include`, rg `-g`), found by this same parse.
+  const patterns = new Set<number>();
   if (program === "gh") {
     for (const [index, word] of args.entries()) {
       if (GH_TEXT.has(word)) text.add(index + 1);
       else if (/^--(?:body|title|jq|template|notes)=/.test(word)) text.add(index);
     }
-    return { text, paths: [], files };
+    return { text, paths: [], files, patterns };
   }
+  if (program === "find") return { text, paths: [], files, patterns: findPatterns(args) };
   const values = SHORT_VALUES[program];
-  if (values === undefined) return { text, paths: [], files };
+  if (values === undefined) return { text, paths: [], files, patterns };
   // Fallback when an option cannot be understood: every operand is checked.
   const everyWord = {
     text: new Set<number>(),
     paths: [],
     files: args.filter((arg) => arg !== "" && !arg.startsWith("-")),
+    patterns: new Set<number>(),
   };
   // grep, rg and GNU sed accept options after operands, so collect everything before deciding
   // which operand, if any, is the pattern or script.
@@ -373,8 +377,13 @@ function textOperands(
       } else {
         // A pattern or script file means there is no pattern operand: every operand is a file.
         if (name === "--file") explicit = true;
+        const pattern = NAME_PATTERN_OPTIONS[program]?.includes(name);
+        if (pattern && eq >= 0) patterns.add(index);
         // A value-taking long option consumes the next word, which stays a checked operand.
-        if (eq < 0 && LONG_VALUES[program]?.has(name)) index++;
+        if (eq < 0 && LONG_VALUES[program]?.has(name)) {
+          index++;
+          if (pattern) patterns.add(index);
+        }
       }
       continue;
     }
@@ -395,6 +404,7 @@ function textOperands(
         if (values.includes(flag)) {
           if (flag === "f") explicit = true;
           if (at + 1 === word.length) index++;
+          if (program === "rg" && flag === "g") patterns.add(index);
           break;
         }
       }
@@ -411,7 +421,7 @@ function textOperands(
   for (const [index] of scripts) text.add(index);
   files.push(...operands.map((index) => args[index] ?? ""));
   const paths = program === "sed" ? scripts.flatMap(([, script]) => sedScriptPaths(script)) : [];
-  return { text, paths, files };
+  return { text, paths, files, patterns };
 }
 
 /** Pattern and script options per program, besides the value lists. */
@@ -1365,28 +1375,18 @@ const NAME_PATTERN_OPTIONS: Record<string, string[]> = {
   find: ["-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename"],
 };
 /**
- * Indices of `args` that are, or carry, the value of a file-name pattern option. Text words (a
- * pattern after `-e`) are never options, and nothing after `--` is.
+ * Indices of find's `-name`/`-path` values. Every value-taking primary consumes its value; an
+ * unknown primary (`-printf`, `-newerXY`) makes the parse uncertain, so nothing is a pattern.
  */
-function namePatternIndices(program: string, args: string[], text: Set<number>): Set<number> {
+function findPatterns(args: string[]): Set<number> {
   const found = new Set<number>();
-  const options = NAME_PATTERN_OPTIONS[program];
-  if (!options) return found;
+  const names = NAME_PATTERN_OPTIONS.find ?? [];
   for (let index = 0; index < args.length; index++) {
     const word = args[index] ?? "";
-    if (text.has(index)) continue;
-    if (word === "--") break;
-    if (options.includes(word)) {
-      if (!text.has(index + 1)) found.add(index + 1);
+    if (FIND_VALUE_PRIMARIES.has(word)) {
+      if (names.includes(word)) found.add(index + 1);
       index++;
-    } else if (
-      options.some((option) =>
-        option.startsWith("--")
-          ? word.startsWith(`${option}=`)
-          : option === "-g" && word.startsWith("-g") && word.length > 2,
-      )
-    )
-      found.add(index);
+    } else if (/^[-(!)]/.test(word) && !FIND_FLAG_PRIMARIES.has(word)) return new Set();
   }
   return found;
 }
@@ -1408,11 +1408,9 @@ function modeIndex(program: string, args: string[]): number | undefined {
 }
 
 /**
- * Sources and written targets of `cp` and `ln`: sources are only read (a symlink's target is not
- * touched), so they take the read check. Undefined when the split is uncertain (backup suffixes),
- * and every operand is then checked as a write.
+ * GNU long options of cp and ln. Of those that take a separate value, only --target-directory
+ * matters: a consumed `--sparse`/`--no-preserve` value only adds a read-checked source.
  */
-/** GNU long options of cp and ln; only --target-directory takes a separate value. */
 const COPY_LONG: Record<string, string[]> = {
   cp: [
     "--archive",
@@ -1460,6 +1458,11 @@ const COPY_LONG: Record<string, string[]> = {
   ],
 };
 
+/**
+ * Sources and written targets of `cp` and `ln`: sources are only read (a symlink's target is not
+ * touched), so they take the read check. Undefined when the split is uncertain (backup suffixes,
+ * hard links, unknown options), and every operand is then checked as a write.
+ */
 function copySources(
   program: string,
   args: string[],
@@ -1630,7 +1633,7 @@ export function simpleDecision(
   // known text positions (sed scripts, grep patterns, gh message text) are not paths, but the
   // files a sed script reads or writes are.
   const operands = textOperands(program, args);
-  const namePatterns = namePatternIndices(program, args, operands.text);
+  const namePatterns = operands.patterns;
   for (const [index, word] of args.entries()) {
     if (operands.text.has(index)) continue;
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;

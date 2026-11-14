@@ -388,6 +388,14 @@ describe("bare credential operands (#33)", SLOW, () => {
       "rg -e --glob ./plain",
       "grep x -- --include ./plain",
       "find . -name x -- -name ./plain",
+      // Another option's value is consumed first.
+      "rg x -r -g ./plain",
+      "rg x -A -g ./plain",
+      "rg x --context-separator -g ./plain",
+      "grep x --label --include ./plain",
+      "grep x -m --include ./plain",
+      "find . -newer -name ./plain",
+      "find . -printf -name ./plain",
     ])
       expect(bash(command, outside).category, command).toBe("sensitive");
     expect(bash("rg x -g ./plain", outside).decision).toBe("approve");
