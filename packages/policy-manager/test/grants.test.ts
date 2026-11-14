@@ -214,6 +214,11 @@ describe("only the user approves", () => {
     "a command that only mentions approval keeps the normal decision: %s",
     (command) => expect(looksLikeApproveGrant(command)).toBe(false),
   );
+  test("stays fast on a long run of program names", () => {
+    const start = performance.now();
+    expect(looksLikeApproveGrant("policy-manager@".repeat(50_000))).toBe(false);
+    expect(performance.now() - start).toBeLessThan(500);
+  });
 });
 
 describe("approve CLI", () => {

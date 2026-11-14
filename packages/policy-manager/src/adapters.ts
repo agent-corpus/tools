@@ -96,10 +96,11 @@ export function looksLikeClassifyRecord(command: string): boolean {
  * nesting (`sh -c '...'`, a here-document). Unlike a classification record, the agent never runs
  * this: only the user approves, from their own terminal.
  */
-const APPROVE_INVOCATION =
-  /(?:cli\.js|policy-manager(?:@[^\s"']*)?)["']?\s+["']?approve["']?(?:\s|$)/;
+const APPROVE_PROGRAM = /^(?:.*cli\.js|(?:@agent-corpus\/)?policy-manager(?:@.*)?)$/;
+// A token scan rather than one regular expression over the command, so its cost stays linear.
 export function looksLikeApproveGrant(command: string): boolean {
-  return APPROVE_INVOCATION.test(command);
+  const tokens = command.split(/[\s"'`;&|()]+/);
+  return tokens.some((token, i) => tokens[i + 1] === "approve" && APPROVE_PROGRAM.test(token));
 }
 /** The command the user runs in their own terminal to approve a human decision. */
 export function approveCommand(
