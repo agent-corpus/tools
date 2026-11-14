@@ -47,6 +47,8 @@ export interface Decision {
   /** Why a human was asked after classification could not decide. */
   fallbackReason?: "unavailable" | "invalid-result" | "limit";
   ai?: Classification;
+  /** A human decision the user may approve for the rest of the session (`approve --session`). */
+  sessionGrantable?: boolean;
 }
 
 export interface OutcomeReport {

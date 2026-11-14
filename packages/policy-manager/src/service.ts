@@ -5,16 +5,17 @@ import { join } from "node:path";
 import { audit, sessionDirectory, sessionDirectoryPath, sessionToken } from "./audit.js";
 import { hash, requestHash } from "./policy.js";
 import { loadProfile, type Profile, strictProfile } from "./profile.js";
-import { PolicySession } from "./session.js";
+import { GrantError, PolicySession } from "./session.js";
 import type { Classification, OutcomeReport, Request } from "./types.js";
 
 interface Message {
   token: string;
-  action: "ping" | "review" | "classify" | "record" | "stop";
+  action: "ping" | "review" | "classify" | "record" | "grant" | "stop";
   request?: Request;
   classification?: Classification;
   report?: OutcomeReport;
   phase?: string;
+  grant?: { requestHash: string; confirm: boolean; session?: boolean };
 }
 function endpoint(directory: string): string {
   return process.platform === "win32"
@@ -57,8 +58,10 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
               ? { requestHash: message.classification.requestHash }
               : message.report
                 ? { requestHash: message.report.requestHash }
-                : {}),
-          action: ["ping", "review", "classify", "record", "stop"].includes(message.action)
+                : message.grant
+                  ? { requestHash: String(message.grant.requestHash) }
+                  : {}),
+          action: ["ping", "review", "classify", "record", "grant", "stop"].includes(message.action)
             ? message.action
             : "invalid",
         });
@@ -76,6 +79,17 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
         else if (message.action === "record" && message.report) {
           session.record(message.report);
           result = { recorded: true };
+        } else if (message.action === "grant" && message.grant) {
+          try {
+            result = session.grant(
+              String(message.grant.requestHash),
+              message.grant.confirm === true,
+              message.grant.session === true,
+            );
+          } catch (error) {
+            if (!(error instanceof GrantError)) throw error;
+            result = { granted: false, refused: error.message };
+          }
         } else throw new Error("Invalid service request");
         socket.end(`${JSON.stringify({ result })}\n`);
       } catch {

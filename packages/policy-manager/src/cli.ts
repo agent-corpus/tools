@@ -1,15 +1,18 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { executionReport, hookOutput, normalize } from "./adapters.js";
+import { sessionDirectoryPath } from "./audit.js";
 import { hookConfig } from "./config.js";
 import { HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
 import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
 import { replayTranscripts } from "./replay.js";
 import { formatReview, reviewClassifications, sessionDirectories } from "./review.js";
 import { send, serve, start, stop } from "./service.js";
+import type { GrantPreview } from "./session.js";
 import { SetupError, setupHook } from "./setup.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
 
@@ -18,6 +21,7 @@ policy-manager hook <claude|codex|copilot> <SessionStart|PreToolUse|PermissionRe
 policy-manager review <claude|codex|copilot> <session-id>   # normalized request JSON on stdin
 policy-manager classify <claude|codex|copilot> <session-id> # {requestHash,category,confidence} on stdin
 policy-manager record <claude|codex|copilot> <session-id>   # host-reported human response or execution result JSON
+policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--session]  # the user, in their own terminal: allow a blocked request once, or its rule and scope for the session
 policy-manager setup-hook <claude|codex|copilot> [--dry-run] [--config-dir <harness-config-directory>]
 policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run] [--config-dir <directory>]
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
@@ -30,6 +34,13 @@ A per-session background service checks policy and writes private temporary audi
 AI classification comes from the session's policy-manager agent, never an external API.
 Unknown effects require human approval. Exit 0: protocol response; exit 1: malformed input or service failure.
 `;
+/** An `approve` failure whose message is meant for the user. */
+class ApproveError extends Error {}
+type GrantResult = Partial<GrantPreview> & {
+  granted: boolean;
+  scope?: "once" | "session";
+  refused?: string;
+};
 async function stdin(): Promise<Record<string, unknown>> {
   let text = "";
   for await (const chunk of process.stdin) {
@@ -120,6 +131,56 @@ try {
     });
     const review = await reviewClassifications(sessionDirectories(values.dir ?? []), values.since);
     console.log(values.json ? JSON.stringify(review, null, 2) : formatReview(review));
+  } else if (action === "approve") {
+    const { values, positionals } = parseArgs({
+      args: args.slice(1),
+      options: { session: { type: "boolean" } },
+      allowPositionals: true,
+    });
+    const [target, sessionId, requestHash] = positionals as [Request["harness"], string, string];
+    if (
+      !["claude", "codex", "copilot"].includes(target) ||
+      !/^[A-Za-z0-9_.-]+$/.test(sessionId ?? "") ||
+      !/^[a-f0-9]{64}$/.test(requestHash ?? "")
+    )
+      throw new ApproveError(
+        "Usage: policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--session]",
+      );
+    if (!process.stdin.isTTY || !process.stdout.isTTY)
+      throw new ApproveError(
+        "Run approve yourself in an interactive terminal; it asks you to confirm the request.",
+      );
+    if (!existsSync(sessionDirectoryPath(target, sessionId)))
+      throw new ApproveError("No policy service is running for that session.");
+    const ask = (confirm: boolean) =>
+      send(target, sessionId, {
+        action: "grant",
+        grant: { requestHash, confirm, session: values.session === true },
+      }) as Promise<GrantResult>;
+    const preview = await ask(false);
+    if (preview.refused) throw new ApproveError(preview.refused);
+    console.log(
+      `Tool:     ${preview.tool}\nRequest:  ${preview.detail}\nRule:     ${preview.reason}`,
+    );
+    if (values.session && preview.scope !== "session")
+      console.log(
+        "This request can only be approved once: credential reads and possible unrecoverable loss are never approved for a session.",
+      );
+    const prompt = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await prompt.question(
+      preview.scope === "session"
+        ? "Allow this and later requests in this session that hit the same rule for the same scope? [y/N] "
+        : "Allow this request once? [y/N] ",
+    );
+    prompt.close();
+    if (!/^y(?:es)?$/i.test(answer.trim())) throw new ApproveError("Not approved.");
+    const granted = await ask(true);
+    if (!granted.granted) throw new ApproveError(granted.refused ?? "Not approved.");
+    console.log(
+      granted.scope === "session"
+        ? "Approved for this session. Tell the agent to retry the request unchanged."
+        : "Approved once. Tell the agent to retry the request unchanged.",
+    );
   } else if (action === "serve") await serve(harness, phase ?? "", cliPath);
   else if (action === "stop")
     console.log(JSON.stringify(await send(harness, phase ?? "", { action: "stop" })));
@@ -174,7 +235,13 @@ try {
     }
   } else throw new Error(usage);
 } catch (error) {
-  if (action?.startsWith("setup-hook")) {
+  if (error instanceof ApproveError) {
+    console.error(error.message);
+    process.exitCode = 1;
+  } else if (action === "approve") {
+    console.error("The approval could not be recorded. Nothing was approved.");
+    process.exitCode = 1;
+  } else if (action?.startsWith("setup-hook")) {
     console.error(
       error instanceof SetupError
         ? error.message

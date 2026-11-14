@@ -57,8 +57,9 @@ describe("Codex PreToolUse", () => {
       }
     ).permissionDecisionReason;
     expect(reason).toContain("does not unblock it");
-    expect(reason).toContain("run it themselves");
-    expect(reason).toContain("policy profile");
+    expect(reason).toContain("approve codex");
+    expect(reason).toContain("in their own terminal");
+    expect(reason).not.toMatch(/policy profile/i);
     expect(reason).not.toMatch(/ask the user to approve/i);
     expect(reason).not.toMatch(/classif/i);
   });
@@ -70,7 +71,7 @@ describe("Codex PreToolUse", () => {
       }).hookSpecificOutput as { permissionDecisionReason: string }
     ).permissionDecisionReason;
     expect(reason).toContain("Classify it with the session policy-manager agent and retry");
-    expect(reason).toContain("run it themselves");
+    expect(reason).toContain("command the user runs to approve it");
     expect(reason).not.toContain("does not unblock it");
   });
   // Codex 0.167 rejects `permissionDecision: "allow"` without `updatedInput` ("PreToolUse hook

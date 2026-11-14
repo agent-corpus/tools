@@ -1,4 +1,4 @@
-import { isClassifyRecord, looksLikeClassifyRecord } from "./adapters.js";
+import { isClassifyRecord, looksLikeApproveGrant, looksLikeClassifyRecord } from "./adapters.js";
 import { audit, requestSummary } from "./audit.js";
 import {
   type CreatedFiles,
@@ -8,6 +8,7 @@ import {
   type Target,
   withCreated,
 } from "./created.js";
+import { grantScope } from "./grants.js";
 import { evaluate, hash, requestHash as requestHashOf, result, SHELL_TOOLS } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
@@ -25,6 +26,18 @@ const CLASSIFICATION_TTL_MS = 5 * 60_000;
 export const MAX_AI_APPROVALS = 50;
 /** How long after its approval an execution report may still record the files a tool created. */
 const CREATION_REPORT_MS = 15 * 60_000;
+/** How long after a human decision the user may still approve that exact request once. */
+export const GRANT_WINDOW_MS = 15 * 60_000;
+
+/** What `approve` shows the user before a one-time grant: the request a person must decide. */
+export interface GrantPreview {
+  requestHash: string;
+  tool: string;
+  category: Decision["category"];
+  reason: string;
+  /** Redacted command or target, for the user to recognize the request. */
+  detail: string;
+}
 
 interface ClassificationState {
   expires: number;
@@ -37,6 +50,23 @@ interface ClassificationState {
   ai?: Classification;
 }
 
+/** A grant the service refuses; its message is safe to show the user. */
+export class GrantError extends Error {}
+function grantDetail(request: Request): string {
+  const command = request.input.command ?? request.input.cmd;
+  if (typeof command === "string") return redactText(command, 300);
+  const file = request.input.file_path ?? request.input.path;
+  if (typeof file === "string") return redactText(file, 300);
+  if (typeof request.input.patch === "string" || typeof request.input.input === "string")
+    return redactText(
+      String(request.input.patch ?? request.input.input)
+        .split("\n")
+        .filter((line) => /^\*\*\* (?:Add|Update|Delete) File:/.test(line))
+        .join("; "),
+      300,
+    );
+  return request.tool;
+}
 export class PolicySession {
   private cache = new Map<string, { expires: number; ai?: Classification }>();
   private pending = new Map<string, Request>();
@@ -46,6 +76,12 @@ export class PolicySession {
   /** Files this session created, and the paths each approved request may create. */
   private created: CreatedFiles = new Map();
   private creating = new Map<string, { targets: Target[]; approvedAt: number }>();
+  /** Requests this session sent to a person, which the user may approve once. */
+  private humanDecisions = new Map<string, GrantPreview & { at: number; sessionScope?: string }>();
+  /** One-time user approvals, each usable once per hook phase. */
+  private grants = new Map<string, { phases: Set<string> }>();
+  /** Session grants: hashes of a human rule and the scope the user approved it for. */
+  private sessionGrants = new Set<string>();
   constructor(
     readonly directory: string,
     readonly harness: string,
@@ -87,6 +123,104 @@ export class PolicySession {
       "unknown",
       "A classification record for another session or CLI, or with anything added, requires human review",
     );
+  }
+  /**
+   * Only the user approves a request once, from their own terminal. A shell command that runs a
+   * policy-manager `approve`, in any form or nesting, is never approved for the agent.
+   */
+  private approveGrant(request: Request): Decision | undefined {
+    const command = request.input.command ?? request.input.cmd;
+    if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string") return undefined;
+    if (!looksLikeApproveGrant(command)) return undefined;
+    return result(
+      request,
+      "sensitive",
+      "Only the user may approve a request, by running approve in their own terminal",
+    );
+  }
+  /**
+   * A user approval that covers this human decision: a one-time grant for this exact request
+   * (used once per hook phase), or a session grant for its rule and scope. Each use is audited.
+   */
+  private granted(request: Request, decision: Decision, phase?: string): Decision | undefined {
+    const once = this.grants.get(decision.requestHash);
+    const slot = phase ?? "review";
+    if (once && !once.phases.has(slot)) {
+      once.phases.add(slot);
+      // PreToolUse runs before PermissionRequest; once both have allowed the tool, it is spent.
+      if (once.phases.has("PreToolUse") && once.phases.has("PermissionRequest"))
+        this.grants.delete(decision.requestHash);
+      audit(this.directory, {
+        event: "human-grant-use",
+        requestHash: decision.requestHash,
+        scope: "once",
+        phase: slot,
+      });
+      return { ...result(request, decision.category, "Approved once by the user", true) };
+    }
+    const scope = grantScope(request, decision, this.profile);
+    if (scope === undefined) return undefined;
+    const key = hash([decision.reason, scope]);
+    if (!this.sessionGrants.has(key)) return undefined;
+    audit(this.directory, {
+      event: "human-grant-use",
+      requestHash: decision.requestHash,
+      scope: "session",
+      scopeHash: key,
+      phase: slot,
+    });
+    return {
+      ...result(request, decision.category, "Approved for this session by the user", true),
+    };
+  }
+  /**
+   * Looks up, and with `confirm` grants, a user approval of a request this session sent to a
+   * person within the last GRANT_WINDOW_MS. Without `session` the next review of that exact
+   * request is approved once per hook phase; with it, every later request in this session that
+   * hits the same rule for the same scope is approved. A request with no session scope (credential
+   * reads, possible unrecoverable loss) is approved once only, and the result says so.
+   */
+  grant(
+    requestHash: string,
+    confirm: boolean,
+    session = false,
+  ): GrantPreview & { granted: boolean; scope: "once" | "session" } {
+    if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new GrantError("Not a request hash");
+    const pending = this.humanDecisions.get(requestHash);
+    if (!pending || Date.now() - pending.at > GRANT_WINDOW_MS) {
+      this.humanDecisions.delete(requestHash);
+      throw new GrantError(
+        "No request in this session needed a person with that hash in the last 15 minutes. Retry the request so it is blocked again, then approve the new hash.",
+      );
+    }
+    const { at: _at, sessionScope, ...preview } = pending;
+    const scope = session && sessionScope !== undefined ? "session" : "once";
+    if (!confirm) return { ...preview, granted: false, scope };
+    this.humanDecisions.delete(requestHash);
+    if (scope === "session" && sessionScope !== undefined) {
+      if (this.sessionGrants.size >= 64) this.sessionGrants.clear();
+      this.sessionGrants.add(hash([preview.reason, sessionScope]));
+    }
+    if (this.grants.size >= 64) this.grants.delete(this.grants.keys().next().value ?? "");
+    this.grants.set(requestHash, { phases: new Set() });
+    audit(this.directory, {
+      event: "human-grant",
+      requestHash,
+      category: preview.category,
+      scope,
+      ...(scope === "session" ? { scopeHash: hash([preview.reason, sessionScope]) } : {}),
+      summary:
+        scope === "session"
+          ? "User approved the rule for this session"
+          : "User approved the request once",
+    });
+    audit(this.directory, {
+      event: "human-response",
+      requestHash,
+      response: "approved",
+      summary: "User approved the request from the terminal",
+    });
+    return { ...preview, granted: true, scope };
   }
   private state(requestHash: string): ClassificationState | undefined {
     const state = this.states.get(requestHash);
@@ -154,6 +288,7 @@ export class PolicySession {
         ...(ai.rationale ? { rationale: redactText(ai.rationale, 200) } : {}),
       });
     let decision =
+      this.approveGrant(request) ??
       this.classifyRecord(request) ??
       withCreated(this.created, () => evaluate(request, ai ?? cachedAi ?? known?.ai, this.profile));
     if (decision.tier === "ambiguous") {
@@ -211,7 +346,27 @@ export class PolicySession {
         }
       }
     }
-    if (decision.decision === "human") this.cache.delete(key);
+    if (decision.decision === "human") {
+      const allowed = this.granted(request, decision, phase);
+      if (allowed) decision = allowed;
+    }
+    if (decision.decision === "human") {
+      this.cache.delete(key);
+      const sessionScope = grantScope(request, decision, this.profile);
+      decision = { ...decision, sessionGrantable: sessionScope !== undefined };
+      if (this.humanDecisions.size >= 256)
+        this.humanDecisions.delete(this.humanDecisions.keys().next().value ?? "");
+      this.humanDecisions.delete(requestHash);
+      this.humanDecisions.set(requestHash, {
+        requestHash,
+        tool: request.tool,
+        category: decision.category,
+        reason: decision.reason,
+        detail: grantDetail(request),
+        at: Date.now(),
+        ...(sessionScope === undefined ? {} : { sessionScope }),
+      });
+    }
     // Evaluation always precedes lookup. Filesystem evidence is never cached.
     if (decision.decision === "approve" && decision.cache === "session") {
       decision.cached = entry !== undefined && entry.expires > Date.now() && ai === undefined;
