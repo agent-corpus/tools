@@ -1276,6 +1276,8 @@ function sensitiveOperand(cwd: string, word: string): boolean {
 function sensitiveGlob(cwd: string, word: string): boolean {
   try {
     const parts = word.split(/[\\/]/);
+    // zsh `**/` matches any depth (and `***/` follows symlinks): too wide to expand here.
+    if (parts.some((part) => part.includes("**"))) return true;
     const first = parts.findIndex((part) => GLOB.test(part));
     const prefix = parts.slice(0, first).join("/");
     const start = resolveWord(cwd, first === 0 ? "." : prefix || "/");
@@ -1362,18 +1364,31 @@ const NAME_PATTERN_OPTIONS: Record<string, string[]> = {
   rg: ["--glob", "--iglob", "-g"],
   find: ["-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename"],
 };
-/** Whether `args[index]` is, or carries, the value of a file-name pattern option. */
-function namePatternAt(program: string, args: string[], index: number): boolean {
+/**
+ * Indices of `args` that are, or carry, the value of a file-name pattern option. Text words (a
+ * pattern after `-e`) are never options, and nothing after `--` is.
+ */
+function namePatternIndices(program: string, args: string[], text: Set<number>): Set<number> {
+  const found = new Set<number>();
   const options = NAME_PATTERN_OPTIONS[program];
-  if (!options) return false;
-  const word = args[index] ?? "";
-  const previous = args[index - 1] ?? "";
-  if (options.includes(previous)) return true;
-  return options.some((option) =>
-    option.startsWith("--")
-      ? word.startsWith(`${option}=`)
-      : option === "-g" && word.startsWith("-g") && word.length > 2,
-  );
+  if (!options) return found;
+  for (let index = 0; index < args.length; index++) {
+    const word = args[index] ?? "";
+    if (text.has(index)) continue;
+    if (word === "--") break;
+    if (options.includes(word)) {
+      if (!text.has(index + 1)) found.add(index + 1);
+      index++;
+    } else if (
+      options.some((option) =>
+        option.startsWith("--")
+          ? word.startsWith(`${option}=`)
+          : option === "-g" && word.startsWith("-g") && word.length > 2,
+      )
+    )
+      found.add(index);
+  }
+  return found;
 }
 
 /** Index of chmod's mode or chown's owner (`+x`, `u+w`, `user:group`), which names no file. */
@@ -1397,6 +1412,54 @@ function modeIndex(program: string, args: string[]): number | undefined {
  * touched), so they take the read check. Undefined when the split is uncertain (backup suffixes),
  * and every operand is then checked as a write.
  */
+/** GNU long options of cp and ln; only --target-directory takes a separate value. */
+const COPY_LONG: Record<string, string[]> = {
+  cp: [
+    "--archive",
+    "--attributes-only",
+    "--backup",
+    "--copy-contents",
+    "--debug",
+    "--dereference",
+    "--force",
+    "--interactive",
+    "--keep-directory-symlink",
+    "--link",
+    "--no-clobber",
+    "--no-dereference",
+    "--no-preserve",
+    "--no-target-directory",
+    "--one-file-system",
+    "--parents",
+    "--preserve",
+    "--recursive",
+    "--reflink",
+    "--remove-destination",
+    "--sparse",
+    "--strip-trailing-slashes",
+    "--suffix",
+    "--symbolic-link",
+    "--target-directory",
+    "--update",
+    "--verbose",
+  ],
+  ln: [
+    "--backup",
+    "--directory",
+    "--force",
+    "--interactive",
+    "--logical",
+    "--no-dereference",
+    "--no-target-directory",
+    "--physical",
+    "--relative",
+    "--suffix",
+    "--symbolic",
+    "--target-directory",
+    "--verbose",
+  ],
+};
+
 function copySources(
   program: string,
   args: string[],
@@ -1418,11 +1481,14 @@ function copySources(
       continue;
     }
     if (arg.startsWith("--")) {
-      const name = arg.split("=")[0] ?? "";
-      if (/^--(?:b|s(?:u|$))/.test(name)) return undefined; // --backup, --suffix
-      if (name.length > 3 && "--symbolic".startsWith(name)) symbolic = true;
-      if (name.length > 3 && "--link".startsWith(name)) return undefined;
-      if (name.length > 3 && "--target-directory".startsWith(name)) {
+      // Resolved as GNU getopt does (exact or unique prefix); unknown or ambiguous fails closed.
+      const given = arg.split("=")[0] ?? "";
+      const known = COPY_LONG[program] ?? [];
+      const matches = known.includes(given) ? [given] : known.filter((o) => o.startsWith(given));
+      const name = matches.length === 1 ? matches[0] : undefined;
+      if (name === undefined || ["--backup", "--suffix", "--link"].includes(name)) return undefined;
+      if (name === "--symbolic") symbolic = true;
+      if (name === "--target-directory") {
         if (target !== undefined) return undefined;
         target = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[++index];
         if (target === undefined) return undefined;
@@ -1564,6 +1630,7 @@ export function simpleDecision(
   // known text positions (sed scripts, grep patterns, gh message text) are not paths, but the
   // files a sed script reads or writes are.
   const operands = textOperands(program, args);
+  const namePatterns = namePatternIndices(program, args, operands.text);
   for (const [index, word] of args.entries()) {
     if (operands.text.has(index)) continue;
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
@@ -1571,7 +1638,7 @@ export function simpleDecision(
     const pathLike = candidate.includes("/") || candidate.startsWith(".");
     // A file-name pattern (`--include=*.md`, `find -name '*.ts'`) is matched below the searched
     // paths, not against the working directory, so it is judged by name only.
-    const namePattern = namePatternAt(program, args, index);
+    const namePattern = namePatterns.has(index);
     if (
       PRINTERS.has(program) || namePattern
         ? (pathLike || namePattern) && sensitive(candidate)

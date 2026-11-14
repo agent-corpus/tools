@@ -147,6 +147,14 @@ describe("cp, ln and chmod from a main checkout into the temp directory", SLOW, 
     (o: string, m: string) => `cp --target-directory=${m} ${o}/x`,
     (o: string, m: string) => `cp --target-directory ${m} ${o}/x`,
     (o: string, m: string) => `cp --target ${m} ${o}/x`,
+    // Abbreviations GNU getopt accepts, and unknown long options, fail closed.
+    (o: string, m: string) => `cp --t ${m}/.claude/ ${o}/settings.json`,
+    (o: string, m: string) => `cp --ta ${m} ${o}/x`,
+    (o: string, m: string) => `ln -sf --t ${m}/.claude ${o}/settings.json`,
+    (o: string, m: string) => `cp --l ${m}/a.txt ${o}/hard`,
+    (o: string, m: string) => `cp --li ${m}/a.txt ${o}/hard`,
+    (o: string, m: string) => `cp --s ${m}/a.txt ${o}/y`,
+    (o: string, m: string) => `cp --no-such-option ${m}/a.txt ${o}/y`,
     (o: string, m: string) => `cp -- ${o}/x ${m}/b.txt`,
     // A backup suffix makes the split uncertain: every operand is a write.
     (o: string, m: string) => `cp -S .bak ${m}/a.txt ${o}/y`,
@@ -366,6 +374,23 @@ describe("bare credential operands (#33)", SLOW, () => {
     for (const command of ["cat .*/*", "cat .s*/*", `cat ${posix(home)}/.s*/*`, "cat */../.ssh/*"])
       expect(bash(command, home).category, command).toBe("sensitive");
     expect(bash("cat */*.md", home).decision).toBe("approve");
+  });
+
+  test("zsh recursive `**` fails closed", () => {
+    for (const command of ["cat **/.s*/*", "cat **/id*", "cat src/***/x"])
+      expect(bash(command, keys).category, command).toBe("sensitive");
+  });
+
+  test.skipIf(windows)("a pattern option is found by parsing, not by the previous word", () => {
+    symlinkSync(join(keys, "id_rsa"), join(outside, "plain"));
+    for (const command of [
+      "rg -e -g ./plain",
+      "rg -e --glob ./plain",
+      "grep x -- --include ./plain",
+      "find . -name x -- -name ./plain",
+    ])
+      expect(bash(command, outside).category, command).toBe("sensitive");
+    expect(bash("rg x -g ./plain", outside).decision).toBe("approve");
   });
 
   test("a glob over more entries than the budget fails closed", () => {
