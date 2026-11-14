@@ -1537,14 +1537,35 @@ function runCase(
 
 // --- lists, pipelines and the entry point -----------------------------------------------------
 
+const ASSIGNABLE = /^[A-Z][A-Z0-9_]*$/;
+/** bash and zsh variables whose assignment can fail: read-only, numeric, or tied to the process. */
+const SHELL_SPECIAL =
+  /^(?:BASH\w*|ZSH\w*|SHELLOPTS|EUID|UID|EGID|GID|GROUPS|PPID|USERNAME|ARGC|HISTCMD|LINENO|SECONDS|EPOCH\w*|S?RANDOM|ERRNO|OPTIND|OPTARG|TTYIDLE|SHLVL|COLUMNS|LINES|HISTSIZE|HISTFILESIZE|SAVEHIST|DIRSTACKSIZE|KEYTIMEOUT|LISTMAX|LOGCHECK|MAILCHECK|PERIOD|TMOUT|TRY_BLOCK_\w+|FUNCNAME|FUNCNEST|COMP_\w+|READLINE_\w+)$/;
+
 /**
- * True when the pipeline always succeeds: `true`, `:`, or `cd` to an absolute directory that exists
+ * True when the pipeline always succeeds: a literal assignment, `true`, `:`,
+ * or `cd` to an absolute directory that exists
  * and can be entered now. Only used to know that an `&&` chain goes on past it; the directory it
  * started from is still kept as possible.
  */
 function cannotFail(ctx: Ctx, node: PipelineNode, state: State): boolean {
   const stage = node.stages.length === 1 && !node.negated ? node.stages[0] : undefined;
-  if (stage?.kind !== "simple" || stage.assigns.length || stage.redirects.length) return false;
+  if (stage?.kind !== "simple" || stage.redirects.length) return false;
+  // `S=/x && H=y; use $H`: a bare assignment with no substitution succeeds. Only uppercase names
+  // that the shell does not reserve; zsh's lowercase specials and the read-only or numeric
+  // specials of bash and zsh can refuse a value.
+  if (!stage.argv.length)
+    return (
+      stage.assigns.length > 0 &&
+      stage.assigns.every(
+        (a) =>
+          ASSIGNABLE.test(a.name) &&
+          !SHELL_SPECIAL.test(a.name) &&
+          !BANNED_ENV.test(a.name) &&
+          !a.value.subs.length,
+      )
+    );
+  if (stage.assigns.length) return false;
   const argv = stage.argv.map(plainText);
   const [program, target] = argv;
   if (program === undefined || state.funcs.has(program)) return false;
