@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -184,6 +184,60 @@ describe("cp, ln and chmod from a main checkout into the temp directory", SLOW, 
     const h = `${posix(outside)}/hard`;
     expect(bash(`ln ${posix(main)}/a.txt ${h} && echo x >> ${h}`, main).decision).toBe("human");
   });
+
+  test("a hard link out of the main checkout is a write of its source", () => {
+    for (const command of [
+      `ln ${posix(main)}/a.txt ${posix(outside)}/hard`,
+      `ln -f ${posix(main)}/a.txt ${posix(outside)}/hard`,
+      `cp -l ${posix(main)}/a.txt ${posix(outside)}/hard`,
+      `cp -al ${posix(main)} ${posix(outside)}/tree`,
+      `cp --link ${posix(main)}/a.txt ${posix(outside)}/hard`,
+    ])
+      expect(bash(command, main).decision, command).toBe("human");
+  });
+
+  test("a hard-linked file in a scratch root is not a scratch write", () => {
+    const scratch = join(root, "scratch-root");
+    mkdirSync(scratch);
+    const scratchProfile = parseProfile(
+      JSON.stringify({ version: 1, mode: "permissive", scratchRoots: [scratch] }),
+    );
+    const decide = (command: string) =>
+      evaluate(
+        { sessionId: "t", harness: "claude", cwd: main, tool: "Bash", input: { command } },
+        undefined,
+        scratchProfile,
+      );
+    const settings = join(main, ".claude", "settings.json");
+    mkdirSync(join(main, ".claude"), { recursive: true });
+    writeFileSync(settings, "{}");
+    const alias = join(scratch, "s");
+    // First call: the link itself asks.
+    expect(decide(`ln ${posix(settings)} ${posix(alias)}`).decision).toBe("human");
+    // Second call, once the link exists: a write through it asks too.
+    linkSync(settings, alias);
+    expect(decide(`echo x > ${posix(alias)}`).decision).toBe("human");
+    const r: Request = {
+      sessionId: "t",
+      harness: "claude",
+      cwd: main,
+      tool: "Write",
+      input: { file_path: alias, content: "x" },
+    };
+    expect(evaluate(r, undefined, scratchProfile).decision).toBe("human");
+    expect(decide(`echo x > ${posix(scratch)}/plain.txt`).decision).toBe("approve");
+  });
+
+  test.each([
+    (m: string) => `chmod -N ${m}/a.txt`,
+    (m: string) => `chmod -E ${m}/a.txt`,
+    (m: string) => `chmod -C ${m}/a.txt`,
+    (m: string) => `chmod -i ${m}/a.txt`,
+    (m: string) => `chmod -I ${m}/a.txt`,
+    (m: string) => `chmod -vN ${m}/a.txt`,
+  ])("BSD chmod ACL options take no mode: %s", (make) => {
+    expect(bash(make(posix(main)), main).decision).toBe("human");
+  });
 });
 
 describe("git worktree remove --force", SLOW, () => {
@@ -198,7 +252,6 @@ describe("git worktree remove --force", SLOW, () => {
     for (const command of [
       `git worktree remove --force ${path}`,
       `git worktree remove -f ${path}`,
-      `git worktree remove -f -f ${path}`,
       `git worktree remove --force -- ${path}`,
     ]) {
       const d = bash(command, main);
@@ -230,6 +283,15 @@ describe("git worktree remove --force", SLOW, () => {
     const other = join(root, "other");
     execFileSync("git", ["init", "-b", "main", other], { stdio: "ignore" });
     expect(bash(`git worktree remove --force ${path}`, other).decision).toBe("human");
+  });
+
+  test("a second force, which removes a locked worktree, asks", () => {
+    const path = scratchWorktree("scratch-locked");
+    git(main, ["worktree", "lock", path]);
+    for (const flags of ["-ff", "-f -f", "--force -f", "--force --force"])
+      expect(bash(`git worktree remove ${flags} ${posix(path)}`, main).decision, flags).toBe(
+        "human",
+      );
   });
 
   test("refuses a worktree that holds another worktree", () => {
@@ -293,6 +355,38 @@ describe("bare credential operands (#33)", SLOW, () => {
   test.skipIf(windows)("a symlink to a credential is judged by its target", () => {
     symlinkSync(join(keys, "id_rsa"), join(outside, "innocent"));
     expect(bash("cat innocent", outside).category).toBe("sensitive");
+  });
+
+  test("a glob in a directory component is expanded too", () => {
+    const home = join(root, "home");
+    mkdirSync(join(home, ".ssh"), { recursive: true });
+    writeFileSync(join(home, ".ssh", "known"), "x");
+    mkdirSync(join(home, "docs"));
+    writeFileSync(join(home, "docs", "a.md"), "x");
+    for (const command of ["cat .*/*", "cat .s*/*", `cat ${posix(home)}/.s*/*`, "cat */../.ssh/*"])
+      expect(bash(command, home).category, command).toBe("sensitive");
+    expect(bash("cat */*.md", home).decision).toBe("approve");
+  });
+
+  test("a glob over more entries than the budget fails closed", () => {
+    const big = join(root, "big");
+    mkdirSync(big);
+    for (let i = 0; i < 5001; i++) writeFileSync(join(big, `f${i}.txt`), "");
+    expect(bash("cat *", big).category).toBe("sensitive");
+  });
+
+  test.skipIf(windows)("an unresolvable entry fails closed", () => {
+    const loop = join(root, "loop");
+    mkdirSync(loop);
+    symlinkSync("self", join(loop, "self"));
+    writeFileSync(join(loop, "zz.txt"), "");
+    expect(bash("cat *", loop).category).toBe("sensitive");
+  });
+
+  test("a file-name pattern option is judged by name only", () => {
+    expect(bash("find . -name '*.json'", keys).decision).toBe("approve");
+    expect(bash("grep -r x --include=*.json .", keys).decision).toBe("approve");
+    expect(bash("find . -name '*.pem'", keys).category).toBe("sensitive");
   });
 
   test("a file in a credential directory is sensitive by its resolved path", () => {

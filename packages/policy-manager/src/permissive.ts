@@ -618,6 +618,16 @@ export function permissiveWrite(cwd: string, input: string, profile: Profile, fi
   return check;
 }
 
+/** A file with another hard link may alias a file outside the scratch root; unknown counts as yes. */
+function hardLinked(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    return !stat.isDirectory() && stat.nlink > 1;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+}
+
 function writeEvidence(cwd: string, input: string, profile: Profile) {
   let lexical: string | undefined;
   let path: string | undefined;
@@ -635,6 +645,7 @@ function writeEvidence(cwd: string, input: string, profile: Profile) {
     if (
       !policyState(target) &&
       !policyState(lexical) &&
+      !hardLinked(target) &&
       profile.scratchRoots.some((root) => inside(root, target))
     )
       return {
@@ -760,13 +771,16 @@ function disposableWorktree(cwd: string, args: string[], roots: string[], fill?:
   if (fill?.script.tainted) return false;
   const paths: string[] = [];
   let ended = false;
+  let forces = 0;
   for (const arg of args) {
     if (!ended && arg === "--") ended = true;
     else if (!ended && arg.startsWith("-")) {
-      if (!/^-f+$/.test(arg) && !abbreviates(arg, "--force")) return false;
+      if (arg !== "-f" && !abbreviates(arg, "--force")) return false;
+      forces++;
     } else paths.push(arg);
   }
-  if (paths.length !== 1) return false;
+  // A second force also removes a locked worktree, and a lock is an explicit keep marker.
+  if (paths.length !== 1 || forces !== 1) return false;
   try {
     const target = canonical(resolveWord(cwd, paths[0] as string));
     if (policyState(target) || !roots.some((root) => root !== target && inside(root, target)))
@@ -878,7 +892,7 @@ function gitDecision(
   if (
     sub === "worktree" &&
     ["remove", "prune"].includes(positional[0] ?? "") &&
-    (has("-f", "--force") || positional[0] === "prune")
+    (has("-f", "--force") || cluster("f") || positional[0] === "prune")
   )
     return positional[0] === "remove" && disposableWorktree(cwd, rest.slice(1), roots, fill)
       ? ok("Removes a linked worktree inside a temp or scratch directory")
@@ -1244,28 +1258,64 @@ const GLOB_ENTRIES = 5000;
 function sensitiveOperand(cwd: string, word: string): boolean {
   if (word === "") return false;
   if (sensitive(word)) return true;
+  if (GLOB.test(word)) return sensitiveGlob(cwd, word);
   try {
-    if (GLOB.test(word)) {
-      const parts = word.split(/[\\/]/);
-      const last = parts.pop() ?? "";
-      if (parts.some((part) => GLOB.test(part))) return false;
-      const dir = resolveWord(cwd, parts.length ? parts.join("/") || "/" : ".");
-      if (sensitive(dir) || sensitive(canonical(dir))) return true;
-      const pattern = globPattern(last);
-      const entries = readdirSync(dir).slice(0, GLOB_ENTRIES);
-      // `*` skips dot files unless the pattern itself starts with a dot.
-      return entries.some(
-        (name) =>
-          (!name.startsWith(".") || last.startsWith(".")) &&
-          pattern.test(name) &&
-          (sensitive(name) || sensitive(canonical(join(dir, name)))),
-      );
-    }
     const lexical = resolveWord(cwd, word);
     if (!lstatExists(lexical)) return false;
     return sensitive(lexical) || sensitive(canonical(lexical));
   } catch {
     return false;
+  }
+}
+
+/**
+ * Expands a glob one component at a time, as the shell would, and reports whether any directory
+ * it passes or entry it matches is a credential path. Fails closed: an unreadable directory, an
+ * unresolvable entry or more than GLOB_ENTRIES entries in total count as sensitive.
+ */
+function sensitiveGlob(cwd: string, word: string): boolean {
+  try {
+    const parts = word.split(/[\\/]/);
+    const first = parts.findIndex((part) => GLOB.test(part));
+    const prefix = parts.slice(0, first).join("/");
+    const start = resolveWord(cwd, first === 0 ? "." : prefix || "/");
+    if (sensitive(start) || sensitive(canonical(start))) return true;
+    let current = [start];
+    let budget = GLOB_ENTRIES;
+    for (const part of parts.slice(first)) {
+      if (part === "" || part === ".") continue;
+      const next: string[] = [];
+      for (const dir of current) {
+        if (!GLOB.test(part)) {
+          const path = join(dir, part);
+          if (sensitive(path) || (lstatExists(path) && sensitive(canonical(path)))) return true;
+          next.push(path);
+          continue;
+        }
+        let entries: string[];
+        try {
+          if (!statSync(dir).isDirectory()) continue;
+          entries = readdirSync(dir);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          return true;
+        }
+        budget -= entries.length;
+        if (budget < 0) return true;
+        const pattern = globPattern(part);
+        // `*` skips dot files unless the pattern itself starts with a dot.
+        for (const name of entries) {
+          if ((name.startsWith(".") && !part.startsWith(".")) || !pattern.test(name)) continue;
+          const path = join(dir, name);
+          if (sensitive(name) || sensitive(canonical(path))) return true;
+          next.push(path);
+        }
+      }
+      current = next;
+    }
+    return false;
+  } catch {
+    return true;
   }
 }
 
@@ -1305,10 +1355,33 @@ function globPattern(glob: string): RegExp {
   }
 }
 
+const NAME_PATTERN_OPTIONS: Record<string, string[]> = {
+  grep: ["--include", "--exclude", "--exclude-dir"],
+  egrep: ["--include", "--exclude", "--exclude-dir"],
+  fgrep: ["--include", "--exclude", "--exclude-dir"],
+  rg: ["--glob", "--iglob", "-g"],
+  find: ["-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename"],
+};
+/** Whether `args[index]` is, or carries, the value of a file-name pattern option. */
+function namePatternAt(program: string, args: string[], index: number): boolean {
+  const options = NAME_PATTERN_OPTIONS[program];
+  if (!options) return false;
+  const word = args[index] ?? "";
+  const previous = args[index - 1] ?? "";
+  if (options.includes(previous)) return true;
+  return options.some((option) =>
+    option.startsWith("--")
+      ? word.startsWith(`${option}=`)
+      : option === "-g" && word.startsWith("-g") && word.length > 2,
+  );
+}
+
 /** Index of chmod's mode or chown's owner (`+x`, `u+w`, `user:group`), which names no file. */
 function modeIndex(program: string, args: string[]): number | undefined {
   if (!["chmod", "chown"].includes(program) || args.some((arg) => arg.startsWith("--reference")))
     return undefined;
+  // BSD chmod's ACL options (-N, -E, -C, -i, -I) take no mode: every operand is a file.
+  if (program === "chmod" && args.some((arg) => /^-[A-Za-z]*[NECiI]/.test(arg))) return undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] ?? "";
     if (arg === "--") return index + 1 < args.length ? index + 1 : undefined;
@@ -1333,6 +1406,7 @@ function copySources(
   const operands: string[] = [];
   let target: string | undefined;
   let ended = false;
+  let symbolic = false;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index] ?? "";
     if (ended || !arg.startsWith("-") || arg === "-") {
@@ -1346,6 +1420,8 @@ function copySources(
     if (arg.startsWith("--")) {
       const name = arg.split("=")[0] ?? "";
       if (/^--(?:b|s(?:u|$))/.test(name)) return undefined; // --backup, --suffix
+      if (name.length > 3 && "--symbolic".startsWith(name)) symbolic = true;
+      if (name.length > 3 && "--link".startsWith(name)) return undefined;
       if (name.length > 3 && "--target-directory".startsWith(name)) {
         if (target !== undefined) return undefined;
         target = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[++index];
@@ -1354,14 +1430,19 @@ function copySources(
       continue;
     }
     const letters = arg.slice(1);
-    if (/[bS]/.test(letters)) return undefined;
     const at = letters.indexOf("t");
+    const flags = at < 0 ? letters : letters.slice(0, at);
+    if (/[bS]/.test(flags)) return undefined;
+    if (program === "cp" && flags.includes("l")) return undefined;
+    if (program === "ln" && flags.includes("s")) symbolic = true;
     if (at >= 0) {
       if (target !== undefined) return undefined;
       target = at + 1 < letters.length ? letters.slice(at + 1) : args[++index];
       if (target === undefined) return undefined;
     }
   }
+  // A hard link shares its source's inode, so a later write through it changes the source.
+  if (program === "ln" && !symbolic) return undefined;
   if (target !== undefined) return { sources: operands, targets: [target] };
   if (operands.length >= 2) return { sources: operands.slice(0, -1), targets: operands.slice(-1) };
   // `ln -s path` links `basename(path)` in the working directory.
@@ -1488,9 +1569,12 @@ export function simpleDecision(
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
     // echo and printf read no file, so only a path-like word is judged, by name.
     const pathLike = candidate.includes("/") || candidate.startsWith(".");
+    // A file-name pattern (`--include=*.md`, `find -name '*.ts'`) is matched below the searched
+    // paths, not against the working directory, so it is judged by name only.
+    const namePattern = namePatternAt(program, args, index);
     if (
-      PRINTERS.has(program)
-        ? pathLike && sensitive(candidate)
+      PRINTERS.has(program) || namePattern
+        ? (pathLike || namePattern) && sensitive(candidate)
         : sensitiveOperand(cwd, candidate) || (candidate !== word && sensitiveOperand(cwd, word))
     )
       return human(request, "sensitive", "Protected path requires human approval");
