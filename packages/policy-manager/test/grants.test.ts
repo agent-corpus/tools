@@ -224,12 +224,13 @@ describe("a session grant on a generic command covers only that command", () => 
     const { s } = session();
     const first = s.review(shell("terraform apply -auto-approve"), undefined, "PreToolUse");
     expect(s.grant(first.requestHash, false, true).sessionScope).toMatch(
-      /^commands matching human pattern 0 in /,
+      /^commands matching \^terraform apply in /,
     );
     const w = s.review(write(join(worktree, ".agent-config", "a.md")), undefined, "PreToolUse");
-    expect(s.grant(w.requestHash, false, true).sessionScope).toBe(
-      `writes under ${join(worktree, ".agent-config")}`,
-    );
+    // Windows may report the temp directory by its short (8.3) name, so compare the tail only.
+    const label = s.grant(w.requestHash, false, true).sessionScope ?? "";
+    expect(label.startsWith("writes under ")).toBe(true);
+    expect(label.endsWith(join(".worktrees", "feat", ".agent-config"))).toBe(true);
   });
 });
 

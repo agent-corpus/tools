@@ -127,12 +127,16 @@ export function grantScope(
 }
 
 /** What a session scope covers, in words the user can check before approving it. */
-export function scopeLabel(scope: string): string {
+export function scopeLabel(scope: string, profile: Profile): string {
   if (scope.startsWith("protected:"))
     return `writes under ${scope.slice("protected:".length).split("\u0000").join(", ")}`;
   if (scope.startsWith("pattern:")) {
-    const [, patterns, ...checkout] = scope.split(":");
-    return `commands matching human pattern ${patterns} in ${checkout.join(":")}`;
+    const [, indexes = "", ...checkout] = scope.split(":");
+    const patterns = indexes
+      .split(",")
+      .map((index) => profile.humanPatterns[Number(index)]?.source ?? index)
+      .join(", ");
+    return `commands matching ${patterns} in ${checkout.join(":")}`;
   }
   const rest = scope.slice(scope.indexOf(":[") + 1);
   const end = rest.lastIndexOf("]:");

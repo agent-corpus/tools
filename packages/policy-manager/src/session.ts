@@ -26,9 +26,9 @@ const CLASSIFICATION_TTL_MS = 5 * 60_000;
 export const MAX_AI_APPROVALS = 50;
 /** How long after its approval an execution report may still record the files a tool created. */
 const CREATION_REPORT_MS = 15 * 60_000;
-/** How long after a human decision the user may still approve that exact request once. */
 export const APPROVE_GUARD =
   "Only the user may approve a request, by running approve in their own terminal";
+/** How long after a human decision the user may still approve that exact request once. */
 export const GRANT_WINDOW_MS = 15 * 60_000;
 
 /** What `approve` shows the user before a one-time grant: the request a person must decide. */
@@ -198,7 +198,7 @@ export class PolicySession {
     const preview: GrantPreview = {
       ...rest,
       ...(scope === "session" && sessionScope !== undefined
-        ? { sessionScope: scopeLabel(sessionScope) }
+        ? { sessionScope: scopeLabel(sessionScope, this.profile) }
         : {}),
     };
     if (!confirm) return { ...preview, granted: false, scope };

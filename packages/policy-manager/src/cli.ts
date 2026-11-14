@@ -164,7 +164,7 @@ try {
     );
     if (values.session && preview.scope !== "session")
       console.log(
-        "This request can only be approved once: credential reads and possible unrecoverable loss are never approved for a session.",
+        "This request can only be approved once: credential reads, possible unrecoverable loss and requests whose effect could not be determined are never approved for a session.",
       );
     if (preview.scope === "session" && preview.sessionScope)
       console.log(`Scope:    ${preview.sessionScope}`);
