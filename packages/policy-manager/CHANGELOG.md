@@ -1,5 +1,15 @@
 # @agent-corpus/policy-manager
 
+## 0.7.0
+
+### Minor Changes
+
+- [#35](https://github.com/agent-corpus/tools/pull/35) [`20addf0`](https://github.com/agent-corpus/tools/commit/20addf04237b4d9036d141e624e7b8bb1fc88e2e) Thanks [@charlesprakash](https://github.com/charlesprakash)! - The session approves its own classification record command deterministically, in every profile: exactly `node "<dist/cli.js>" classify <harness> <session-id> <<< '<json>'` for the current harness and session, with one single-quoted JSON object and nothing else. Any other direct invocation of a record (`node … cli.js classify` or `policy-manager classify`, also behind assignments, wrappers or keywords) goes to a person: another session, harness or CLI path, or anything added. A record nested in a quoted script (`sh -c '…'`) gets the normal decision.
+
+- [#37](https://github.com/agent-corpus/tools/pull/37) [`965ae78`](https://github.com/agent-corpus/tools/commit/965ae7857647251344fe4e117d2cd99282e7bf40) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Permissive profile: approve `grep`/`rg` glob-valued options (`--include=*.md`, `-g*.ts`), `az boards query`, `git worktree remove --force` of a linked worktree in a temp or scratch directory, plain `git worktree prune`, and `cp`/`ln` out of a main checkout into the temp directory (sources are reads; `chmod` modes are not paths). Security: bare credential file operands (`cat id_rsa`, `grep x secrets.json`, `head server.pem`, `cat *`) are now resolved against the working directory and sent to a person ([#33](https://github.com/agent-corpus/tools/issues/33)); `credentials.*`/`secrets.*` data files (json, yaml, toml, ini, env, ...) count as credential paths.
+
+- [#36](https://github.com/agent-corpus/tools/pull/36) [`71fe65c`](https://github.com/agent-corpus/tools/commit/71fe65cb95af94292c000ad9f853c9749e3ec04b) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Permissive mode now resolves variables assigned in an `&&` chain of literal assignments for commands after the chain: `S=/abs && H=x; ls $S/$H` is judged as `ls /abs/x` instead of going to a human as an environment variable of unknown content. A bare uppercase assignment with no command substitution or redirection cannot fail, so the chain always reaches it. Shell-reserved names (`UID`, `SECONDS`, `BASH*`, `ZSH*`, zsh's lowercase specials), `$(...)` values, `export` and prefix assignments still leave later names unknown.
+
 ## 0.6.0
 
 ### Minor Changes

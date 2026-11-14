@@ -1,6 +1,6 @@
 {
   "name": "@agent-corpus/live-board",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "live-board portable local tracking tools",
   "type": "module",
   "license": "MIT",
