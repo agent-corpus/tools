@@ -91,6 +91,42 @@ const CLASSIFY_INVOCATION = new RegExp(
 export function looksLikeClassifyRecord(command: string): boolean {
   return CLASSIFY_INVOCATION.test(command);
 }
+/**
+ * A command that runs, or names, a policy-manager `approve`, anywhere in the script and at any
+ * nesting (`sh -c '...'`, a here-document). Unlike a classification record, the agent never runs
+ * this: only the user approves, from their own terminal.
+ */
+const APPROVE_PROGRAM = /^(?:.*cli\.js|(?:@agent-corpus\/)?policy-manager(?:@.*)?)$/;
+// A token scan rather than one regular expression over the command, so its cost stays linear.
+export function looksLikeApproveGrant(command: string): boolean {
+  const tokens = command.split(/[\s"'`;&|()]+/);
+  return tokens.some((token, i) => tokens[i + 1] === "approve" && APPROVE_PROGRAM.test(token));
+}
+/** The command the user runs in their own terminal to approve a human decision. */
+export function approveCommand(
+  harness: Request["harness"],
+  requestHash: string,
+  context?: HookContext,
+): string {
+  const cliPath =
+    context && /^[A-Za-z]:\\/.test(context.cliPath)
+      ? context.cliPath.replace(/\\/g, "/")
+      : context?.cliPath;
+  return cliPath && context
+    ? `node "${cliPath}" approve ${harness} ${context.sessionId} ${requestHash}`
+    : `policy-manager approve ${harness} <session-id> ${requestHash}`;
+}
+function approveInstruction(
+  harness: Request["harness"],
+  decision: Decision,
+  context?: HookContext,
+): string {
+  const command = approveCommand(harness, decision.requestHash, context);
+  const session = decision.sessionGrantable
+    ? " Adding --session also allows later requests in this session that hit the same rule for the same scope."
+    : "";
+  return `Approving it in chat does not unblock it. To allow it once, the user runs in their own terminal: ${command} — then retry the same request unchanged.${session} Do not run that command yourself.`;
+}
 /** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
 function classifyInstruction(
   harness: Request["harness"],
@@ -151,15 +187,15 @@ export function hookResponse(
       : { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
   // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
   // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
-  // so a decision that needs a human is a deny. Approving it in chat does not change the decision,
-  // so the reason says so; the one in-session way through is classifying an ambiguous cloud
-  // request (needsClassification), which a retry then sees as approved. Codex's own approval prompt
-  // (PermissionRequest, above) still handles the requests it would ask about.
+  // so a decision that needs a human is a deny. Approving it in chat does not change the decision;
+  // the user approves it from their own terminal (`approve`, once or for the session), or an
+  // ambiguous request (needsClassification) is classified, and a retry then sees the approval.
+  // Codex's own approval prompt (PermissionRequest, above) still handles the requests it asks about.
   if (harness === "codex") {
     const next =
       decision.needsClassification === true && decision.classification !== "fallback"
-        ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, ask the user to run it themselves or to change the policy profile."
-        : "Approving it in this session does not unblock it: ask the user to run it themselves or to change the policy profile.";
+        ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, the retry is blocked with the command the user runs to approve it."
+        : approveInstruction(harness, decision, context);
     return {
       hookSpecificOutput: {
         hookEventName: phase,
