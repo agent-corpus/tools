@@ -519,6 +519,25 @@ function splitAssignment(word: Word): { name: string; value: Word } | undefined 
   };
 }
 
+/** grep and rg options whose value is a file-name glob. */
+const GLOB_VALUE_OPTIONS: Record<string, string[]> = {
+  grep: ["--include", "--exclude", "--exclude-dir"],
+  egrep: ["--include", "--exclude", "--exclude-dir"],
+  fgrep: ["--include", "--exclude", "--exclude-dir"],
+  rg: ["--glob", "--iglob", "-g"],
+};
+/**
+ * `--include=*.md` or rg's `-g*.ts`: the option name is literal, so expansion can only yield more
+ * words of the same option, never another option or program.
+ */
+function globValuedOption(program: string | undefined, text: string | undefined): boolean {
+  const options = program === undefined ? undefined : GLOB_VALUE_OPTIONS[basename(program)];
+  if (!options || text === undefined) return false;
+  return options.some((option) =>
+    option.startsWith("--") ? text.startsWith(`${option}=`) : text.startsWith(option),
+  );
+}
+
 function runSimple(
   ctx: Ctx,
   node: Simple,
@@ -542,10 +561,12 @@ function runSimple(
   // `r[m] -rf x` runs `rm` once a file called `rm` is there, and `--forc[e]` can become `--force`.
   const hasGlob = (word: Word) =>
     word.glob === true && plainText(word) !== "[" && plainText(word) !== "[[";
+  const program0 = plainText(node.argv[0]);
   const globbed = node.argv.find(
     (word, index) =>
       hasGlob(word) &&
-      (index === 0 || word.parts.some((p) => typeof p === "string" && p.startsWith("-"))),
+      (index === 0 || word.parts.some((p) => typeof p === "string" && p.startsWith("-"))) &&
+      !(index > 0 && globValuedOption(program0, plainText(word))),
   );
   if (globbed)
     return human(request, "unknown", "A pattern in a command name or option requires human review");

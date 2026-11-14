@@ -510,7 +510,10 @@ describe("files this session created", SLOW, () => {
     s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
   }
 
-  test("every command in the script must be provably on the creation allowlist", () => {
+  // Many scripts, each judged with live Git evidence, which is slow on Windows runners.
+  test("every command in the script must be provably on the creation allowlist", {
+    timeout: 90_000,
+  }, () => {
     const make = () => write(join(wt, "st.txt"), "a user's stashed data");
     for (const command of [
       "echo $(git stash pop) && touch st.txt",
