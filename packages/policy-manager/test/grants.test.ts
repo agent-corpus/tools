@@ -7,8 +7,8 @@ import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { approveCommand, hookResponse, looksLikeApproveGrant } from "../src/adapters.js";
 import { HUMAN_PATTERN, PROTECTED_PATH } from "../src/grants.js";
-import { parseProfile } from "../src/profile.js";
-import { GrantError, PolicySession } from "../src/session.js";
+import { parseProfile, strictProfile } from "../src/profile.js";
+import { APPROVE_GUARD, GrantError, PolicySession } from "../src/session.js";
 import type { Request } from "../src/types.js";
 
 const profile = parseProfile(
@@ -189,6 +189,63 @@ describe("session approval", () => {
     s.grant(first.requestHash, true, true);
     const d = s.review(shell("terraform apply y && rm -rf /tmp/z"), undefined, "PreToolUse");
     expect(d.decision).toBe("human");
+  });
+});
+
+function strictSession() {
+  const directory = join(root, `s${counter++}`);
+  mkdirSync(directory, { mode: 0o700 });
+  return new PolicySession(directory, "codex", "s1", strictProfile);
+}
+
+describe("a session grant on a generic command covers only that command", () => {
+  test.each([
+    ['bash -c "echo hi"', 'bash -c "rm -rf ~/proj"'],
+    ['python3 -c "print(1)"', "python3 -c \"import shutil; shutil.rmtree('/Users/x')\""],
+    ["gh api repos/o/r", "gh api -X DELETE repos/o/r"],
+    ["gh repo delete o/scratch --yes", "gh repo delete o/prod --yes"],
+    ["kubectl delete ns dev", "kubectl delete ns dev --all"],
+  ])("approving %s for the session does not approve %s", (command, later) => {
+    const s = strictSession();
+    const first = s.review(shell(command), undefined, "PreToolUse");
+    expect(first.decision).toBe("human");
+    s.grant(first.requestHash, true, true);
+    expect(s.review(shell(later), undefined, "PreToolUse").decision).not.toBe("approve");
+  });
+
+  test("a request with an unknown effect is approved once only", () => {
+    const s = strictSession();
+    const first = s.review(shell('bash -c "echo hi"'), undefined, "PreToolUse");
+    expect(first.category).toBe("unknown");
+    expect(first.sessionGrantable).toBe(false);
+  });
+
+  test("the preview names what a session approval covers", () => {
+    const { s } = session();
+    const first = s.review(shell("terraform apply -auto-approve"), undefined, "PreToolUse");
+    expect(s.grant(first.requestHash, false, true).sessionScope).toMatch(
+      /^commands matching human pattern 0 in /,
+    );
+    const w = s.review(write(join(worktree, ".agent-config", "a.md")), undefined, "PreToolUse");
+    expect(s.grant(w.requestHash, false, true).sessionScope).toBe(
+      `writes under ${join(worktree, ".agent-config")}`,
+    );
+  });
+});
+
+describe("the approve guard", () => {
+  test("is not itself approvable and offers no approve command", () => {
+    const { s } = session();
+    const d = s.review(
+      shell('node "/opt/pm/dist/cli.js" approve codex s1 x'),
+      undefined,
+      "PreToolUse",
+    );
+    expect(d.reason).toBe(APPROVE_GUARD);
+    expect(() => s.grant(d.requestHash, false)).toThrow(GrantError);
+    const text = JSON.stringify(hookResponse("codex", "PreToolUse", d));
+    expect(text).not.toContain("approve codex s1 " + d.requestHash);
+    expect(text).toContain("Do not run approve yourself");
   });
 });
 

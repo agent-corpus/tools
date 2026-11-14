@@ -69,7 +69,8 @@ function simple(request: Request): string[] | undefined {
  * targets cannot be read from the request stay one-time. Scopes:
  * - a protected-path write: the protected roots it touches (`<worktree>/.agent-config`);
  * - a humanPatterns match: the matching patterns, in the same checkout;
- * - any other human rule for a simple command: the program and its subcommands, same checkout.
+ * - any other human rule for a simple command: that exact command, same checkout.
+ * Category unknown (the engine could not rule out loss) is approved once only.
  * Shell scopes need a simple command, so nothing else in the script hides behind the rule.
  */
 export function grantScope(
@@ -112,15 +113,29 @@ export function grantScope(
       );
       return matched.length ? `pattern:${matched.join(",")}:${checkout}` : undefined;
     }
-    if (decision.category === "sensitive" || decision.category === "destructive") return undefined;
+    if (
+      decision.category === "sensitive" ||
+      decision.category === "destructive" ||
+      decision.category === "unknown"
+    )
+      return undefined;
     if (argv.slice(1).some((word) => sensitive(word))) return undefined;
-    const command = [argv[0]];
-    for (const word of argv.slice(1, 4)) {
-      if (word.startsWith("-") || word.includes("/") || word.startsWith(".")) break;
-      command.push(word);
-    }
-    return `command:${decision.reason}:${command.join(" ")}:${checkout}`;
+    return `command:${decision.reason}:${JSON.stringify(argv)}:${checkout}`;
   } catch {
     return undefined;
   }
+}
+
+/** What a session scope covers, in words the user can check before approving it. */
+export function scopeLabel(scope: string): string {
+  if (scope.startsWith("protected:"))
+    return `writes under ${scope.slice("protected:".length).split("\u0000").join(", ")}`;
+  if (scope.startsWith("pattern:")) {
+    const [, patterns, ...checkout] = scope.split(":");
+    return `commands matching human pattern ${patterns} in ${checkout.join(":")}`;
+  }
+  const rest = scope.slice(scope.indexOf(":[") + 1);
+  const end = rest.lastIndexOf("]:");
+  const argv = JSON.parse(rest.slice(0, end + 1)) as string[];
+  return `the exact command \`${argv.join(" ")}\` in ${rest.slice(end + 2)}`;
 }

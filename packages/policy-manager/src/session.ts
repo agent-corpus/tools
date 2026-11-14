@@ -8,7 +8,7 @@ import {
   type Target,
   withCreated,
 } from "./created.js";
-import { grantScope } from "./grants.js";
+import { grantScope, scopeLabel } from "./grants.js";
 import { evaluate, hash, requestHash as requestHashOf, result, SHELL_TOOLS } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
@@ -27,6 +27,8 @@ export const MAX_AI_APPROVALS = 50;
 /** How long after its approval an execution report may still record the files a tool created. */
 const CREATION_REPORT_MS = 15 * 60_000;
 /** How long after a human decision the user may still approve that exact request once. */
+export const APPROVE_GUARD =
+  "Only the user may approve a request, by running approve in their own terminal";
 export const GRANT_WINDOW_MS = 15 * 60_000;
 
 /** What `approve` shows the user before a one-time grant: the request a person must decide. */
@@ -37,6 +39,8 @@ export interface GrantPreview {
   reason: string;
   /** Redacted command or target, for the user to recognize the request. */
   detail: string;
+  /** What a session approval would cover, when this request can be approved for the session. */
+  sessionScope?: string;
 }
 
 interface ClassificationState {
@@ -132,11 +136,7 @@ export class PolicySession {
     const command = request.input.command ?? request.input.cmd;
     if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string") return undefined;
     if (!looksLikeApproveGrant(command)) return undefined;
-    return result(
-      request,
-      "sensitive",
-      "Only the user may approve a request, by running approve in their own terminal",
-    );
+    return result(request, "sensitive", APPROVE_GUARD);
   }
   /**
    * A user approval that covers this human decision: a one-time grant for this exact request
@@ -193,8 +193,14 @@ export class PolicySession {
         "No request in this session needed a person with that hash in the last 15 minutes. Retry the request so it is blocked again, then approve the new hash.",
       );
     }
-    const { at: _at, sessionScope, ...preview } = pending;
+    const { at: _at, sessionScope, ...rest } = pending;
     const scope = session && sessionScope !== undefined ? "session" : "once";
+    const preview: GrantPreview = {
+      ...rest,
+      ...(scope === "session" && sessionScope !== undefined
+        ? { sessionScope: scopeLabel(sessionScope) }
+        : {}),
+    };
     if (!confirm) return { ...preview, granted: false, scope };
     this.humanDecisions.delete(requestHash);
     if (scope === "session" && sessionScope !== undefined) {
@@ -350,7 +356,10 @@ export class PolicySession {
       const allowed = this.granted(request, decision, phase);
       if (allowed) decision = allowed;
     }
-    if (decision.decision === "human") {
+    if (decision.decision === "human" && decision.reason === APPROVE_GUARD) {
+      this.cache.delete(key);
+      decision = { ...decision, userOnly: true, sessionGrantable: false };
+    } else if (decision.decision === "human") {
       this.cache.delete(key);
       const sessionScope = grantScope(request, decision, this.profile);
       decision = { ...decision, sessionGrantable: sessionScope !== undefined };

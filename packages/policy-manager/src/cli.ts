@@ -166,6 +166,8 @@ try {
       console.log(
         "This request can only be approved once: credential reads and possible unrecoverable loss are never approved for a session.",
       );
+    if (preview.scope === "session" && preview.sessionScope)
+      console.log(`Scope:    ${preview.sessionScope}`);
     const prompt = createInterface({ input: process.stdin, output: process.stdout });
     const answer = await prompt.question(
       preview.scope === "session"

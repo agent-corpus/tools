@@ -49,6 +49,8 @@ export interface Decision {
   ai?: Classification;
   /** A human decision the user may approve for the rest of the session (`approve --session`). */
   sessionGrantable?: boolean;
+  /** The agent tried to approve a request itself: no approval instruction is offered for it. */
+  userOnly?: boolean;
 }
 
 export interface OutcomeReport {

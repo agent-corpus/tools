@@ -195,7 +195,9 @@ export function hookResponse(
     const next =
       decision.needsClassification === true && decision.classification !== "fallback"
         ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, the retry is blocked with the command the user runs to approve it."
-        : approveInstruction(harness, decision, context);
+        : decision.userOnly
+          ? "Do not run approve yourself: ask the user to approve the original request from their own terminal."
+          : approveInstruction(harness, decision, context);
     return {
       hookSpecificOutput: {
         hookEventName: phase,
