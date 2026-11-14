@@ -451,6 +451,153 @@ describe("the classify round trip", () => {
   });
 });
 
+describe("the session approves only its own record command", () => {
+  const cliPath = "/opt/pm/dist/cli.js";
+  const recording = (
+    harness: Request["harness"] = "claude",
+    profile = permissive,
+    path: string = cliPath,
+  ) => {
+    const directory = join(root, `r${counter++}`);
+    mkdirSync(directory, { mode: 0o700 });
+    return new PolicySession(directory, harness, "s1", profile, path);
+  };
+  const shell = (command: string, harness: Request["harness"] = "claude"): Request => ({
+    ...request(command),
+    harness,
+    tool: harness === "codex" ? "exec_command" : harness === "copilot" ? "bash" : "Bash",
+  });
+  const answer = (r: Request) => JSON.stringify(verdict(r));
+  const own = (json = '{"requestHash":"abc"}', harness: Request["harness"] = "claude") =>
+    classifyCommand(harness, { cliPath, sessionId: "s1" }, json);
+
+  for (const harness of ["claude", "codex", "copilot"] as const)
+    for (const profile of [permissive, parseProfile('{"version":1,"mode":"strict"}')])
+      test(`approved deterministically (${harness}, ${profile.mode})`, () => {
+        const d = recording(harness, profile).review(
+          shell(own(undefined, harness), harness),
+          undefined,
+          "PreToolUse",
+        );
+        expect(d.decision).toBe("approve");
+        expect(d.classification).toBeUndefined();
+      });
+
+  test("a Windows CLI path is matched in the form the hook writes", () => {
+    const windows = "D:\\a\\pm\\dist\\cli.js";
+    const command = classifyCommand("claude", { cliPath: windows, sessionId: "s1" }, "{}");
+    const s = recording("claude", permissive, windows);
+    expect(s.review(request(command), undefined, "PreToolUse").decision).toBe("approve");
+  });
+
+  test.each([
+    ["another session", classifyCommand("claude", { cliPath, sessionId: "s2" }, "{}")],
+    ["another harness", classifyCommand("codex", { cliPath, sessionId: "s1" }, "{}")],
+    [
+      "another CLI path",
+      classifyCommand("claude", { cliPath: "/tmp/evil/cli.js", sessionId: "s1" }, "{}"),
+    ],
+    [
+      "another installed version",
+      classifyCommand("claude", { cliPath: "/opt/pm-0.4.0/dist/cli.js", sessionId: "s1" }, "{}"),
+    ],
+    ["the generic form", "policy-manager classify claude s1 <<< '{}'"],
+    ["an unquoted path", `node ${cliPath} classify claude s1 <<< '{}'`],
+    ["a double-quoted answer", `node "${cliPath}" classify claude s1 <<< "{}"`],
+    ["a pipe in", `echo '{}' | node "${cliPath}" classify claude s1`],
+    ["a heredoc", `node "${cliPath}" classify claude s1 <<'EOF'\n{}\nEOF`],
+    ["a command after", `${own("{}")}; rm -rf x`],
+    ["an and-list", `${own("{}")} && echo done`],
+    ["a pipe out", `${own("{}")} | tee out.txt`],
+    ["a redirect", `${own("{}")} > ~/.bashrc`],
+    ["a command before", `cd /tmp && ${own("{}")}`],
+    ["a variable", `X=1 ${own("{}")}`],
+    ["a substitution outside the quotes", `${own("{}")}$(rm -rf x)`],
+    ["a quote break-out", own(`{}'$(rm -rf x)'`)],
+    ["a second word", `${own("{}")} '{}'`],
+    ["trailing space", `${own("{}")} `],
+    ["a multi-line answer", own('{\n"a":1}')],
+    ["a non-object answer", own("[1]")],
+    ["a non-JSON answer", own("not json")],
+    ["an empty answer", own("")],
+    ["npx", "npx -y @agent-corpus/policy-manager classify claude s1 <<< '{}'"],
+    ["a node path", `/usr/local/bin/node "${cliPath}" classify claude s1 <<< '{}'`],
+    ["a substitution", `echo $(node "${cliPath}" classify claude s1 <<< '{}')`],
+    ...[
+      "env",
+      "env -i",
+      "command",
+      "exec",
+      "exec -a name",
+      "time",
+      "timeout 5",
+      "nohup",
+      "nice -n 5",
+      "xargs",
+      "xargs -n 1",
+      "env A=1 nice -n 5",
+      "!",
+    ].map((lead) => [`behind ${lead}`, `${lead} node "${cliPath}" classify claude s2 <<< '{}'`]),
+    ["after then", `if true; then node "${cliPath}" classify claude s2 <<< '{}'; fi`],
+    ["after do", `for i in 1; do node "${cliPath}" classify claude s2 <<< '{}'; done`],
+    ["a quoted node path", `"/usr/local/bin/node" "${cliPath}" classify claude s2 <<< '{}'`],
+  ])("goes to a person: %s", (_, command) => {
+    const d = recording().review(request(command), undefined, "PreToolUse");
+    expect(d.decision).toBe("human");
+    expect(d.reason).toContain("classification record");
+  });
+
+  test("goes to a person with a custom environment or another directory", () => {
+    for (const extra of [{ env: { A: "1" } }, { workdir: "/elsewhere" }, { stdin: "x" }]) {
+      const r = { ...request(own()), input: { command: own(), ...extra } };
+      expect(recording().review(r, undefined, "PreToolUse").decision).toBe("human");
+    }
+  });
+
+  test.each([
+    'grep -rn "classify claude" src',
+    `grep -rn 'node "${cliPath}" classify claude s1' src`,
+    'git log --oneline --grep "policy-manager classify codex"',
+    "echo policy-manager classify claude",
+  ])("a command that only mentions a record keeps the normal decision: %s", (command) => {
+    const r = request(command);
+    const d = recording().review(r, undefined, "PermissionRequest");
+    expect(d.reason).not.toContain("classification record");
+    expect(d.decision).toBe(evaluate(r, undefined, permissive).decision);
+  });
+
+  test("without a known CLI path nothing is approved by this check", () => {
+    const directory = join(root, `r${counter++}`);
+    mkdirSync(directory, { mode: 0o700 });
+    const s = new PolicySession(directory, "claude", "s1", permissive);
+    expect(s.review(request(own()), undefined, "PreToolUse").decision).toBe("human");
+  });
+
+  test("a recorded classification approves the unchanged retry of the original", () => {
+    const s = recording();
+    const original = { ...ambiguous(), input: { command: "echo $RETRY", description: "first" } };
+    const blocked = s.review(original, undefined, "PreToolUse");
+    expect(blocked.classification).toBe("requested");
+    const out = JSON.stringify(
+      hookResponse("claude", "PreToolUse", blocked, { cliPath, sessionId: "s1" }),
+    );
+    const record = own(answer({ ...original, input: { command: "echo $RETRY" } }));
+    expect(out).toContain(JSON.stringify(own("<json>")).slice(1, -1));
+    expect(s.review(request(record), undefined, "PreToolUse").decision).toBe("approve");
+    // What the CLI then sends the service.
+    const classified = s.classify(JSON.parse(record.slice(record.indexOf("'") + 1, -1)));
+    expect(classified.requestHash).toBe(blocked.requestHash);
+    expect(classified.decision).toBe("approve");
+    // The harness may relabel the retry; the hash ignores the description.
+    const retry = { ...original, input: { ...original.input, description: "retry" } };
+    expect(s.review(retry, undefined, "PreToolUse")).toMatchObject({
+      decision: "approve",
+      requestHash: blocked.requestHash,
+    });
+    expect(s.review(retry, undefined, "PermissionRequest").decision).toBe("approve");
+  });
+});
+
 describe("review history", () => {
   test("a deny that was later approved is reported, with both attempts kept", async () => {
     const directory = join(root, `history-${counter++}`);

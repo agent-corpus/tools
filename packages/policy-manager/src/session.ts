@@ -1,3 +1,4 @@
+import { isClassifyRecord, looksLikeClassifyRecord } from "./adapters.js";
 import { audit, requestSummary } from "./audit.js";
 import {
   type CreatedFiles,
@@ -7,7 +8,7 @@ import {
   type Target,
   withCreated,
 } from "./created.js";
-import { evaluate, hash, requestHash as requestHashOf } from "./policy.js";
+import { evaluate, hash, requestHash as requestHashOf, result, SHELL_TOOLS } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
 import {
@@ -50,7 +51,43 @@ export class PolicySession {
     readonly harness: string,
     readonly sessionId: string,
     readonly profile: Profile = strictProfile,
+    /** This package's `cli.js`: the path in the record command the hook gives the model. */
+    readonly cliPath?: string,
   ) {}
+  /**
+   * The record command the hook gives this session is approved before the policy runs: the
+   * engine cannot always verify an installed CLI outside the repository or a here-string (strict
+   * mode never can), so the round trip could not finish. Any other classification record, for
+   * another session or CLI or with anything added, goes to a person.
+   */
+  private classifyRecord(request: Request): Decision | undefined {
+    const input = request.input;
+    const command = input.command ?? input.cmd;
+    if (
+      !SHELL_TOOLS.has(request.tool) ||
+      typeof command !== "string" ||
+      !looksLikeClassifyRecord(command)
+    )
+      return undefined;
+    const cwd = input.workdir ?? input.cwd ?? request.cwd;
+    if (
+      this.cliPath &&
+      cwd === request.cwd &&
+      input.env === undefined &&
+      input.shell === undefined &&
+      input.stdin === undefined &&
+      isClassifyRecord(command, request.harness, {
+        cliPath: this.cliPath,
+        sessionId: this.sessionId,
+      })
+    )
+      return result(request, "temp-write", "Records a classification for this session", true);
+    return result(
+      request,
+      "unknown",
+      "A classification record for another session or CLI, or with anything added, requires human review",
+    );
+  }
   private state(requestHash: string): ClassificationState | undefined {
     const state = this.states.get(requestHash);
     if (state && state.expires <= Date.now()) {
@@ -116,9 +153,9 @@ export class PolicySession {
         ...(ai.recoverable === undefined ? {} : { recoverable: ai.recoverable }),
         ...(ai.rationale ? { rationale: redactText(ai.rationale, 200) } : {}),
       });
-    let decision = withCreated(this.created, () =>
-      evaluate(request, ai ?? cachedAi ?? known?.ai, this.profile),
-    );
+    let decision =
+      this.classifyRecord(request) ??
+      withCreated(this.created, () => evaluate(request, ai ?? cachedAi ?? known?.ai, this.profile));
     if (decision.tier === "ambiguous") {
       if (ai && !decision.classification) this.remember(requestHash, { invalid: true });
       else if (ai) {

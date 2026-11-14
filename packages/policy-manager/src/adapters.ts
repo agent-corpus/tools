@@ -46,6 +46,51 @@ export function classifyCommand(
     ? `node "${cliPath}" classify ${harness} ${context.sessionId} <<< '${json}'`
     : `policy-manager classify ${harness} <session-id> <<< '${json}'`;
 }
+/**
+ * Whether `command` is exactly this session's record command from `classifyCommand`, answer
+ * included: one single-quoted literal JSON object, nothing before or after it. Inside single
+ * quotes the shell expands nothing, so the answer cannot run anything.
+ */
+export function isClassifyRecord(
+  command: string,
+  harness: Request["harness"],
+  context: HookContext,
+): boolean {
+  const template = classifyCommand(harness, context, "");
+  if (!template.startsWith('node "')) return false;
+  const head = template.slice(0, -1);
+  if (command.length > head.length + 4096 || !command.startsWith(head) || !command.endsWith("'"))
+    return false;
+  const json = command.slice(head.length, -1);
+  if (/['\0\r\n]/.test(json)) return false;
+  try {
+    const value: unknown = JSON.parse(json);
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+const WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s;&|]+)`;
+const CLI = String.raw`(?:"[^"]*cli\.js"|'[^']*cli\.js'|[^\s"';&|]*cli\.js)`;
+const NODE = String.raw`(?:"(?:[^"]*[/\\])?node(?:\.exe)?"|'(?:[^']*[/\\])?node(?:\.exe)?'|(?:[^\s"';&|]*[/\\])?node(?:\.exe)?)`;
+/** Assignments, wrappers and keywords that can stand before the command in a segment. */
+const LEAD = String.raw`(?:[A-Za-z_]\w*=${WORD}?\s+|(?:then|do|else|elif|if|while|until|!)\s+|(?:env|command|builtin|exec|time|timeout|nohup|nice|ionice|xargs|stdbuf|sudo|doas)(?:\s+${WORD}){0,6}?\s+)*`;
+/**
+ * A command segment that runs a policy-manager CLI's `classify`, for any session or CLI: `node`
+ * with a `cli.js`, or `policy-manager` (also through `npx`), at the start of the script or after
+ * an operator, behind any assignments, wrappers (`env`, `exec`, `xargs`...) or keywords. Text
+ * that only mentions such a command (a `grep` pattern, a commit message) does not match, and
+ * neither does a script nested in quotes (`sh -c '...'`), which gets the normal decision.
+ */
+const CLASSIFY_INVOCATION = new RegExp(
+  String.raw`(?:^|[;&|({` +
+    "`" +
+    String.raw`\n]|\$\()\s*${LEAD}(?:${NODE}\s+(?:-${WORD}\s+)*${CLI}|(?:npx\s+(?:-\S+\s+)*)?(?:@agent-corpus\/)?policy-manager(?:@\S+)?)\s+["']?classify\b`,
+);
+/** A command that runs a policy-manager classification record, for any session or CLI. */
+export function looksLikeClassifyRecord(command: string): boolean {
+  return CLASSIFY_INVOCATION.test(command);
+}
 /** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
 function classifyInstruction(
   harness: Request["harness"],

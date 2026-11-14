@@ -120,7 +120,7 @@ try {
     });
     const review = await reviewClassifications(sessionDirectories(values.dir ?? []), values.since);
     console.log(values.json ? JSON.stringify(review, null, 2) : formatReview(review));
-  } else if (action === "serve") await serve(harness, phase ?? "");
+  } else if (action === "serve") await serve(harness, phase ?? "", cliPath);
   else if (action === "stop")
     console.log(JSON.stringify(await send(harness, phase ?? "", { action: "stop" })));
   else if (action === "review" || action === "classify" || action === "record") {
