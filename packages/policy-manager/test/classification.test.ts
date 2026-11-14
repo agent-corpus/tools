@@ -523,6 +523,13 @@ describe("the session approves only its own record command", () => {
     ["npx", "npx -y @agent-corpus/policy-manager classify claude s1 <<< '{}'"],
     ["a node path", `/usr/local/bin/node "${cliPath}" classify claude s1 <<< '{}'`],
     ["a substitution", `echo $(node "${cliPath}" classify claude s1 <<< '{}')`],
+    ...["env", "env -i", "command", "exec", "time", "nohup", "xargs", "!"].map((lead) => [
+      `behind ${lead}`,
+      `${lead} node "${cliPath}" classify claude s2 <<< '{}'`,
+    ]),
+    ["after then", `if true; then node "${cliPath}" classify claude s2 <<< '{}'; fi`],
+    ["after do", `for i in 1; do node "${cliPath}" classify claude s2 <<< '{}'; done`],
+    ["a quoted node path", `"/usr/local/bin/node" "${cliPath}" classify claude s2 <<< '{}'`],
   ])("goes to a person: %s", (_, command) => {
     const d = recording().review(request(command), undefined, "PreToolUse");
     expect(d.decision).toBe("human");
