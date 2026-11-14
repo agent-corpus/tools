@@ -74,7 +74,7 @@ const WORD = String.raw`(?:"[^"]*"|'[^']*'|[^\s;&|]+)`;
 const CLI = String.raw`(?:"[^"]*cli\.js"|'[^']*cli\.js'|[^\s"';&|]*cli\.js)`;
 const NODE = String.raw`(?:"(?:[^"]*[/\\])?node(?:\.exe)?"|'(?:[^']*[/\\])?node(?:\.exe)?'|(?:[^\s"';&|]*[/\\])?node(?:\.exe)?)`;
 /** Assignments, wrappers and keywords that can stand before the command in a segment. */
-const LEAD = String.raw`(?:[A-Za-z_]\w*=${WORD}?\s+|(?:env|command|builtin|exec|time|nohup|nice|xargs|stdbuf|then|do|else|elif|if|while|until|!)(?:\s+-\S+)*\s+)*`;
+const LEAD = String.raw`(?:[A-Za-z_]\w*=${WORD}?\s+|(?:then|do|else|elif|if|while|until|!)\s+|(?:env|command|builtin|exec|time|timeout|nohup|nice|ionice|xargs|stdbuf|sudo|doas)(?:\s+${WORD}){0,6}?\s+)*`;
 /**
  * A command segment that runs a policy-manager CLI's `classify`, for any session or CLI: `node`
  * with a `cli.js`, or `policy-manager` (also through `npx`), at the start of the script or after
