@@ -425,6 +425,8 @@ export class PolicySession {
         decision.deferred !== undefined ||
         decision.classification === "requested") &&
       (["unknown", "cloud-read"].includes(decision.category) || decision.needsClassification) &&
+      // Only a person clears a hard-list request: it is never offered for classification.
+      decision.alwaysAsk === undefined &&
       !ai
     ) {
       if (this.pending.size >= 64) this.pending.delete(this.pending.keys().next().value ?? "");

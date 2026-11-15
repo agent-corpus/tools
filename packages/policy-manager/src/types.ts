@@ -90,5 +90,27 @@ export const ALWAYS_ASK_RULES = [
   "harness-settings",
   /** Writes to the policy profile itself. */
   "policy-profile",
+  /** A command matching the profile's `humanPatterns`. */
+  "human-patterns",
+  /** Credential or secret retrieval, and reads of credential paths. Off by default. */
+  "credential-read",
+  /** Cloud changes and deletions outside the verified inspection catalog. Off by default. */
+  "cloud-write",
+  /**
+   * Any other destructive command: `rm -rf` outside a feature worktree or temp directory,
+   * `git reset --hard`, `git checkout -- .`, `git stash drop`, deletions, publishing. Off by default.
+   */
+  "destructive-other",
 ] as const;
 export type AlwaysAskRule = (typeof ALWAYS_ASK_RULES)[number];
+
+/** The `alwaysAsk` a profile gets when it sets none. */
+export const DEFAULT_ALWAYS_ASK: readonly AlwaysAskRule[] = [
+  "force-push",
+  "delete-unmerged-branch",
+  "remove-worktree-force",
+  "git-clean",
+  "harness-settings",
+  "policy-profile",
+  "human-patterns",
+];

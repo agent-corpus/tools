@@ -211,8 +211,10 @@ describe("the AI never relaxes a deterministic boundary", () => {
       const { session: s } = session();
       const r = request(command);
       const d = s.review(r, undefined, "PreToolUse");
-      // Harness settings are on the default hard list and still ask; the rest defer to the harness.
-      expect(d.decision).toBe(name === "protected path" ? "human" : "native");
+      // Harness settings and humanPatterns are on the default hard list and still ask; the rest defer.
+      expect(d.decision).toBe(
+        ["protected path", "organization pattern"].includes(name) ? "human" : "native",
+      );
       expect(d.tier).toBeUndefined();
       const outcome = (() => {
         try {
@@ -272,19 +274,23 @@ describe("destructive requests follow recoverability", () => {
   });
 
   test("a destructive label approves nothing the engine did not prove is a worktree deletion", () => {
-    // Not approved: a hard-list rule still asks, even in a form the engine cannot parse; the rest
-    // is left to the harness.
-    for (const [command, expected] of [
-      ["rm -rf ~/{Documents,x}", "native"],
-      ["git push --force origin {feature,x}", "human"],
-      ["git clean -fdx {a,b}", "human"],
-      ["echo $SOME_VAR", "native"],
-    ]) {
+    // Not approved: what the classifier does not approve is left to the harness.
+    for (const command of ["rm -rf ~/{Documents,x}", "echo $SOME_VAR"]) {
       const { session: s } = session();
-      const r = request(command as string);
+      const r = request(command);
       expect(s.review(r, undefined, "PreToolUse").classification, command).toBe("requested");
       const d = s.classify(verdict(r, { category: "destructive", confidence: 0.99 }));
-      expect(d.decision, command).toBe(expected);
+      expect(d.decision, command).toBe("native");
+    }
+    // A hard-list rule asks at once, even in a form the engine cannot parse, and is never
+    // offered for classification.
+    for (const command of ["git push --force origin {feature,x}", "git clean -fdx {a,b}"]) {
+      const { session: s } = session();
+      const r = request(command);
+      const d = s.review(r, undefined, "PreToolUse");
+      expect(d.decision, command).toBe("human");
+      expect(d.classification, command).toBeUndefined();
+      expect(() => s.classify(verdict(r, { category: "destructive", confidence: 0.99 }))).toThrow();
     }
     // A non-destructive label on an ambiguous request still follows the verdict, as on main.
     const { session: s } = session();

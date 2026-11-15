@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { hookOutput, hookResponse } from "../src/adapters.js";
-import { ALWAYS_ASK_RULES, deferToNative } from "../src/native.js";
+import { ALWAYS_ASK_RULES, DEFAULT_ALWAYS_ASK, deferToNative } from "../src/native.js";
 import { evaluate } from "../src/policy.js";
 import { defaultProfilePath, ProfileError, parseProfile, strictProfile } from "../src/profile.js";
 import { replayTranscripts } from "../src/replay.js";
@@ -154,6 +154,24 @@ describe("the default hard list still asks", () => {
       "a shell redirect",
       () => shell("echo '{}' > ~/.claude/settings.json", repo),
     ],
+    ["harness-settings", "~/.claude/hooks/x.sh", () => write(settings(".claude", "hooks", "x.sh"))],
+    [
+      "harness-settings",
+      "a repository .claude/hooks script",
+      () => write(join(worktree, ".claude", "hooks", "pre.sh")),
+    ],
+    ["harness-settings", "~/.claude.json", () => write(settings(".claude.json"))],
+    ["harness-settings", "~/.codex/hooks/x.sh", () => write(settings(".codex", "hooks", "x.sh"))],
+    [
+      "harness-settings",
+      "~/.copilot/config.json",
+      () => write(settings(".copilot", "config.json")),
+    ],
+    [
+      "harness-settings",
+      ".github/hooks/*.json",
+      () => write(join(worktree, ".github", "hooks", "policy-manager.json")),
+    ],
     ["policy-profile", "the profile path", () => write(defaultProfilePath())],
   ];
   test.each(asks)("%s (%s)", (rule, _, make) => {
@@ -177,15 +195,23 @@ describe("the default hard list still asks", () => {
   });
 
   test("the default list is exactly the documented rule ids", () => {
-    expect(permissive.alwaysAsk).toEqual([...ALWAYS_ASK_RULES]);
-    expect(strictProfile.alwaysAsk).toEqual([...ALWAYS_ASK_RULES]);
-    expect(ALWAYS_ASK_RULES).toEqual([
+    const defaults = [
       "force-push",
       "delete-unmerged-branch",
       "remove-worktree-force",
       "git-clean",
       "harness-settings",
       "policy-profile",
+      "human-patterns",
+    ];
+    expect(permissive.alwaysAsk).toEqual(defaults);
+    expect(strictProfile.alwaysAsk).toEqual(defaults);
+    expect(DEFAULT_ALWAYS_ASK).toEqual(defaults);
+    expect(ALWAYS_ASK_RULES).toEqual([
+      ...defaults,
+      "credential-read",
+      "cloud-write",
+      "destructive-other",
     ]);
   });
 
@@ -211,6 +237,131 @@ describe("the default hard list still asks", () => {
       decision: "deny" as const,
     };
     expect(deferToNative(shell("ls"), d, [])).toBe(d);
+  });
+});
+
+describe("quoted, indirect and nested forms do not escape the hard list", () => {
+  const forms: Array<[string, string, string?]> = [
+    ["force-push", "'git' push --force origin x"],
+    ["force-push", "git 'push' --force origin x"],
+    ["force-push", "git push '--force' origin x"],
+    ["force-push", 'git push --for"ce" origin x'],
+    ["force-push", "\\git push -f origin x"],
+    ["force-push", "GIT=git; $GIT push -f origin x"],
+    ["force-push", "x=push; git $x --force origin"],
+    ["force-push", 'x="push --force"; git $x origin'],
+    ["force-push", "git -c alias.p=push p --force origin"],
+    ["force-push", "git $(echo push) --force origin"],
+    ["force-push", "git `echo push` --force origin"],
+    ["force-push", 'git "$(echo push)" --force origin'],
+    ["force-push", "GIT_EXEC_PATH=/tmp/x git push origin x --force"],
+    ["force-push", "git --exec-path=/tmp/x push -f origin x"],
+    ["force-push", 'eval git push "--for""ce" origin x'],
+    ["force-push", "eval 'git pu''sh --force origin x'"],
+    ["force-push", 'X=--force; eval "git push $X origin x"'],
+    ["force-push", "bash -c 'git push --force origin x'"],
+    ["force-push", 'sh -c "git push -f origin x" && echo done'],
+    ["force-push", "echo ok; (cd /tmp && git push --force origin x)"],
+    ["force-push", "env -i git push --mirror origin"],
+    ["force-push", "sudo -u me git push origin +x"],
+    ["delete-unmerged-branch", "git update-ref -d refs/heads/x"],
+    ["delete-unmerged-branch", "git branch -D ${BR}"],
+    ["delete-unmerged-branch", "git 'branch' '-D' x"],
+    ["delete-unmerged-branch", "git push origin ':x'"],
+    ["git-clean", "git 'clean' -fd"],
+    ["git-clean", "git clean -fd {a,b}"],
+    ["remove-worktree-force", "git worktree remove '--force' ../x"],
+    ["harness-settings", "echo x > ~/.claude/'settings.json'"],
+    ["harness-settings", "cd ~/.claude && echo x > settings.json"],
+    ["harness-settings", 'cd "$HOME/.claude" && echo x > settings.json'],
+    ["harness-settings", "cp /tmp/a ~/.codex/'config.toml'"],
+    ["harness-settings", "tee ~/.copilot/hooks/x.json < /tmp/a"],
+    ["harness-settings", "cd ~ && mv /tmp/a .claude.json"],
+    ["policy-profile", "cd ~/.config/agent-corpus/policy-manager && echo '{}' > policy.json"],
+  ];
+  const profiles = [
+    ["strict", strictProfile],
+    ["permissive", permissive],
+  ] as const;
+  for (const [mode, profile] of profiles)
+    test.each(forms)(`${mode}: %s for %s`, (rule, command) => {
+      const r = shell(command, repo);
+      const d = session(profile).s.review(r, undefined, "PreToolUse");
+      expect(d.decision, command).toBe("human");
+      expect(d.alwaysAsk, command).toBe(rule);
+    });
+
+  test.each([
+    "git status",
+    "git log --oneline -5",
+    "echo $(git rev-parse HEAD)",
+    "git commit -m 'force push later, then clean up'",
+    "npm run build -- --force",
+  ])("ordinary commands are not on the hard list: %s", (command) => {
+    for (const [, profile] of profiles) {
+      const d = session(profile).s.review(shell(command), undefined, "PreToolUse");
+      expect(d.alwaysAsk, command).toBeUndefined();
+    }
+  });
+});
+
+describe("a classification never approves a hard-list item", () => {
+  const forms = [
+    "git push -f origin {feat/a,x}",
+    "git clean -fd {a,b}",
+    "git branch -D ${BR}",
+    "git push origin --delete ${BR}",
+  ];
+  for (const classify of [false, true])
+    test.each(forms)(`classify ${classify}: %s`, (command) => {
+      const profile = { ...permissive, classify };
+      const { s } = session(profile);
+      const r = shell(command);
+      const d = s.review(r, undefined, "PreToolUse");
+      expect(d.decision).toBe("human");
+      expect(d.classification).toBeUndefined();
+      const ai = {
+        requestHash: d.requestHash,
+        category: "worktree-write" as const,
+        confidence: 0.99,
+        recoverable: true,
+      };
+      // Not offered for classification, and a record for it approves nothing.
+      expect(() => s.classify(ai)).toThrow();
+      expect(s.review(r, ai, "PreToolUse").decision).toBe("human");
+      expect(evaluate(r, ai, profile).decision).toBe("human");
+      expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
+    });
+});
+
+describe("off-by-default rule ids", () => {
+  test.each([
+    ["credential-read", "cat ~/.aws/credentials"],
+    ["credential-read", "az keyvault secret show --name x --vault-name y"],
+    ["cloud-write", "az vm restart --name a --resource-group b"],
+    ["destructive-other", "git reset --hard HEAD~1"],
+    ["destructive-other", "git stash drop"],
+    ["destructive-other", "rm -rf /var/tmp/../opt/x"],
+  ])("%s defers by default and asks when listed: %s", (rule, command) => {
+    for (const profile of [strictProfile, permissive]) {
+      expect(
+        session(profile).s.review(shell(command, repo), undefined, "PreToolUse").decision,
+      ).toBe("native");
+      const d = session({ ...profile, alwaysAsk: [rule] }).s.review(
+        shell(command, repo),
+        undefined,
+        "PreToolUse",
+      );
+      expect(d, command).toMatchObject({ decision: "human", alwaysAsk: rule });
+    }
+  });
+
+  test("human-patterns asks by default", () => {
+    const profile = parseProfile(
+      JSON.stringify({ version: 1, mode: "permissive", humanPatterns: ["^terraform apply"] }),
+    );
+    const d = session(profile).s.review(shell("terraform apply"), undefined, "PreToolUse");
+    expect(d).toMatchObject({ decision: "human", alwaysAsk: "human-patterns" });
   });
 });
 

@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { canonical, git } from "./evidence.js";
 import { type CredentialHelper, HelperError, parseCredentialHelpers } from "./helpers.js";
 import { TOOL_NAME } from "./tools.js";
-import { ALWAYS_ASK_RULES, CATEGORIES } from "./types.js";
+import { ALWAYS_ASK_RULES, CATEGORIES, DEFAULT_ALWAYS_ASK } from "./types.js";
 
 /**
  * A profile is policy *data*. The engine's checks (protected paths, secret retrieval, verified
@@ -34,7 +34,7 @@ export interface Profile {
   credentialHelpers: CredentialHelper[];
   /**
    * Decisions that still ask a person; every other one that needs a person is left to the
-   * harness's native permission flow. Rule ids from ALWAYS_ASK_RULES or decision categories.
+   * harness's native permission flow. Rule ids from ALWAYS_ASK_RULES (DEFAULT_ALWAYS_ASK when unset) or categories.
    */
   alwaysAsk: string[];
   /**
@@ -54,13 +54,13 @@ export const strictProfile: Profile = {
   mcpReadOnly: [],
   toolsDeny: { claude: [], codex: [], copilot: [] },
   credentialHelpers: [],
-  alwaysAsk: [...ALWAYS_ASK_RULES],
+  alwaysAsk: [...DEFAULT_ALWAYS_ASK],
   classify: false,
 };
 
 export const MAX_ALWAYS_ASK = 50;
 function parseAlwaysAsk(raw: unknown): string[] {
-  if (raw === undefined) return [...ALWAYS_ASK_RULES];
+  if (raw === undefined) return [...DEFAULT_ALWAYS_ASK];
   const known = new Set<string>([...ALWAYS_ASK_RULES, ...CATEGORIES]);
   if (
     !Array.isArray(raw) ||

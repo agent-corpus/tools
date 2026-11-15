@@ -98,7 +98,7 @@ export function replayTranscripts(paths: string[], profile: Profile, files = 50)
         reasons.set(decision.reason, bucket);
         if (decision.decision !== "human") continue;
         // With `classify` on, an ambiguous request is first blocked for classification.
-        if (decision.tier === "ambiguous" && profile.classify) {
+        if (decision.tier === "ambiguous" && decision.needsClassification && profile.classify) {
           report.classificationBlocks++;
           continue;
         }

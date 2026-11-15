@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
+import { stillAsks } from "./native.js";
 import {
   commandDecision,
   permissiveRead,
@@ -276,6 +277,11 @@ export function evaluate(
   profile: Profile = strictProfile,
 ): Decision {
   const decision = markAmbiguous(evaluateCore(request, profile), profile);
+  // A request on the `alwaysAsk` hard list is a person's: it is never sent to classification, and
+  // no classification, however confident, approves it.
+  const hard =
+    decision.decision === "human" ? stillAsks(request, decision, profile.alwaysAsk) : undefined;
+  if (hard) return { ...decision, needsClassification: false, alwaysAsk: hard };
   if (ai) {
     // Self-reported confidence is not a probability or a substitute for verified effects.
     if (
