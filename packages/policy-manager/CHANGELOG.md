@@ -1,5 +1,11 @@
 # @agent-corpus/policy-manager
 
+## 0.8.0
+
+### Minor Changes
+
+- [#42](https://github.com/agent-corpus/tools/pull/42) [`e21c133`](https://github.com/agent-corpus/tools/commit/e21c1337fa3112fccbfd972e24ee3cf853f75573) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Add `approve`: the user approves, from their own terminal, a request the policy sent to a person, once or with `--session` for the same rule and scope for the rest of the session. Codex deny reasons now give that command instead of suggesting a profile change. A shell command that runs `approve` always goes to a person.
+
 ## 0.7.0
 
 ### Minor Changes
