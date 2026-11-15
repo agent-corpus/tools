@@ -222,8 +222,8 @@ Reading a credential always goes to a person, except through a script listed in 
 ```json
 "credentialHelpers": [
   {
-    "path": ".agent-config/skills/code-review/app-auth.mjs",
-    "remotes": ["github.com/caredocs-ai/"],
+    "path": "tools/review-bot.mjs",
+    "remotes": ["github.com/example-org/"],
     "args": [
       ["--repo", "<repo>", "check"],
       ["--repo", "<repo>", "gh", "api", "repos/<repo>/pulls/<int>/reviews", "--input", "<file>"],
@@ -235,7 +235,7 @@ Reading a credential always goes to a person, except through a script listed in 
 
 `node <script> <args>` is approved, and named in the audit `decision` record as `credentialHelpers: ["<path>#<shape index>"]`, only when all of these hold:
 
-- The checkout comes from a listed remote. `remotes` (required) lists normalized prefixes such as `github.com/caredocs-ai/`: a lowercase host, then at least an owner, where a trailing `/` makes it a prefix. The checkout's `remote.origin.url` (https, ssh or `git@host:` form, normalized to lowercase `host/owner/repo` without `.git`) must match one. It must equal what `git remote get-url origin` resolves, so no `url.*.insteadOf` rewrite applies, and there must be no `remote.origin.pushurl`. A clone of a local or other repository, or a `git init`, has an origin that does not match.
+- The checkout comes from a listed remote. `remotes` (required) lists normalized prefixes such as `github.com/example-org/`: a lowercase host, then at least an owner, where a trailing `/` makes it a prefix. The checkout's `remote.origin.url` (https, ssh or `git@host:` form, normalized to lowercase `host/owner/repo` without `.git`) must match one. It must equal what `git remote get-url origin` resolves, so no `url.*.insteadOf` rewrite applies, and there must be no `remote.origin.pushurl`. A clone of a local or other repository, or a `git init`, has an origin that does not match.
 - The script, however it is named (relative, absolute, from another directory), is the regular file at `<checkout>/<path>` with no symlink on the way, tracked, and identical to the committed file on the default branch of `origin`. The branch is found by full ref name only (`refs/remotes/origin/HEAD` when it points into `refs/remotes/origin/`, else `refs/remotes/origin/main`), so a tag or branch named `origin/HEAD` cannot stand in for it, and every lookup ignores replace refs. The committed blob's bytes are compared in Node with the working file: an exact match, or, when the blob has no CR, a match once the file's CRLF line ends become LF (a `core.autocrlf` checkout). No clean filter or `.gitattributes` setting applies. A local edit makes it a different script.
 - The arguments match one listed shape exactly, word for word. A token is a literal, a list of literal alternatives, or a word with placeholders: `<repo>` (`owner/name`, each part starting with a letter or digit), `<int>`, `<sha>` (7 to 40 hex digits), `<word>` (a letter or digit, then letters, digits, `_.-`), `<url>` (a `https://github.com/` URL), `<file>` (a path with no pattern or `~` characters and not under `/dev/`, inside the working checkout or a temp or scratch root, that passes the usual read check), or `<text>` (any one argument, only as a whole word). Profiles hold no regular expressions.
 - No argument the shell would expand: an unquoted `*`, `?` or `[`, or a leading `~`. Quote a literal pattern (`--reason '*'`).

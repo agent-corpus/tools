@@ -18,10 +18,10 @@ import { ProfileError, parseProfile } from "../src/profile.js";
 import { PolicySession } from "../src/session.js";
 import type { Decision, Request } from "../src/types.js";
 
-const STATUS = ".agent-config/skills/code-review/review-status.mjs";
-const AUTH = ".agent-config/skills/code-review/app-auth.mjs";
+const STATUS = ".agent-config/skills/review-bot/post-status.mjs";
+const AUTH = ".agent-config/skills/review-bot/bot-auth.mjs";
 const SHA = "38fdd662fe6810766469c1e580588f946299cecf";
-const GITHUB = "https://github.com/caredocs-ai/agent-config.git";
+const GITHUB = "https://github.com/example-org/example-repo.git";
 const helpers = [
   {
     path: STATUS,
@@ -40,11 +40,11 @@ const helpers = [
         "--as-app",
       ],
     ],
-    remotes: ["github.com/caredocs-ai/"],
+    remotes: ["github.com/example-org/"],
   },
   {
     path: AUTH,
-    remotes: ["github.com/caredocs-ai/"],
+    remotes: ["github.com/example-org/"],
     args: [
       ["--repo", "<repo>", "check"],
       ["--repo", "<repo>", "gh", "api", "repos/<repo>/pulls/<int>/reviews", "--input", "<file>"],
@@ -89,7 +89,7 @@ beforeAll(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "RUNNER~1-helpers-")));
   const source = join(root, "source");
   execFileSync("git", ["init", "-b", "main", source], { stdio: "ignore" });
-  mkdirSync(join(source, ".agent-config", "skills", "code-review"), { recursive: true });
+  mkdirSync(join(source, ".agent-config", "skills", "review-bot"), { recursive: true });
   writeFileSync(join(source, STATUS), "// status\n");
   writeFileSync(join(source, AUTH), "// auth\n");
   git(source, "add", ".");
@@ -104,7 +104,7 @@ beforeAll(() => {
   appendFileSync(join(changed, AUTH), "console.log('extra');\n");
   outside = join(root, "outside");
   mkdirSync(outside);
-  writeFileSync(join(outside, "app-auth.mjs"), "// auth\n");
+  writeFileSync(join(outside, "bot-auth.mjs"), "// auth\n");
   rw = join(root, "rw");
   mkdirSync(rw);
   writeFileSync(join(rw, "review.json"), "{}");
@@ -121,7 +121,7 @@ function clone(name: string, github = true): string {
 describe("credential helpers", () => {
   test("a listed helper with an accepted shape is approved and named", () => {
     const d = bash(
-      `node ${STATUS} start --repo caredocs-ai/agent-config --pr 82 --head ${SHA} --as-app`,
+      `node ${STATUS} start --repo example-org/example-repo --pr 82 --head ${SHA} --as-app`,
     );
     expect(d).toSatisfy(approved);
     expect(d.reason).toBe("Listed credential helper");
@@ -141,7 +141,7 @@ describe("credential helpers", () => {
   });
   test("works inside the reviewer's compound script, and git reads stay symlink-free", () => {
     const script = [
-      `cd ${posix(worktree)} && N=82 REPO=caredocs-ai/agent-config; RW=${posix(rw)}/82; mkdir -p $RW`,
+      `cd ${posix(worktree)} && N=82 REPO=example-org/example-repo; RW=${posix(rw)}/82; mkdir -p $RW`,
       `node ${STATUS} start --repo $REPO --pr $N --head ${SHA} --as-app`,
       `git fetch origin "+pull/$N/head:pr$N" && git fetch origin main && git rev-parse pr$N`,
       "git diff --name-only origin/main...pr$N | tee $RW/files.txt",
@@ -177,26 +177,26 @@ describe("credential helpers", () => {
   test("an untracked copy at the helper's path goes to a person", () => {
     const repo = join(root, "untracked");
     execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
-    mkdirSync(join(repo, ".agent-config", "skills", "code-review"), { recursive: true });
+    mkdirSync(join(repo, ".agent-config", "skills", "review-bot"), { recursive: true });
     writeFileSync(join(repo, AUTH), "// auth\n");
     expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/not tracked/);
   });
   test("a copy outside any checkout goes to a person", () => {
-    const d = bash(`node ${posix(join(outside, "app-auth.mjs"))} --repo a/b check`, outside);
+    const d = bash(`node ${posix(join(outside, "bot-auth.mjs"))} --repo a/b check`, outside);
     expect(d.decision).toBe("human");
     expect(d.reason).toMatch(/not inside a Git checkout/);
   });
   test.skipIf(process.platform === "win32")("a symlink to the helper goes to a person", () => {
     const link = join(outside, "linked");
     mkdirSync(link);
-    symlinkSync(join(worktree, AUTH), join(link, "app-auth.mjs"));
+    symlinkSync(join(worktree, AUTH), join(link, "bot-auth.mjs"));
     expect(
-      bash(`node ${posix(join(link, "app-auth.mjs"))} --repo a/b check`, outside).reason,
+      bash(`node ${posix(join(link, "bot-auth.mjs"))} --repo a/b check`, outside).reason,
     ).toMatch(/symlink/);
   });
   test("an environment prefix, a wrapper or piped input goes to a person", () => {
     for (const command of [
-      `CODE_REVIEW_APP_VAULT=x node ${AUTH} --repo a/b check`,
+      `HELPER_TOKEN=x node ${AUTH} --repo a/b check`,
       `env node ${AUTH} --repo a/b check`,
       `echo x | node ${AUTH} --repo a/b check`,
     ])
@@ -389,12 +389,12 @@ describe("the helper's checkout must come from a listed remote", () => {
   });
   test("an origin under another owner is refused", () => {
     const repo = clone("other-owner");
-    git(repo, "config", "remote.origin.url", "git@github.com:someone/agent-config.git");
+    git(repo, "config", "remote.origin.url", "git@github.com:someone/example-repo.git");
     expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/listed remote/);
   });
   test("an ssh origin under the listed owner is accepted", () => {
     const repo = clone("ssh-origin");
-    git(repo, "config", "remote.origin.url", "git@GitHub.com:caredocs-ai/agent-config.git");
+    git(repo, "config", "remote.origin.url", "git@GitHub.com:example-org/example-repo.git");
     expect(bash(`node ${AUTH} --repo a/b check`, repo)).toSatisfy(approved);
   });
   test("a URL rewrite or a push URL is refused", () => {
@@ -406,22 +406,22 @@ describe("the helper's checkout must come from a listed remote", () => {
     expect(bash(`node ${AUTH} --repo a/b check`, push).reason).toMatch(/listed remote/);
   });
   test.each([
-    "git remote add origin https://github.com/caredocs-ai/x.git",
-    "git remote add upstream https://github.com/caredocs-ai/x.git",
-    "git remote set-url origin https://github.com/caredocs-ai/x.git",
+    "git remote add origin https://github.com/example-org/x.git",
+    "git remote add upstream https://github.com/example-org/x.git",
+    "git remote set-url origin https://github.com/example-org/x.git",
     "git remote rename origin old",
     "git remote set-branches origin main",
-    "git config remote.origin.url https://github.com/caredocs-ai/x.git",
+    "git config remote.origin.url https://github.com/example-org/x.git",
     "git config remote.origin.fetch +refs/heads/*:refs/remotes/origin/*",
     "git config url.file:///tmp/x/.insteadOf https://github.com/",
     "git config include.path /tmp/x",
     "git config includeIf.gitdir:/x.path /tmp/x",
     "git clone -c remote.origin.url=x /tmp/evil x",
     "git clone --config=remote.origin.url=x /tmp/evil x",
-    "git clone --origin origin2 https://github.com/caredocs-ai/x.git y",
-    "git clone -o origin2 https://github.com/caredocs-ai/x.git y",
-    "git clone --template=/tmp/t https://github.com/caredocs-ai/x.git y",
-    "git clone --separate-git-dir /tmp/g https://github.com/caredocs-ai/x.git y",
+    "git clone --origin origin2 https://github.com/example-org/x.git y",
+    "git clone -o origin2 https://github.com/example-org/x.git y",
+    "git clone --template=/tmp/t https://github.com/example-org/x.git y",
+    "git clone --separate-git-dir /tmp/g https://github.com/example-org/x.git y",
     "git init --template=/tmp/t y",
     "git init --separate-git-dir /tmp/g y",
     "git fetch origin pull/1/head:remotes/origin/main",
@@ -436,19 +436,19 @@ describe("the helper's checkout must come from a listed remote", () => {
     },
   );
   test("a fresh clone from the listed remote stays fetchable", () => {
-    expect(bash("git clone https://github.com/caredocs-ai/agent-config.git ac")).toMatchObject({
+    expect(bash("git clone https://github.com/example-org/example-repo.git ac")).toMatchObject({
       decision: "approve",
     });
     expect(bash("git fetch origin")).toSatisfy(approved);
   });
   test("normalizeRemote", () => {
-    expect(normalizeRemote("https://github.com/CareDocs-AI/Agent-Config.git/")).toBe(
-      "github.com/caredocs-ai/agent-config",
+    expect(normalizeRemote("https://github.com/Example-Org/Example-Repo.git/")).toBe(
+      "github.com/example-org/example-repo",
     );
-    expect(normalizeRemote("ssh://git@github.com:22/caredocs-ai/x")).toBe(
-      "github.com/caredocs-ai/x",
+    expect(normalizeRemote("ssh://git@github.com:22/example-org/x")).toBe(
+      "github.com/example-org/x",
     );
-    expect(normalizeRemote("git@github.com:caredocs-ai/x.git")).toBe("github.com/caredocs-ai/x");
+    expect(normalizeRemote("git@github.com:example-org/x.git")).toBe("github.com/example-org/x");
     for (const local of ["/tmp/x", "file:///tmp/x", "../x", "C:/x", "https://github.com/../x"])
       expect(normalizeRemote(local)).toBeUndefined();
   });
@@ -488,7 +488,7 @@ describe("line endings", () => {
     const source = join(root, "cr-source");
     execFileSync("git", ["init", "-q", "-b", "main", source], { stdio: "ignore" });
     git(source, "config", "core.autocrlf", "false");
-    mkdirSync(join(source, ".agent-config", "skills", "code-review"), { recursive: true });
+    mkdirSync(join(source, ".agent-config", "skills", "review-bot"), { recursive: true });
     writeFileSync(join(source, AUTH), "// auth\r\nmore\r\n");
     git(source, "add", ".");
     git(source, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "cr");
