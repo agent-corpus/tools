@@ -12,15 +12,16 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { matchShape, sameContent } from "../src/helpers.js";
+import { matchShape, normalizeRemote, sameContent } from "../src/helpers.js";
 import { evaluate } from "../src/policy.js";
 import { ProfileError, parseProfile } from "../src/profile.js";
 import { PolicySession } from "../src/session.js";
-import type { Request } from "../src/types.js";
+import type { Decision, Request } from "../src/types.js";
 
 const STATUS = ".agent-config/skills/code-review/review-status.mjs";
 const AUTH = ".agent-config/skills/code-review/app-auth.mjs";
 const SHA = "38fdd662fe6810766469c1e580588f946299cecf";
+const GITHUB = "https://github.com/caredocs-ai/agent-config.git";
 const helpers = [
   {
     path: STATUS,
@@ -39,9 +40,11 @@ const helpers = [
         "--as-app",
       ],
     ],
+    remotes: ["github.com/caredocs-ai/"],
   },
   {
     path: AUTH,
+    remotes: ["github.com/caredocs-ai/"],
     args: [
       ["--repo", "<repo>", "check"],
       ["--repo", "<repo>", "gh", "api", "repos/<repo>/pulls/<int>/reviews", "--input", "<file>"],
@@ -65,6 +68,11 @@ const profile = parseProfile(
   JSON.stringify({ version: 1, mode: "permissive", credentialHelpers: helpers }),
 );
 
+/** Passes an approval; otherwise fails with the decision's reason, so CI logs say why. */
+function approved(d: Decision): boolean {
+  if (d.decision !== "approve") throw new Error(`${d.decision} (${d.category}): ${d.reason}`);
+  return true;
+}
 // A backslash in an unquoted shell word is an escape, so commands name paths with `/`.
 const posix = (path: string) => path.split("\\").join("/");
 let root: string, worktree: string, changed: string, outside: string, rw: string;
@@ -78,7 +86,7 @@ const bash = (command: string, cwd = worktree, p = profile) =>
   );
 
 beforeAll(() => {
-  root = realpathSync(mkdtempSync(join(tmpdir(), "helpers-test-")));
+  root = realpathSync(mkdtempSync(join(tmpdir(), "RUNNER~1-helpers-")));
   const source = join(root, "source");
   execFileSync("git", ["init", "-b", "main", source], { stdio: "ignore" });
   mkdirSync(join(source, ".agent-config", "skills", "code-review"), { recursive: true });
@@ -88,6 +96,7 @@ beforeAll(() => {
   git(source, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "helpers");
   const clone = join(root, "clone");
   execFileSync("git", ["clone", "-q", source, clone], { stdio: "ignore" });
+  git(clone, "config", "remote.origin.url", GITHUB);
   worktree = join(clone, ".worktrees", "feat");
   git(clone, "worktree", "add", "-b", "feat/a", worktree);
   changed = join(clone, ".worktrees", "changed");
@@ -102,9 +111,10 @@ beforeAll(() => {
 });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 /** A fresh clone of the helpers repository, for tests that change refs or files. */
-function clone(name: string): string {
+function clone(name: string, github = true): string {
   const repo = join(root, name);
   execFileSync("git", ["clone", "-q", join(root, "source"), repo], { stdio: "ignore" });
+  if (github) git(repo, "config", "remote.origin.url", GITHUB);
   return repo;
 }
 
@@ -113,7 +123,7 @@ describe("credential helpers", () => {
     const d = bash(
       `node ${STATUS} start --repo caredocs-ai/agent-config --pr 82 --head ${SHA} --as-app`,
     );
-    expect(d.decision).toBe("approve");
+    expect(d).toSatisfy(approved);
     expect(d.reason).toBe("Listed credential helper");
     expect(d.credentialHelpers).toEqual([`${STATUS}#0`]);
   });
@@ -121,13 +131,13 @@ describe("credential helpers", () => {
     const d = bash(
       `node ${posix(join(worktree, AUTH))} --repo a/b gh api repos/a/b/pulls/7/reviews --input ${posix(join(rw, "review.json"))}`,
     );
-    expect(d.decision).toBe("approve");
+    expect(d).toSatisfy(approved);
     expect(d.credentialHelpers).toEqual([`${AUTH}#1`]);
     expect(
       bash(
         `node ${AUTH} --repo a/b gh pr review 7 -R a/b --comment --body-file ${posix(join(rw, "review.json"))}`,
-      ).decision,
-    ).toBe("approve");
+      ),
+    ).toSatisfy(approved);
   });
   test("works inside the reviewer's compound script, and git reads stay symlink-free", () => {
     const script = [
@@ -139,7 +149,7 @@ describe("credential helpers", () => {
     ].join("\n");
     const d = bash(script);
     expect(d.reason).not.toMatch(/symlink/);
-    expect(d.decision).toBe("approve");
+    expect(d).toSatisfy(approved);
     expect(d.credentialHelpers).toEqual([`${STATUS}#0`]);
   });
   test.each([
@@ -238,15 +248,14 @@ describe("credential helpers", () => {
   });
   test("a quoted pattern is one literal argument", () => {
     expect(
-      bash(`node ${STATUS} fail --repo a/b --pr 1 --head ${SHA} --reason '* why?' --as-app`)
-        .decision,
-    ).toBe("approve");
+      bash(`node ${STATUS} fail --repo a/b --pr 1 --head ${SHA} --reason '* why?' --as-app`),
+    ).toSatisfy(approved);
   });
   test("a file in the working checkout may be sent", () => {
     writeFileSync(join(worktree, "body.md"), "x");
     expect(
-      bash(`node ${AUTH} --repo a/b gh pr review 7 -R a/b --comment --body-file body.md`).decision,
-    ).toBe("approve");
+      bash(`node ${AUTH} --repo a/b gh pr review 7 -R a/b --comment --body-file body.md`),
+    ).toSatisfy(approved);
   });
   test("without the profile entry nothing changes for other scripts", () => {
     const plain = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
@@ -281,7 +290,7 @@ describe("remote-tracking refs stay evidence of the remote", () => {
     "git symbolic-ref --short refs/remotes/origin/HEAD",
     "git update-ref refs/heads/topic HEAD",
   ])("%s stays approved", (command) => {
-    expect(bash(command).decision).toBe("approve");
+    expect(bash(command)).toSatisfy(approved);
   });
   test("editing the helper, committing and moving origin/main does not make it trusted", () => {
     const d = bash(
@@ -370,12 +379,110 @@ describe("remote-tracking refs stay evidence of the remote", () => {
   });
 });
 
+describe("the helper's checkout must come from a listed remote", () => {
+  test("a clone of a local repository is refused, by absolute path and as cwd", () => {
+    const evil = clone("evil-local", false);
+    expect(bash(`node ${posix(join(evil, AUTH))} --repo a/b check`).reason).toMatch(
+      /listed remote/,
+    );
+    expect(bash(`node ${AUTH} --repo a/b check`, evil).reason).toMatch(/listed remote/);
+  });
+  test("an origin under another owner is refused", () => {
+    const repo = clone("other-owner");
+    git(repo, "config", "remote.origin.url", "git@github.com:someone/agent-config.git");
+    expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/listed remote/);
+  });
+  test("an ssh origin under the listed owner is accepted", () => {
+    const repo = clone("ssh-origin");
+    git(repo, "config", "remote.origin.url", "git@GitHub.com:caredocs-ai/agent-config.git");
+    expect(bash(`node ${AUTH} --repo a/b check`, repo)).toSatisfy(approved);
+  });
+  test("a URL rewrite or a push URL is refused", () => {
+    const rewrite = clone("insteadof");
+    git(rewrite, "config", "url.file:///tmp/evil/.insteadOf", "https://github.com/");
+    expect(bash(`node ${AUTH} --repo a/b check`, rewrite).reason).toMatch(/listed remote/);
+    const push = clone("pushurl");
+    git(push, "config", "remote.origin.pushurl", "file:///tmp/evil");
+    expect(bash(`node ${AUTH} --repo a/b check`, push).reason).toMatch(/listed remote/);
+  });
+  test.each([
+    "git remote add origin https://github.com/caredocs-ai/x.git",
+    "git remote add upstream https://github.com/caredocs-ai/x.git",
+    "git remote set-url origin https://github.com/caredocs-ai/x.git",
+    "git remote rename origin old",
+    "git remote set-branches origin main",
+    "git config remote.origin.url https://github.com/caredocs-ai/x.git",
+    "git config remote.origin.fetch +refs/heads/*:refs/remotes/origin/*",
+    "git config url.file:///tmp/x/.insteadOf https://github.com/",
+    "git config include.path /tmp/x",
+    "git config includeIf.gitdir:/x.path /tmp/x",
+    "git clone -c remote.origin.url=x /tmp/evil x",
+    "git clone --config=remote.origin.url=x /tmp/evil x",
+    "git clone --origin origin2 https://github.com/caredocs-ai/x.git y",
+    "git clone -o origin2 https://github.com/caredocs-ai/x.git y",
+    "git clone --template=/tmp/t https://github.com/caredocs-ai/x.git y",
+    "git clone --separate-git-dir /tmp/g https://github.com/caredocs-ai/x.git y",
+    "git init --template=/tmp/t y",
+    "git init --separate-git-dir /tmp/g y",
+    "git fetch origin pull/1/head:remotes/origin/main",
+  ])("%s goes to a person", (command) => {
+    expect(bash(command).decision).toBe("human");
+  });
+  test.each([".git/config", ".git/worktrees/feat/config", ".git/config.worktree"])(
+    "a direct write to %s is refused",
+    (path) => {
+      const main = join(worktree, "..", "..");
+      expect(bash(`printf x >> ${posix(join(main, path))}`).decision).toBe("human");
+    },
+  );
+  test("a fresh clone from the listed remote stays fetchable", () => {
+    expect(bash("git clone https://github.com/caredocs-ai/agent-config.git ac")).toMatchObject({
+      decision: "approve",
+    });
+    expect(bash("git fetch origin")).toSatisfy(approved);
+  });
+  test("normalizeRemote", () => {
+    expect(normalizeRemote("https://github.com/CareDocs-AI/Agent-Config.git/")).toBe(
+      "github.com/caredocs-ai/agent-config",
+    );
+    expect(normalizeRemote("ssh://git@github.com:22/caredocs-ai/x")).toBe(
+      "github.com/caredocs-ai/x",
+    );
+    expect(normalizeRemote("git@github.com:caredocs-ai/x.git")).toBe("github.com/caredocs-ai/x");
+    for (const local of ["/tmp/x", "file:///tmp/x", "../x", "C:/x", "https://github.com/../x"])
+      expect(normalizeRemote(local)).toBeUndefined();
+  });
+});
+
+describe("Windows short names", () => {
+  test("a ~ after a letter or digit is literal in a variable value and a file argument", () => {
+    const short = posix(join(rw, "X~1"));
+    expect(bash(`R=${short}; mkdir -p $R && printf x > $R/a.txt`)).toSatisfy(approved);
+    expect(
+      bash(
+        `node ${AUTH} --repo a/b gh api repos/a/b/pulls/7/reviews --input ${posix(join(rw, "review.json"))}`,
+      ),
+    ).toSatisfy(approved);
+  });
+  test.each(["R=~/x; printf x > $R/a", "R=/tmp:~/x; printf x > $R/a"])(
+    "a ~ the shell expands keeps the value unknown: %s",
+    (command) => {
+      expect(bash(command).decision).toBe("human");
+    },
+  );
+  test("a file argument with an expanded ~ is refused", () => {
+    expect(
+      bash(`node ${AUTH} --repo a/b gh api repos/a/b/pulls/7/reviews --input x:~/y`).decision,
+    ).toBe("human");
+  });
+});
+
 describe("line endings", () => {
   test("a CRLF checkout of an LF helper matches", () => {
     const repo = clone("crlf");
     const file = join(repo, AUTH);
-    writeFileSync(file, readFileSync(file, "utf8").replace(/\n/g, "\r\n"));
-    expect(bash(`node ${AUTH} --repo a/b check`, repo).decision).toBe("approve");
+    writeFileSync(file, readFileSync(file, "utf8").replace(/\r?\n/g, "\r\n"));
+    expect(bash(`node ${AUTH} --repo a/b check`, repo)).toSatisfy(approved);
   });
   test("a helper committed with CR must match byte for byte", () => {
     const source = join(root, "cr-source");
@@ -390,7 +497,8 @@ describe("line endings", () => {
       stdio: "ignore",
     });
     git(repo, "config", "core.autocrlf", "false");
-    expect(bash(`node ${AUTH} --repo a/b check`, repo).decision).toBe("approve");
+    git(repo, "config", "remote.origin.url", GITHUB);
+    expect(bash(`node ${AUTH} --repo a/b check`, repo)).toSatisfy(approved);
     writeFileSync(join(repo, AUTH), "// auth\nmore\n");
     expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/differs/);
   });
@@ -406,14 +514,20 @@ describe("line endings", () => {
 
 describe("credentialHelpers profile field", () => {
   test.each([
-    [{ path: "/abs/x.mjs", args: [["a"]] }],
-    [{ path: "a/../x.mjs", args: [["a"]] }],
-    [{ path: "x.mjs", args: [] }],
-    [{ path: "x.mjs", args: [["<nope>"]] }],
-    [{ path: "x.mjs", args: [["<int><int>"]] }],
-    [{ path: "x.mjs", args: [["a<text>"]] }],
-    [{ path: "x.mjs", args: [["a"]], extra: 1 }],
-    [{ path: "x.mjs", args: [[[]]] }],
+    [{ path: "/abs/x.mjs", args: [["a"]], remotes: ["github.com/o/"] }],
+    [{ path: "a/../x.mjs", args: [["a"]], remotes: ["github.com/o/"] }],
+    [{ path: "x.mjs", args: [], remotes: ["github.com/o/"] }],
+    [{ path: "x.mjs", args: [["<nope>"]], remotes: ["github.com/o/"] }],
+    [{ path: "x.mjs", args: [["<int><int>"]], remotes: ["github.com/o/"] }],
+    [{ path: "x.mjs", args: [["a<text>"]], remotes: ["github.com/o/"] }],
+    [{ path: "x.mjs", args: [["a"]], remotes: ["github.com/o/"], extra: 1 }],
+    [{ path: "x.mjs", args: [[[]]], remotes: ["github.com/o/"] }],
+    [{ path: "x.mjs", args: [["a"]] }],
+    [{ path: "x.mjs", args: [["a"]], remotes: [] }],
+    [{ path: "x.mjs", args: [["a"]], remotes: ["GitHub.com/o/"] }],
+    [{ path: "x.mjs", args: [["a"]], remotes: ["github.com"] }],
+    [{ path: "x.mjs", args: [["a"]], remotes: ["https://github.com/o/"] }],
+    [{ path: "x.mjs", args: [["a"]], remotes: ["github.com/../"] }],
   ])("an invalid entry makes the profile invalid: %j", (entry) => {
     expect(() =>
       parseProfile(JSON.stringify({ version: 1, mode: "permissive", credentialHelpers: [entry] })),
@@ -426,7 +540,7 @@ describe("credentialHelpers profile field", () => {
     expect(strict.credentialHelpers).toEqual([]);
   });
   test("placeholders match whole values only", () => {
-    const helper = { path: "x.mjs", args: [["repos/<repo>/pulls/<int>/reviews"]] };
+    const helper = { path: "x.mjs", args: [["repos/<repo>/pulls/<int>/reviews"]], remotes: [] };
     expect(matchShape(helper, ["repos/a/b/pulls/7/reviews"])?.index).toBe(0);
     expect(matchShape(helper, ["repos/a/b/c/pulls/7/reviews"])).toBeUndefined();
     expect(matchShape(helper, ["repos/a/b/pulls/7/reviews/1"])).toBeUndefined();

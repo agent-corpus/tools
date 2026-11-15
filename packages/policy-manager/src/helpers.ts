@@ -46,9 +46,48 @@ export interface CredentialHelper {
    * alternatives, or a string with placeholders (`repos/<repo>/pulls/<int>/reviews`).
    */
   args: Array<Array<string | string[]>>;
+  /**
+   * Where the helper's checkout must come from: normalized `host/owner/` prefixes (or a whole
+   * `host/owner/repo`) that `remote.origin.url` must match, such as `github.com/caredocs-ai/`.
+   */
+  remotes: string[];
 }
 
 export class HelperError extends Error {}
+
+/** A remote prefix: a lowercase host, then at least an owner; a trailing `/` makes it a prefix. */
+const REMOTE_PREFIX = /^[a-z0-9][a-z0-9.-]*(?::[0-9]{1,5})?(?:\/[a-z0-9][a-z0-9_.-]*)+\/?$/;
+
+/**
+ * `host/path` for an https, ssh or scp-style (`git@host:path`) URL, with the host and path in
+ * lower case and any `.git` and trailing `/` removed. Anything else (a local path, `file:`) is
+ * undefined: its content does not come from a hosted remote.
+ */
+export function normalizeRemote(url: string): string | undefined {
+  let host: string;
+  let path: string;
+  const full = /^(?:https|ssh|git\+ssh):\/\/(?:[^@/\s]+@)?([^/:\s]+)(?::[0-9]{1,5})?\/(.+)$/i.exec(
+    url,
+  );
+  const scp = /^(?:[^@/\s:]+@)?([^/:\s]+):(?!\/)(.+)$/.exec(url);
+  if (full?.[1] && full[2]) [host, path] = [full[1], full[2]];
+  else if (scp?.[1] && scp[2] && !/^[A-Za-z]$/.test(scp[1])) [host, path] = [scp[1], scp[2]];
+  else return undefined;
+  path = path
+    .replace(/\/+$/, "")
+    .replace(/\.git$/i, "")
+    .replace(/\/+$/, "");
+  const segments = path.split("/");
+  if (!segments.length || segments.some((s) => !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(s)))
+    return undefined;
+  return `${host}/${path}`.toLowerCase();
+}
+
+function remoteMatches(remotes: string[], normalized: string): boolean {
+  return remotes.some((prefix) =>
+    prefix.endsWith("/") ? normalized.startsWith(prefix) : normalized === prefix,
+  );
+}
 
 export const MAX_HELPERS = 20;
 const MAX_SHAPES = 50;
@@ -63,9 +102,14 @@ const PLACEHOLDERS: Record<string, (value: string) => boolean> = {
   sha: (v) => /^[0-9a-f]{7,40}$/.test(v),
   word: (v) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(v),
   url: (v) => /^https:\/\/github\.com\/[A-Za-z0-9_./#-]{1,300}$/.test(v),
-  // No pattern or tilde characters, and no device file such as /dev/stdin. The caller also checks
+  // No pattern characters, no tilde the shell expands, and no device file such as /dev/stdin. The caller also checks
   // where the file is and that it may be read.
-  file: (v) => v.length > 0 && !/[*?[\]{}~]/.test(v) && !/^\/dev\//.test(v),
+  file: (v) =>
+    v.length > 0 &&
+    !/[*?[\]{}]/.test(v) &&
+    // `~` only right after a letter or digit (a Windows short name such as RUNNER~1).
+    !/(?:^|[^A-Za-z0-9])~/.test(v) &&
+    !/^\/dev\//.test(v),
   // Any one argument; the caller refuses one the shell would expand.
   text: () => true,
 };
@@ -149,7 +193,16 @@ export function parseCredentialHelpers(raw: unknown): CredentialHelper[] {
   return raw.map((entry) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry))
       throw new HelperError("each credential helper must be an object");
-    const { path, args, ...extra } = entry as Record<string, unknown>;
+    const { path, args, remotes, ...extra } = entry as Record<string, unknown>;
+    if (
+      !Array.isArray(remotes) ||
+      remotes.length === 0 ||
+      remotes.length > 20 ||
+      remotes.some((r) => typeof r !== "string" || r.length > 200 || !REMOTE_PREFIX.test(r))
+    )
+      throw new HelperError(
+        "each credential helper needs remotes: lowercase host/owner/ prefixes such as github.com/org/",
+      );
     if (Object.keys(extra).length)
       throw new HelperError(`unknown credential helper key: ${Object.keys(extra)[0]}`);
     if (
@@ -180,7 +233,7 @@ export function parseCredentialHelpers(raw: unknown): CredentialHelper[] {
         else parts(token);
       }
     }
-    return { path, args: args as CredentialHelper["args"] };
+    return { path, args: args as CredentialHelper["args"], remotes: remotes as string[] };
   });
 }
 
@@ -247,6 +300,24 @@ export function helperMatch(helpers: CredentialHelper[], cwd: string, argv: stri
   } catch {
     return refused("Credential helper is not tracked");
   }
+  // A clone or `git init` anywhere has its own origin; only a checkout whose origin is a listed
+  // hosted remote, read as configured and as git resolves it, can vouch for the helper.
+  let origin: string | undefined;
+  try {
+    const configured = git(top, ["config", "--get", "remote.origin.url"]);
+    const resolved = git(top, ["remote", "get-url", "origin"]);
+    let pushUrl = "";
+    try {
+      pushUrl = git(top, ["config", "--get", "remote.origin.pushurl"]);
+    } catch {
+      /* no push URL */
+    }
+    if (configured === resolved && !pushUrl) origin = normalizeRemote(configured);
+  } catch {
+    origin = undefined;
+  }
+  if (!origin || !remoteMatches(helper.remotes, origin))
+    return refused("Credential helper's checkout does not come from a listed remote");
   const ref = defaultRef(top);
   if (!ref) return refused("Credential helper's default branch is unknown");
   let committed: Buffer;

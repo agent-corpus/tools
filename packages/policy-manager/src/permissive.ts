@@ -891,6 +891,20 @@ function gitDecision(
   if (!sub) return ok();
   const refWrite = remoteRefWrite(cwd, sub, rest);
   if (refWrite) return human(request, "sensitive", refWrite);
+  if (
+    (sub === "clone" || sub === "init") &&
+    rest.some(
+      (word) =>
+        CLONE_CONFIG.some((option) => word === option || abbreviates(word, option)) ||
+        /^-c./.test(word) ||
+        (sub === "clone" && /^-[A-Za-z]*[cou]/.test(word) && !word.startsWith("--")),
+    )
+  )
+    return human(
+      request,
+      "sensitive",
+      `git ${sub} with a configuration, origin, template or separate git directory requires human approval`,
+    );
   if (sub === "push") return gitPush(request, cwd, rest);
   if (sub === "branch" && (has("-d", "-D", "--delete") || cluster("d") || cluster("D"))) {
     if (has("-r", "--remotes")) return ok();
@@ -970,11 +984,19 @@ function gitDecision(
     return human(request, "sensitive", "Git configuration can install hooks or credential helpers");
   if (
     sub === "remote" &&
-    ["set-url", "remove", "rm", "rename", "set-head"].includes(positional[0] ?? "")
+    ["add", "set-url", "remove", "rm", "rename", "set-head", "set-branches"].includes(
+      positional[0] ?? "",
+    )
   )
     return human(request, "impactful-write", "Changing remotes requires human approval");
   return ok();
 }
+
+/**
+ * `git clone`/`init` options that set the new repository's configuration or origin, or run a
+ * program: a credential helper trusts a checkout by its configured origin.
+ */
+const CLONE_CONFIG = ["--config", "--origin", "--template", "--separate-git-dir", "--upload-pack"];
 
 /** Whether a credential helper's file argument lies in the working checkout or a temp/scratch root. */
 function helperFileAllowed(cwd: string, file: string, profile: Profile): boolean {
@@ -1046,7 +1068,7 @@ function remoteRefWrite(cwd: string, sub: string, rest: string[]): string | unde
   }
   if (sub === "symbolic-ref") {
     const writes = positional.length > 1 || rest.some((w) => w === "-d" || w === "--delete");
-    return writes && positional.some((w) => w.startsWith("refs/remotes/")) ? why : undefined;
+    return writes && positional.some((w) => /^(?:refs\/)?remotes\//.test(w)) ? why : undefined;
   }
   if (sub === "push") {
     const remote = positional[0];
@@ -1065,7 +1087,9 @@ function remoteRefWrite(cwd: string, sub: string, rest: string[]): string | unde
     const colon = spec.indexOf(":");
     if (colon < 0) continue;
     const source = spec.slice(spec.startsWith("+") ? 1 : 0, colon);
-    const destination = spec.slice(colon + 1);
+    // Git also takes `remotes/<r>/<b>` as a short name for `refs/remotes/<r>/<b>`.
+    const raw = spec.slice(colon + 1);
+    const destination = raw.startsWith("remotes/") ? `refs/${raw}` : raw;
     if (!destination.startsWith("refs/remotes/")) continue;
     const [owner = "", ...branch] = destination.slice("refs/remotes/".length).split("/");
     const name = branch.join("/");

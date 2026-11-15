@@ -34,8 +34,12 @@ const MAX_VARIANTS = 16;
 const MAX_SUBSTITUTION_DEPTH = 3;
 /** Commands one script may be judged as; past this it is too large to verify in time. */
 const MAX_JUDGEMENTS = 400;
-/** No whitespace, glob, quote, expansion or tilde characters: the value is exactly one word. */
-const SIMPLE_VALUE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+/**
+ * No whitespace, glob, quote or expansion characters: the value is exactly one word. A `~` is
+ * allowed only right after a letter or digit, where no shell expands it (a Windows short name
+ * such as `RUNNER~1`); at the start or after `=` or `:` it would become a home directory.
+ */
+const SIMPLE_VALUE = /^(?:[A-Za-z0-9_@%+=:,./-]|(?<=[A-Za-z0-9])~)+$/;
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const UNSUPPORTED = "Unsupported shell syntax; expansions and subshells need human review";
 const MAX_CALL_DEPTH = 4;
