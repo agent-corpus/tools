@@ -53,10 +53,12 @@ export const BUILTIN_TOOLS_DENY: Record<Request["harness"], ReadonlySet<string>>
 };
 
 /**
- * A name that suggests running a command or feeding a running one. Such a tool is never approved
- * by default, even when ENGINE_TOOLS misses it, so a new or renamed command runner fails closed.
+ * A name that suggests running code, feeding a running command, or touching files. Such a tool is
+ * never approved by default, even when ENGINE_TOOLS misses it, so a new or renamed one fails
+ * closed. A false positive (`BashOutput`, `SendUserFile`) only costs a classification.
  */
-export const COMMAND_TOOL = /bash|shell|powershell|pwsh|exec|stdin|terminal|command|cmd|spawn/i;
+export const COMMAND_TOOL =
+  /bash|shell|powershell|pwsh|exec|stdin|terminal|command|cmd|spawn|repl|eval|python|node|interpreter|script|computer|run|file|delete|remove|move|rename|patch|edit/i;
 
 /** A harness tool name a profile may list. */
 export const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;

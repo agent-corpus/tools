@@ -213,6 +213,26 @@ describe("harness tools approved by default", () => {
     expect(d.decision).toBe("approve");
     expect(d.defaultTool).toBe("TaskStop");
   });
+  test.each([
+    "TaskStop",
+    "TaskOutput",
+    "ScheduleWakeup",
+    "ListAgents",
+    "SendMessage",
+    "ToolSearch",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "TodoWrite",
+    "update_plan",
+    "WebFetch",
+    "WebSearch",
+    "Agent",
+    "Task",
+    "Skill",
+  ])("common session tool %s stays approved by default", (name) => {
+    expect(evaluate(tool(name), undefined, permissive).defaultTool).toBe(name);
+  });
   test("a tool in the profile's toolsDeny keeps the classification path", () => {
     const profile = parseProfile(
       JSON.stringify({ version: 1, mode: "permissive", toolsDeny: { claude: ["SendMessage"] } }),
@@ -247,6 +267,15 @@ describe("harness tools approved by default", () => {
     "run_terminal_cmd",
     "container.exec",
     "spawn_process",
+    // Code runners and file tools named outside the list.
+    "js_repl",
+    "eval",
+    "python",
+    "computer",
+    "run_code",
+    "edit_file",
+    "delete_file",
+    "move_file",
   ])("%s is never approved by default", (name) => {
     const d = evaluate(tool(name), undefined, permissive);
     expect(d.decision).not.toBe("approve");
