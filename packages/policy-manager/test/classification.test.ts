@@ -666,7 +666,7 @@ describe("adapters", () => {
     const text = JSON.stringify(hookResponse("codex", "PreToolUse", fallback));
     expect(text).toContain('"permissionDecision":"deny"');
     expect(text).not.toContain("Classify it");
-    expect(text).toContain("run it themselves");
+    expect(text).toContain("approve codex");
   });
 
   test("Copilot gets a deny with a reason; approvals and ordinary asks are unchanged", () => {
