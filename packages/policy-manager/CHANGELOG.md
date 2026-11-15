@@ -1,5 +1,11 @@
 # @agent-corpus/policy-manager
 
+## 0.9.0
+
+### Minor Changes
+
+- [#45](https://github.com/agent-corpus/tools/pull/45) [`381a325`](https://github.com/agent-corpus/tools/commit/381a3250ed015d74c8f245ab2694303bc2a56a69) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Make approving a blocked request under Codex usable, and stop classifying harmless harness tools. The Codex deny reason now leads with "Waiting for your approval", puts the command on its own line, names the `--session` scope, and tells the agent to stop. `approve --last` approves the newest blocked request without a session id or hash, and setup installs a managed `pm` launcher so the command is `pm approve --last`. Shell redirect and `tee` writes get a session scope like patches. Under the permissive profile, harness tools that are not shell, file, patch or MCP tools are approved by default and listed in `review-classifications`; the profile's `toolsDeny` keeps chosen ones on the classification path. A tool that runs code, writes to a running command, or touches files, listed or only named like one (`shell_command`, `write_stdin`, `write_bash`, any name with `shell`, `exec`, `stdin`, `command`, `repl`, `eval`, `run`, `file`, `delete`, `move`, `edit` and similar), is never approved by default. `sort -o`/`--output` and `-T`/`--temporary-directory` targets now get the write check, and `--compress-program` or an unknown `sort` option is not approved. A variable holding a single-quoted literal is usable inside double quotes.
+
 ## 0.8.0
 
 ### Minor Changes
