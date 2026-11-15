@@ -64,6 +64,8 @@ const profile = parseProfile(
   JSON.stringify({ version: 1, mode: "permissive", credentialHelpers: helpers }),
 );
 
+// A backslash in an unquoted shell word is an escape, so commands name paths with `/`.
+const posix = (path: string) => path.split("\\").join("/");
 let root: string, worktree: string, changed: string, outside: string, rw: string;
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
@@ -110,19 +112,19 @@ describe("credential helpers", () => {
   });
   test("by absolute path, with a file argument and a placeholder inside a word", () => {
     const d = bash(
-      `node ${join(worktree, AUTH)} --repo a/b gh api repos/a/b/pulls/7/reviews --input ${join(rw, "review.json")}`,
+      `node ${posix(join(worktree, AUTH))} --repo a/b gh api repos/a/b/pulls/7/reviews --input ${posix(join(rw, "review.json"))}`,
     );
     expect(d.decision).toBe("approve");
     expect(d.credentialHelpers).toEqual([`${AUTH}#1`]);
     expect(
       bash(
-        `node ${AUTH} --repo a/b gh pr review 7 -R a/b --comment --body-file ${join(rw, "review.json")}`,
+        `node ${AUTH} --repo a/b gh pr review 7 -R a/b --comment --body-file ${posix(join(rw, "review.json"))}`,
       ).decision,
     ).toBe("approve");
   });
   test("works inside the reviewer's compound script, and git reads stay symlink-free", () => {
     const script = [
-      `cd ${worktree} && N=82 REPO=caredocs-ai/agent-config; RW=${rw}/82; mkdir -p $RW`,
+      `cd ${posix(worktree)} && N=82 REPO=caredocs-ai/agent-config; RW=${posix(rw)}/82; mkdir -p $RW`,
       `node ${STATUS} start --repo $REPO --pr $N --head ${SHA} --as-app`,
       `git fetch origin "+pull/$N/head:pr$N" && git fetch origin main && git rev-parse pr$N`,
       "git diff --name-only origin/main...pr$N | tee $RW/files.txt",
@@ -163,7 +165,7 @@ describe("credential helpers", () => {
     expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/not tracked/);
   });
   test("a copy outside any checkout goes to a person", () => {
-    const d = bash(`node ${join(outside, "app-auth.mjs")} --repo a/b check`, outside);
+    const d = bash(`node ${posix(join(outside, "app-auth.mjs"))} --repo a/b check`, outside);
     expect(d.decision).toBe("human");
     expect(d.reason).toMatch(/not inside a Git checkout/);
   });
@@ -171,9 +173,9 @@ describe("credential helpers", () => {
     const link = join(outside, "linked");
     mkdirSync(link);
     symlinkSync(join(worktree, AUTH), join(link, "app-auth.mjs"));
-    expect(bash(`node ${join(link, "app-auth.mjs")} --repo a/b check`, outside).reason).toMatch(
-      /symlink/,
-    );
+    expect(
+      bash(`node ${posix(join(link, "app-auth.mjs"))} --repo a/b check`, outside).reason,
+    ).toMatch(/symlink/);
   });
   test("an environment prefix, a wrapper or piped input goes to a person", () => {
     for (const command of [
@@ -192,11 +194,98 @@ describe("credential helpers", () => {
   test("another script in the same command is still judged", () => {
     expect(bash(`node ${AUTH} --repo a/b check && rm -rf ~/x`).decision).toBe("human");
   });
+  test.each([
+    [
+      "an unquoted pattern in <text>",
+      `node ${STATUS} fail --repo a/b --pr 1 --head ${SHA} --reason * --as-app`,
+    ],
+    [
+      "a pattern in <file>",
+      `node ${AUTH} --repo a/b gh api repos/a/b/pulls/7/reviews --input .en?`,
+    ],
+    [
+      "a class in <file>",
+      `node ${AUTH} --repo a/b gh api repos/a/b/pulls/7/reviews --input '.e[n]v'`,
+    ],
+    [
+      "a tilde in <file>",
+      `node ${AUTH} --repo a/b gh api repos/a/b/pulls/7/reviews --input ~/x.json`,
+    ],
+    [
+      "a tilde in <text>",
+      `node ${STATUS} fail --repo a/b --pr 1 --head ${SHA} --reason ~ --as-app`,
+    ],
+    ["a .. repo", `node ${AUTH} --repo ../x check`],
+    ["a ../.. repo", `node ${AUTH} --repo ../.. check`],
+    ["an input redirect", `node ${STATUS} start --repo a/b --pr 1 --head ${SHA} --as-app < x.json`],
+    [
+      "/dev/stdin as a file",
+      `node ${AUTH} --repo a/b gh api repos/a/b/pulls/7/reviews --input /dev/stdin`,
+    ],
+    [
+      "a file outside the checkout and temp",
+      `node ${AUTH} --repo a/b gh api repos/a/b/pulls/7/reviews --input /etc/passwd`,
+    ],
+  ])("%s goes to a person", (_name, command) => {
+    expect(bash(command).decision).toBe("human");
+  });
+  test("a quoted pattern is one literal argument", () => {
+    expect(
+      bash(`node ${STATUS} fail --repo a/b --pr 1 --head ${SHA} --reason '* why?' --as-app`)
+        .decision,
+    ).toBe("approve");
+  });
+  test("a file in the working checkout may be sent", () => {
+    writeFileSync(join(worktree, "body.md"), "x");
+    expect(
+      bash(`node ${AUTH} --repo a/b gh pr review 7 -R a/b --comment --body-file body.md`).decision,
+    ).toBe("approve");
+  });
   test("without the profile entry nothing changes for other scripts", () => {
     const plain = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
     expect(
       bash(`node ${AUTH} --repo a/b check`, worktree, plain).credentialHelpers,
     ).toBeUndefined();
+  });
+});
+
+describe("remote-tracking refs stay evidence of the remote", () => {
+  test.each([
+    "git update-ref refs/remotes/origin/main HEAD",
+    "git update-ref --stdin",
+    "git fetch origin +pull/82/head:refs/remotes/origin/main",
+    "git fetch origin feat/a:refs/remotes/origin/main",
+    "git fetch . HEAD:refs/remotes/origin/main",
+    "git fetch ../other main",
+    "git fetch file:///tmp/x main",
+    "git fetch /tmp/x",
+    "git fetch origin --refmap=+refs/heads/*:refs/remotes/origin/*",
+    "git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat",
+    "git push . HEAD:refs/remotes/origin/main",
+    "git push ../other HEAD:main",
+  ])("%s goes to a person", (command) => {
+    expect(bash(command).decision).toBe("human");
+  });
+  test.each([
+    "git fetch origin",
+    "git fetch origin main",
+    "git fetch origin +pull/82/head:pr82",
+    "git fetch origin main:refs/remotes/origin/main",
+    "git symbolic-ref --short refs/remotes/origin/HEAD",
+    "git update-ref refs/heads/topic HEAD",
+  ])("%s stays approved", (command) => {
+    expect(bash(command).decision).toBe("approve");
+  });
+  test("editing the helper, committing and moving origin/main does not make it trusted", () => {
+    const d = bash(
+      [
+        `printf x >> ${AUTH}`,
+        `git commit -qam edit`,
+        "git update-ref refs/remotes/origin/main HEAD",
+        `node ${AUTH} --repo a/b check`,
+      ].join(" && "),
+    );
+    expect(d.decision).toBe("human");
   });
 });
 

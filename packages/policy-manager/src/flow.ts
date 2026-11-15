@@ -636,6 +636,7 @@ function runSimple(
       redirects,
       subs: [],
       loose,
+      glob: node.argv.map((word) => word.glob === true),
       ...(stdin === undefined ? {} : { stdin }),
     };
   };

@@ -26,13 +26,16 @@ const MAX_WORD = 1024;
 
 /** Placeholder values. Each is checked whole; none may contain whitespace. */
 const PLACEHOLDERS: Record<string, (value: string) => boolean> = {
-  repo: (v) => /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(v),
+  // Each segment starts with a letter or digit, so neither is `.` or `..`.
+  repo: (v) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(v),
   int: (v) => /^[0-9]{1,12}$/.test(v),
   sha: (v) => /^[0-9a-f]{7,40}$/.test(v),
-  word: (v) => /^[A-Za-z0-9_.-]{1,100}$/.test(v),
+  word: (v) => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(v),
   url: (v) => /^https:\/\/github\.com\/[A-Za-z0-9_./#-]{1,300}$/.test(v),
-  // The caller read-checks a file; text is any argument the engine's earlier checks passed.
-  file: (v) => v.length > 0,
+  // No pattern or tilde characters, and no device file such as /dev/stdin. The caller also checks
+  // where the file is and that it may be read.
+  file: (v) => v.length > 0 && !/[*?[\]{}~]/.test(v) && !/^\/dev\//.test(v),
+  // Any one argument; the caller refuses one the shell would expand.
   text: () => true,
 };
 
@@ -205,7 +208,7 @@ export function helperMatch(helpers: CredentialHelper[], cwd: string, argv: stri
   let current: string;
   try {
     committed = git(top, ["rev-parse", "--verify", "--quiet", `${ref}:${helper.path}`]);
-    current = git(top, ["hash-object", "--", helper.path]);
+    current = git(top, ["hash-object", "--no-filters", "--", helper.path]);
   } catch {
     return refused("Credential helper is not on the default branch");
   }

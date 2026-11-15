@@ -28,6 +28,8 @@ export interface SimpleCommand {
   subs: string[];
   /** For each argv word, whether it contains an unquoted unknown value (it could split). */
   loose?: boolean[];
+  /** For each argv word, whether it has an unquoted `*`, `?` or `[` the shell may expand. */
+  glob?: boolean[];
   /** Literal text fed to standard input by a heredoc or here-string, when there is one. */
   stdin?: string;
 }
@@ -78,7 +80,7 @@ function plainSimple(command: Command): SimpleCommand | undefined {
     redirects.push(plain);
     subs.push(...(redir.target?.subs ?? []));
   }
-  return { env, argv, redirects, subs, loose };
+  return { env, argv, redirects, subs, loose, glob: simple.argv.map((w) => w.glob === true) };
 }
 
 function flatten(andOr: AndOr): Pipeline[] | undefined {
