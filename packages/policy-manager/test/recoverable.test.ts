@@ -392,9 +392,10 @@ describe("files this session created", SLOW, () => {
       recoverable,
     });
     for (const [recoverable, confidence, expected] of [
+      // Not on the hard list: what the classifier does not approve is left to the harness.
       [true, 0.95, "approve"],
-      [false, 0.99, "human"],
-      [true, 0.9, "human"],
+      [false, 0.99, "native"],
+      [true, 0.9, "native"],
     ] as const) {
       const s = session();
       const r = bash(s, "rm new.txt");
@@ -777,10 +778,14 @@ describe("files this session created", SLOW, () => {
     }
   });
 
-  test("protected paths stay with a person", () => {
+  test("protected paths are never approved, and are left to the harness", () => {
     const s = session();
-    expect(rm(s, "rm .github/w.yml")).toMatchObject({ decision: "human", category: "sensitive" });
-    expect(rm(s, "rm -rf .claude")).toMatchObject({ decision: "human", category: "sensitive" });
+    for (const command of ["rm .github/w.yml", "rm -rf .claude"])
+      expect(rm(s, command)).toMatchObject({
+        decision: "native",
+        category: "sensitive",
+        deferred: expect.any(String),
+      });
   });
 });
 

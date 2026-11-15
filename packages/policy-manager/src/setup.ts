@@ -172,7 +172,7 @@ export function setupHook(
       ? [
           "Open /hooks and explicitly review and trust the installed hooks. Setup does not grant hook trust, and Codex skips hooks it has not trusted.",
           "Codex trusts the command text, not the code behind it: an upgrade at the same CLI path keeps trust, so review a new version before upgrading in place. A changed command (a new install path or Node binary) is skipped until you trust it again.",
-          "Codex does not support ask in PreToolUse, so a decision that needs a human is returned as a deny and the command does not run, and approving it in chat does not unblock it: run `pm approve --last` (or the command in the deny reason) in your own terminal, then tell the agent to retry.",
+          "Codex does not support ask in PreToolUse. A decision that needs a human is left to Codex's own approval policy, except the profile's alwaysAsk hard list, which is returned as a deny and the command does not run, and approving it in chat does not unblock it: run `pm approve --last` (or the command in the deny reason) in your own terminal, then tell the agent to retry.",
         ]
       : []),
     "Native sandbox controls and existing permission rules remain in effect.",

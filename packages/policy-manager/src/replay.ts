@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { stillAsks } from "./native.js";
 import { evaluate } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import type { Request } from "./types.js";
@@ -11,6 +12,12 @@ export interface ReplayReport {
   /** Escalations the AI classifier handles instead of a person (permissive profile only). */
   classified: number;
   reasons: Array<{ reason: string; count: number; examples: string[] }>;
+  /** Escalations a session now leaves to the harness's native permission flow (no hook decision). */
+  deferred: number;
+  /** Escalations on the profile's `alwaysAsk` hard list, which still ask a person. */
+  stillAsk: number;
+  /** Hard-list escalations by reason, with the rule id or category each matched. */
+  askReasons: Array<{ reason: string; rule: string; count: number; examples: string[] }>;
 }
 
 function transcriptFiles(paths: string[], limit: number): string[] {
@@ -41,7 +48,11 @@ export function replayTranscripts(paths: string[], profile: Profile, files = 50)
     strictApproved: 0,
     classified: 0,
     reasons: [],
+    deferred: 0,
+    stillAsk: 0,
+    askReasons: [],
   };
+  const asks = new Map<string, { rule: string; count: number; examples: string[] }>();
   for (const file of transcriptFiles(paths, files))
     for (const line of readFileSync(file, "utf8").split("\n")) {
       if (!line.includes('"tool_use"')) continue;
@@ -82,9 +93,27 @@ export function replayTranscripts(paths: string[], profile: Profile, files = 50)
         if (bucket.examples.length < 3)
           bucket.examples.push(command.split("\n")[0]?.slice(0, 100) ?? "");
         reasons.set(decision.reason, bucket);
+        // An ambiguous request that is not classified falls back the same way a human one does.
+        const rule =
+          decision.decision === "human"
+            ? stillAsks(request, decision, profile.alwaysAsk)
+            : undefined;
+        if (decision.decision !== "human") continue;
+        if (!rule) report.deferred++;
+        else {
+          report.stillAsk++;
+          const ask = asks.get(decision.reason) ?? { rule, count: 0, examples: [] };
+          ask.count++;
+          if (ask.examples.length < 3)
+            ask.examples.push(command.split("\n")[0]?.slice(0, 100) ?? "");
+          asks.set(decision.reason, ask);
+        }
       }
     }
   report.reasons = [...reasons]
+    .map(([reason, value]) => ({ reason, ...value }))
+    .sort((a, b) => b.count - a.count);
+  report.askReasons = [...asks]
     .map(([reason, value]) => ({ reason, ...value }))
     .sort((a, b) => b.count - a.count);
   return report;

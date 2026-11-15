@@ -14,10 +14,18 @@ import {
 import { HUMAN_PATTERN, PROTECTED_PATH } from "../src/grants.js";
 import { parseProfile, strictProfile } from "../src/profile.js";
 import { APPROVE_GUARD, GrantError, PolicySession } from "../src/session.js";
-import type { Request } from "../src/types.js";
+import { CATEGORIES, type Request } from "../src/types.js";
 
+// Approvals cover whatever is on the profile's alwaysAsk hard list. Listing every category puts
+// every decision that needs a person on it, so these tests exercise the grant machinery itself.
+const everyCategory = [...CATEGORIES];
 const profile = parseProfile(
-  JSON.stringify({ version: 1, mode: "permissive", humanPatterns: ["^terraform apply"] }),
+  JSON.stringify({
+    version: 1,
+    mode: "permissive",
+    humanPatterns: ["^terraform apply"],
+    alwaysAsk: everyCategory,
+  }),
 );
 let root: string, repo: string, worktree: string, other: string;
 let counter = 0;
@@ -200,7 +208,10 @@ describe("session approval", () => {
 function strictSession() {
   const directory = join(root, `s${counter++}`);
   mkdirSync(directory, { mode: 0o700 });
-  return new PolicySession(directory, "codex", "s1", strictProfile);
+  return new PolicySession(directory, "codex", "s1", {
+    ...strictProfile,
+    alwaysAsk: everyCategory,
+  });
 }
 
 describe("a session grant on a generic command covers only that command", () => {

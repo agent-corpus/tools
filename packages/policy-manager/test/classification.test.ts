@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { classifyCommand, hookResponse } from "../src/adapters.js";
+import { classifyCommand, hookOutput, hookResponse } from "../src/adapters.js";
 import { audit, requestSummary } from "../src/audit.js";
 import { evaluate, hash, requestHash } from "../src/policy.js";
 import { HUMAN_REVIEW_PRINCIPLE } from "../src/principle.js";
@@ -106,28 +106,33 @@ describe("hint and retry flow", () => {
     }
   });
 
-  test("an unusable classifier falls back to a human exactly once, and the reason is recorded", async () => {
+  test("an unusable classifier falls back to the native flow exactly once, and the reason is recorded", async () => {
     const { directory, session: s } = session();
     const r = ambiguous();
     expect(s.review(r, undefined, "PreToolUse").decision).toBe("deny");
     const second = s.review(r, undefined, "PreToolUse");
-    expect(second.decision).toBe("human");
+    expect(second.decision).toBe("native");
     expect(second.fallbackReason).toBe("unavailable");
-    expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
-    expect(s.review(r, undefined, "PermissionRequest").decision).toBe("human");
+    expect(second.deferred).toBe(second.reason);
+    // No hook decision: the harness's own rules and prompt decide, in every harness.
+    for (const harness of ["claude", "copilot", "codex"] as const)
+      for (const phase of ["PreToolUse", "PermissionRequest"])
+        expect(hookResponse(harness, phase, second)).toEqual({});
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("native");
+    expect(s.review(r, undefined, "PermissionRequest").decision).toBe("native");
     const fallbacks = await events(directory, "classification-fallback");
     expect(fallbacks).toHaveLength(1);
     expect(fallbacks[0]?.attributes.fallbackReason).toBe("unavailable");
   });
 
-  test("an invalid classification falls back to a human on the retry", async () => {
+  test("an invalid classification falls back to the native flow on the retry", async () => {
     const { directory, session: s } = session();
     const r = ambiguous();
     s.review(r, undefined, "PreToolUse");
     expect(() => s.classify(verdict(r, { confidence: Number.NaN }))).toThrow();
     expect(() => s.classify(verdict(r, { category: "bogus" as never }))).toThrow();
     const retry = s.review(r, undefined, "PreToolUse");
-    expect(retry.decision).toBe("human");
+    expect(retry.decision).toBe("native");
     expect(retry.fallbackReason).toBe("invalid-result");
     expect((await events(directory, "classification-fallback"))[0]?.attributes.fallbackReason).toBe(
       "invalid-result",
@@ -141,10 +146,10 @@ describe("hint and retry flow", () => {
     s.review(r, undefined, "PreToolUse");
     expect(() => s.classify(verdict(other))).toThrow();
     expect(evaluate(r, verdict(other), permissive).decision).toBe("human");
-    expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("native");
   });
 
-  test("a session cap on AI approvals sends the rest to a human", () => {
+  test("a session cap on AI approvals sends the rest to the native flow", () => {
     const { session: s } = session();
     let last = s.review(ambiguous(), undefined);
     let limited = ambiguous();
@@ -154,11 +159,11 @@ describe("hint and retry flow", () => {
       s.review(r, undefined, "PreToolUse");
       last = s.classify(verdict(r));
     }
-    expect(last.decision).toBe("human");
+    expect(last.decision).toBe("native");
     expect(last.fallbackReason).toBe("limit");
     // The limit is part of the remembered outcome: the retry must not run without a person.
     const retried = s.review(limited, undefined, "PreToolUse");
-    expect(retried.decision).toBe("human");
+    expect(retried.decision).toBe("native");
     expect(retried.fallbackReason).toBe("limit");
   });
 
@@ -176,17 +181,15 @@ describe("hint and retry flow", () => {
     expect(s.review(approved, undefined, "PreToolUse").decision).toBe("approve");
   });
 
-  test("calls outside a hook, and strict mode, behave as before", () => {
+  test("calls outside a hook, and strict mode, request no classification and defer", () => {
     const { session: s } = session();
-    expect(s.review(ambiguous()).decision).toBe("human");
+    expect(s.review(ambiguous()).decision).toBe("native");
     const strict = session(parseProfile(JSON.stringify({ version: 1, mode: "strict" })));
     const r = ambiguous();
     const d = strict.session.review(r, undefined, "PreToolUse");
-    expect(d.decision).toBe("human");
+    expect(d.decision).toBe("native");
     expect(d.classification).toBeUndefined();
-    expect(hookResponse("claude", "PreToolUse", d)).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "ask" },
-    });
+    expect(hookResponse("claude", "PreToolUse", d)).toEqual({});
   });
 });
 
@@ -199,11 +202,12 @@ describe("the AI never relaxes a deterministic boundary", () => {
     ["cloud write", "az vm restart --name a --resource-group b"],
   ];
   for (const [name, command] of always)
-    test(`${name} stays with a human even with a perfect classification`, () => {
+    test(`${name} is never approved, even with a perfect classification`, () => {
       const { session: s } = session();
       const r = request(command);
       const d = s.review(r, undefined, "PreToolUse");
-      expect(d.decision).toBe("human");
+      // Harness settings are on the default hard list and still ask; the rest defer to the harness.
+      expect(d.decision).toBe(name === "protected path" ? "human" : "native");
       expect(d.tier).toBeUndefined();
       const outcome = (() => {
         try {
@@ -212,7 +216,7 @@ describe("the AI never relaxes a deterministic boundary", () => {
           return "rejected";
         }
       })();
-      expect(["human", "rejected"]).toContain(outcome);
+      expect(["human", "native", "rejected"]).toContain(outcome);
       expect(evaluate(r, verdict(r, { confidence: 1 }), permissive).decision).toBe("human");
     });
 
@@ -263,17 +267,19 @@ describe("destructive requests follow recoverability", () => {
   });
 
   test("a destructive label approves nothing the engine did not prove is a worktree deletion", () => {
-    for (const command of [
-      "rm -rf ~/{Documents,x}",
-      "git push --force origin {feature,x}",
-      "git clean -fdx {a,b}",
-      "echo $SOME_VAR",
+    // Not approved: a hard-list rule still asks, even in a form the engine cannot parse; the rest
+    // is left to the harness.
+    for (const [command, expected] of [
+      ["rm -rf ~/{Documents,x}", "native"],
+      ["git push --force origin {feature,x}", "human"],
+      ["git clean -fdx {a,b}", "human"],
+      ["echo $SOME_VAR", "native"],
     ]) {
       const { session: s } = session();
-      const r = request(command);
+      const r = request(command as string);
       expect(s.review(r, undefined, "PreToolUse").classification, command).toBe("requested");
       const d = s.classify(verdict(r, { category: "destructive", confidence: 0.99 }));
-      expect(d.decision, command).toBe("human");
+      expect(d.decision, command).toBe(expected);
     }
     // A non-destructive label on an ambiguous request still follows the verdict, as on main.
     const { session: s } = session();
@@ -284,12 +290,12 @@ describe("destructive requests follow recoverability", () => {
     );
   });
 
-  test("an ambiguous request the AI calls destructive but unrecoverable goes to a person", () => {
+  test("an ambiguous request the AI calls destructive but unrecoverable is left to the native flow", () => {
     const { session: s } = session();
     const r = ambiguous();
     s.review(r, undefined, "PreToolUse");
     expect(s.classify(verdict(r, { category: "destructive", recoverable: false })).decision).toBe(
-      "human",
+      "native",
     );
   });
 
@@ -657,12 +663,23 @@ describe("review history", () => {
 });
 
 describe("adapters", () => {
-  test("Codex cannot ask, so a fallback is a deny that does not invite another classification", () => {
+  test("a Codex fallback writes no hook output, so Codex's own approval policy decides", () => {
     const { session: s } = session();
     const r = ambiguous();
     s.review(r, undefined, "PreToolUse");
     const fallback = s.review(r, undefined, "PreToolUse");
     expect(fallback.classification).toBe("fallback");
+    expect(fallback.decision).toBe("native");
+    expect(hookOutput("codex", "PreToolUse", fallback)).toBe("");
+    expect(hookOutput("codex", "PermissionRequest", fallback)).toBe("");
+  });
+
+  test("a Codex fallback on the hard list is a deny with the approve command", () => {
+    const { session: s } = session();
+    const r = request("git push --force origin {feature,x}");
+    s.review(r, undefined, "PreToolUse");
+    const fallback = s.review(r, undefined, "PreToolUse");
+    expect(fallback).toMatchObject({ decision: "human", alwaysAsk: "force-push" });
     const text = JSON.stringify(hookResponse("codex", "PreToolUse", fallback));
     expect(text).toContain('"permissionDecision":"deny"');
     expect(text).not.toContain("Classify it");

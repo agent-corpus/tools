@@ -4,6 +4,23 @@ A coding-agent-independent permission evaluator. It starts a private background 
 
 This is a conservative initial implementation. It grants ordinary operations through deterministic checks. For additional cloud inspection operations, AI can confirm a bounded read-only candidate. A same-session AI classifier can categorize candidates and recommend structured replacements for opaque commands. Confidence alone never authorizes an opaque command.
 
+## Never stricter than native
+
+With the hooks installed, the harness never prompts more than it would on its own. The policy manager only _removes_ prompts, by approving what it proves safe; it never adds one. When the engine's decision is that a person is needed (`human`), the session leaves the request to the harness's native permission flow instead: `PreToolUse` returns no decision, so the user's own `permissions.allow` rules (Claude Code), sandbox and approval policy (Codex) and trusted-tool settings (Copilot) apply as before, and `PermissionRequest`, which fires only when the harness itself would prompt, returns no decision, so the user sees the native prompt with its "don't ask again" choice. Hard blocks (`deny`) stay blocks.
+
+The exception is a short hard list, the profile's `alwaysAsk`, which keeps asking (Claude Code and Copilot `ask`; Codex `deny` with the `approve` command, see **Approving from the terminal**) even where a native rule would allow it. By default it holds these rule ids:
+
+| Rule id                  | What still asks                                                                                                                         |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `force-push`             | `git push --force`/`--force-with-lease`/`--mirror`/`--prune` and `+` refspecs: they overwrite remote history.                           |
+| `delete-unmerged-branch` | Deleting a local or remote branch whose commits are not verified merged.                                                                |
+| `remove-worktree-force`  | `git worktree remove --force` (outside scratch and temp directories) and unverified `git worktree prune`.                               |
+| `git-clean`              | `git clean` other than a dry run: it deletes untracked files.                                                                           |
+| `harness-settings`       | Writes to harness permission and hook settings: `.claude/settings*.json`, `.codex/hooks.json`, `.codex/config.toml`, `.copilot/hooks/`. |
+| `policy-profile`         | Writes to the policy profile itself.                                                                                                    |
+
+A rule also matches the text of a shell command the engine could not parse (`git push -f origin {a,b}`), so an unparsed form does not slip past it. `alwaysAsk` may also name decision categories (`"sensitive"`, `"destructive"`, ...) to keep asking for everything in them, or be `[]`. Two built-in rules cannot be removed: an agent running `approve` itself (`self-approve`) and a classification record for another session or CLI (`foreign-classification-record`). Everything else that needs a person, such as protected repository paths (`.agent-config`, `AGENTS.md`), Claude Code's own `~/.claude` files outside its settings (agent memory, transcripts), credential reads, cloud writes, `humanPatterns`, and unknown or unparsed commands, is deferred. The audit log records each deferral as decision `native` with the reason it would have asked in `deferred`, and a hard-list decision names its rule in `alwaysAsk`.
+
 ## Usage
 
 Build from an inspected worktree with `npm install` and `npm run build`. Install the reviewed package outside agent-writable worktrees before using it as an approval authority. The initial package is not yet published.
@@ -95,7 +112,7 @@ How a hook call flows (Claude Code, Codex and Copilot `PreToolUse`):
 1. **First call.** The command is _not run_ and the person is not asked. The hook blocks it with a reason that tells the model to ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive, to record the answer with `policy-manager classify`, and to retry the same command. The reason starts with `Needs classification (not an error)` and states the rule the classifier applies (`HUMAN_REVIEW_PRINCIPLE`). A person is needed only for unrecoverable loss, credential or secret retrieval, protected configuration or paths, and `humanPatterns`. A recoverable outward-facing write such as an issue comment is approvable, and so is a destructive-but-safe deletion inside a feature worktree. The request hash covers only effect-relevant input, so a retry with a different Bash `description` reuses the classification.
 2. **Recorded.** The session approves the record command in that reason deterministically, in every profile: exactly `node "<this package's dist/cli.js>" classify <harness> <session-id> <<< '<json>'` for the current harness and session, with one single-quoted JSON object and nothing else in the command. Any other direct invocation of a classification record goes to a person: `node … cli.js classify` or `policy-manager classify`, at the start of a command or after an operator, including behind assignments, wrappers such as `env`, `exec` or `xargs`, or keywords such as `then`. That covers another session, harness or CLI path, and anything added before or after. A command that only mentions one, such as a `grep` pattern, gets the normal decision, and so does a record nested in a quoted script (`sh -c '…'`).
 3. **Classified.** `classify` takes `{requestHash, category, confidence, recoverable, rationale}`. The request is approved only when `recoverable` is `true`, `confidence` is at least 0.95, and the category is not `sensitive` or `unknown`. A `destructive` label approves only a deletion the engine itself identified inside a linked feature worktree, on the same terms. Any other request the AI labels `destructive` (an unparsable `rm -rf ~/{a,b}`, for example), and any such deletion not judged recoverable, goes to a **person** (under Codex, a deny), since it may lose data for good. No other deterministic `destructive` escalation is classified. Anything else is a **deny with a reason** the model sees and works around. The outcome is remembered for five minutes for that exact request, and a verdict is final in that time: a deny cannot be reclassified into an approve.
-4. **Fallback.** If the classifier is unavailable or its answer is invalid, the retry reaches a person through the normal prompt (under Codex, which cannot ask, it is a deny that gives the `approve` command the user runs; see **Approving from the terminal**). This happens at most once per request, so there is never a loop and never a lost prompt. After 50 AI approvals in a session, further ambiguous requests go to a person.
+4. **Fallback.** If the classifier is unavailable or its answer is invalid, the retry is left to the harness's native permission flow (see **Never stricter than native**); only a request on the `alwaysAsk` hard list asks (under Codex, which cannot ask, it is a deny that gives the `approve` command the user runs; see **Approving from the terminal**). This happens at most once per request, so there is never a loop and never a lost prompt. After 50 AI approvals in a session, further ambiguous requests fall back the same way.
 
 **What always stays with a person, in code, and is never AI-relaxable** (these are the owner's calls; they list exactly what this experiment does not change):
 
@@ -118,13 +135,12 @@ The report shows how many ambiguous requests were approved, denied, fell back to
 
 ## Approving from the terminal
 
-Codex cannot ask in `PreToolUse`, so a request that needs a person is denied, and approving it in chat does not change the decision. The deny reason leads with what to do:
+Only requests on the `alwaysAsk` hard list wait for an approval; everything else that needs a person is left to the harness. Codex cannot ask in `PreToolUse`, so a hard-list request is denied, and approving it in chat does not change the decision. The deny reason leads with what to do:
 
 ```text
-⏸ Waiting for your approval. Not run: Protected path requires human approval.
+⏸ Waiting for your approval. Not run: Force or mirror pushes overwrite remote history.
 Run in your own terminal, then say "retry":
   pm approve --last
-Add --session to also allow writes under /tmp/wt/.agent-config for the rest of this session.
 Agent: stop now and end your turn; approving it in chat does not unblock it. Show the user the command above exactly, in a code block. Never run it yourself.
 Request <64-character request hash>.
 ```
@@ -165,9 +181,19 @@ Without a profile the engine is strict (everything above). An organization can i
   "cloudWrites": "human",
   "humanPatterns": ["^npm install"],
   "scratchRoots": ["/srv/scratch"],
-  "mcpReadOnly": ["mcp__github__get_issue", "mcp__github__list_pull_requests"]
+  "mcpReadOnly": ["mcp__github__get_issue", "mcp__github__list_pull_requests"],
+  "alwaysAsk": [
+    "force-push",
+    "delete-unmerged-branch",
+    "remove-worktree-force",
+    "git-clean",
+    "harness-settings",
+    "policy-profile"
+  ]
 }
 ```
+
+"Sends to a person" and "needs a human" below describe the engine's decision. In a hook session such a request is left to the harness's native flow unless it is on `alwaysAsk` (see **Never stricter than native**). An `alwaysAsk` that is not a list of known rule ids and categories makes the profile invalid, and the session stays strict.
 
 ```sh
 policy-manager profile validate policy.json
@@ -261,7 +287,7 @@ A listed tool is approved. Any other MCP tool gets no decision from the policy m
 | Codex       | Same matcher; Codex names MCP tools `mcp__<server>__<tool>` in `PreToolUse` and `PermissionRequest`. The new matcher changes the `PreToolUse` hook's trust hash, so trust it again in `/hooks` after `setup-hook-codex`. |
 | Copilot     | Not supported. The Copilot hooks reference documents no MCP tool name for hooks, so setup adds no MCP matcher and `mcpReadOnly` never matches a Copilot tool; Copilot's own MCP permissions apply.                       |
 
-Measure a profile against real usage with `policy-manager replay ~/.claude/projects --profile policy.json`: it replays the Bash commands recorded in Claude Code transcripts through the evaluator (nothing is executed) and prints the approval rate with and without the profile, plus the most common reasons that still need a human. Reports include short command excerpts, so keep them local.
+Measure a profile against real usage with `policy-manager replay ~/.claude/projects --profile policy.json`: it replays the Bash commands recorded in Claude Code transcripts through the evaluator (nothing is executed) and prints the approval rate with and without the profile, plus the most common reasons that still need a human. It then splits those escalations into the ones a hook session now defers to the harness's native flow and the ones that still ask under `alwaysAsk`, with the ten most common reasons that still ask and the rule each matched. Only Bash commands are replayed; file tool writes (`Write`, `Edit`) are not. Reports include short command excerpts, so keep them local.
 
 Protected names (`.claude`, `.agent-config`, `AGENTS.md`, ...) are judged relative to the repository root, so a linked worktree under `<repo>/.claude/worktrees/<name>` is ordinary code while `<worktree>/.claude/settings.json` stays protected. `git config` is limited to a short allowlist of local, non-executable keys; hooks, aliases, credential helpers, URLs and `--global` always need a human. For `--session`, a single shell command's scope comes from every word that could name a file it touches: non-option arguments, `--option=value` and `-oVALUE` values, and redirect targets (`>`, `>>`, `<`), so `printf x >> .agent-config/README.md` and `tee -a .agent-config/a` are covered like a patch, while a command that also names `AGENTS.md` or `.claude` is not. A variable assigned a single-quoted literal that is not one plain word (`Q='query($t: ID!)'`) is known only inside double quotes, so `gh api graphql -f query="$Q"` is judged on its value; an unquoted `$Q` stays unknown. Read-only cloud verbs (`list`, `show`, `describe`, `get-*`) and `az boards query` (a WIQL read) are approved beyond the exact catalog unless the arguments name credentials or override the endpoint.
 
@@ -290,7 +316,7 @@ The cache belongs to the service process and is scoped to harness plus session I
 
 `SessionStart` reports the private temporary directory containing `audit.jsonl`. Each request and decision is recorded before an approval is returned. The log stores versioned event envelopes, readable action summaries, opaque session identifiers, request hashes, and hashed targets. It excludes paths, argument values, source text, credentials, and model explanations. Compare request hashes against the original request in the harness transcript during an investigation. Logs rotate at 10 MiB per segment and stop accepting writes at 100 MiB total. Earlier segments remain available through `audit-log query` and `audit-log export`; no records are automatically deleted. Logs remain after normal shutdown and can disappear during operating-system cleanup. Copy them before cleanup when needed.
 
-Logging failure, malformed requests, service failure, and unknown semantics never produce an automatic approval. Permission hooks fall through to native human handling. Pre-tool failures exit 2. Host timeout behavior differs: Copilot command-hook timeouts fall through to its normal permission flow. Codex does not support `ask` in `PreToolUse`: it parses the value, marks the hook failed and runs the tool anyway. A decision that needs a human is therefore returned to Codex as a `deny` whose reason says the command was not run and that approving it in chat does not unblock it (the decision is deterministic, so a retry is denied again); there is no in-Codex button to approve it. The reason gives the `approve` command the user runs in their own terminal (see **Approving from the terminal**). An ambiguous request is the other way through: its reason points to the session policy-manager agent, and a classification of approved is accepted for the session, so a retry passes. Codex also rejects `PreToolUse` `permissionDecision: "allow"` without `updatedInput` ("PreToolUse hook returned unsupported permissionDecision:allow", checked against Codex CLI 0.167.2), so an approval there is no decision: empty output and exit 0. If Codex would still prompt, its `PermissionRequest` hook returns `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`, which suppresses the prompt; a request that needs a human gets no output there and Codex's own prompt.
+Logging failure, malformed requests, service failure, and unknown semantics never produce an automatic approval. Permission hooks fall through to native human handling. Pre-tool failures exit 2. Host timeout behavior differs: Copilot command-hook timeouts fall through to its normal permission flow. Codex does not support `ask` in `PreToolUse`: it parses the value, marks the hook failed and runs the tool anyway. A decision that needs a human gets no output (Codex's own sandbox and approval policy decide), except on the `alwaysAsk` hard list, which is returned to Codex as a `deny` whose reason says the command was not run and that approving it in chat does not unblock it (the decision is deterministic, so a retry is denied again); there is no in-Codex button to approve it. The reason gives the `approve` command the user runs in their own terminal (see **Approving from the terminal**). An ambiguous request is the other way through: its reason points to the session policy-manager agent, and a classification of approved is accepted for the session, so a retry passes. Codex also rejects `PreToolUse` `permissionDecision: "allow"` without `updatedInput` ("PreToolUse hook returned unsupported permissionDecision:allow", checked against Codex CLI 0.167.2), so an approval there is no decision: empty output and exit 0. If Codex would still prompt, its `PermissionRequest` hook returns `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`, which suppresses the prompt; a request that needs a human gets no output there and Codex's own prompt.
 
 ## Audit API and reported outcomes
 

@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { canonical, git } from "./evidence.js";
 import { type CredentialHelper, HelperError, parseCredentialHelpers } from "./helpers.js";
 import { TOOL_NAME } from "./tools.js";
+import { ALWAYS_ASK_RULES, CATEGORIES } from "./types.js";
 
 /**
  * A profile is policy *data*. The engine's checks (protected paths, secret retrieval, verified
@@ -31,6 +32,11 @@ export interface Profile {
   toolsDeny: { claude: string[]; codex: string[]; copilot: string[] };
   /** Scripts that may read a credential for one narrow job, as committed on the default branch. */
   credentialHelpers: CredentialHelper[];
+  /**
+   * Decisions that still ask a person; every other one that needs a person is left to the
+   * harness's native permission flow. Rule ids from ALWAYS_ASK_RULES or decision categories.
+   */
+  alwaysAsk: string[];
   /** SHA-256 of the file the profile came from, for the audit log. */
   digest?: string;
 }
@@ -43,7 +49,23 @@ export const strictProfile: Profile = {
   mcpReadOnly: [],
   toolsDeny: { claude: [], codex: [], copilot: [] },
   credentialHelpers: [],
+  alwaysAsk: [...ALWAYS_ASK_RULES],
 };
+
+export const MAX_ALWAYS_ASK = 50;
+function parseAlwaysAsk(raw: unknown): string[] {
+  if (raw === undefined) return [...ALWAYS_ASK_RULES];
+  const known = new Set<string>([...ALWAYS_ASK_RULES, ...CATEGORIES]);
+  if (
+    !Array.isArray(raw) ||
+    raw.length > MAX_ALWAYS_ASK ||
+    raw.some((entry) => typeof entry !== "string" || !known.has(entry))
+  )
+    throw new ProfileError(
+      `alwaysAsk must list at most ${MAX_ALWAYS_ASK} rule ids (${ALWAYS_ASK_RULES.join(", ")}) or categories`,
+    );
+  return [...new Set(raw as string[])];
+}
 
 export const MAX_MCP_READ_ONLY = 200;
 /**
@@ -132,6 +154,7 @@ export function parseProfile(text: string): Profile {
     "mcpReadOnly",
     "toolsDeny",
     "credentialHelpers",
+    "alwaysAsk",
     "description",
   ]);
   for (const key of Object.keys(value))
@@ -158,6 +181,7 @@ export function parseProfile(text: string): Profile {
       `mcpReadOnly must list at most ${MAX_MCP_READ_ONLY} names like mcp__server__tool, optionally ending in *`,
     );
   const toolsDeny = parseToolsDeny(value.toolsDeny);
+  const alwaysAsk = parseAlwaysAsk(value.alwaysAsk);
   let credentialHelpers: CredentialHelper[];
   try {
     credentialHelpers = parseCredentialHelpers(value.credentialHelpers);
@@ -187,6 +211,7 @@ export function parseProfile(text: string): Profile {
     mcpReadOnly: [...new Set(mcp as string[])],
     toolsDeny,
     credentialHelpers: value.mode === "permissive" ? credentialHelpers : [],
+    alwaysAsk,
     digest: createHash("sha256").update(text).digest("hex"),
   };
 }

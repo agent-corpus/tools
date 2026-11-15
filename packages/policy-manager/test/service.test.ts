@@ -55,7 +55,10 @@ test.each(["claude", "codex", "copilot"] as const)(
       );
       expect(raw("PermissionRequest", human)).toBe(harness === "codex" ? "" : "{}\n");
       const entries = readFileSync(join(directory, "audit.jsonl"), "utf8");
-      expect(entries).toContain('"decision":"human"');
+      expect(entries).toContain('"decision":"native"');
+      expect(entries).toMatch(/"decision":"native"[^\n]*"deferred":"[^"]+"/);
+      // Deferred to the harness: no PreToolUse decision either.
+      expect(raw("PreToolUse", human)).toBe(harness === "codex" ? "" : "{}\n");
       expect(entries).not.toContain("private-id");
       const recorded = JSON.parse(
         execFileSync(process.execPath, [cli, "record", harness, sessionId], {

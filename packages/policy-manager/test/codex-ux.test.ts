@@ -21,6 +21,10 @@ import { inspectShim, installShim, SHIM_MARKER, shimPath } from "../src/shim.js"
 import type { Request } from "../src/types.js";
 
 const permissive = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
+/** Protected-path writes are not on the default hard list; listing `sensitive` puts them there. */
+const asking = parseProfile(
+  JSON.stringify({ version: 1, mode: "permissive", alwaysAsk: ["sensitive"] }),
+);
 let root: string, repo: string, worktree: string;
 let counter = 0;
 const git = (cwd: string, ...args: string[]) =>
@@ -82,8 +86,15 @@ describe("single-quoted literals", () => {
 });
 
 describe("session scope for shell redirect writes", () => {
-  test("a redirect write is session-grantable and covers later writes under the same root", () => {
+  test("by default a protected-path redirect write defers to the harness", () => {
     const { s } = session();
+    const d = s.review(shell("printf test >> .agent-config/README.md"), undefined, "PreToolUse");
+    expect(d.decision).toBe("native");
+    expect(d.deferred).toBe("Protected path requires human approval");
+    expect(s.latestHumanDecision()).toBeUndefined();
+  });
+  test("a redirect write is session-grantable and covers later writes under the same root", () => {
+    const { s } = session(asking);
     const first = s.review(
       shell("printf test >> .agent-config/README.md"),
       undefined,
@@ -106,7 +117,7 @@ describe("session scope for shell redirect writes", () => {
     "tee .agent-config/a AGENTS.md",
     "printf x > .claude/settings.json",
   ])("a write that also touches another protected path is not covered: %s", (command) => {
-    const { s } = session();
+    const { s } = session(asking);
     const first = s.review(
       shell("printf test >> .agent-config/README.md"),
       undefined,
@@ -119,7 +130,7 @@ describe("session scope for shell redirect writes", () => {
 
 describe("approve --last", () => {
   test("the session reports its newest request waiting for a person", () => {
-    const { s } = session();
+    const { s } = session(asking);
     expect(s.latestHumanDecision()).toBeUndefined();
     const a = s.review(shell("printf a >> .agent-config/a.md"), undefined, "PreToolUse");
     const b = s.review(shell("printf b >> AGENTS.md"), undefined, "PreToolUse");

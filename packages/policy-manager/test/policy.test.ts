@@ -233,17 +233,17 @@ test("AI can approve a bounded cloud inspection and cache only that session requ
   mkdirSync(directory, { mode: 0o700 });
   const session = new PolicySession(directory, "codex", "test");
   const r = request("az network vnet list --resource-group example");
-  expect(session.review(r).decision).toBe("human");
+  expect(session.review(r).decision).toBe("native");
   expect(
     session.classify({ requestHash: hash(r), category: "cloud-read", confidence: 0.999 }).decision,
   ).toBe("approve");
   expect(session.review(r).cached).toBe(true);
-  expect(session.review(request("az network vnet delete --name example")).decision).toBe("human");
+  expect(session.review(request("az network vnet delete --name example")).decision).toBe("native");
   expect(
     session.review(request("az network vnet list --endpoint-url https://evil.example")).decision,
-  ).toBe("human");
+  ).toBe("native");
   const changed = request("az network vnet list --resource-group another");
-  expect(session.review(changed).decision).toBe("human");
+  expect(session.review(changed).decision).toBe("native");
 });
 
 test("request, classification, decision and reported outcomes share audit correlation", async () => {
@@ -268,7 +268,7 @@ test("request, classification, decision and reported outcomes share audit correl
   const text = JSON.stringify(records);
   expect(text).not.toContain("hidden-target");
   expect(text).toContain("az network");
-  expect(session.review(request("az resource delete --ids hidden-target")).decision).toBe("human");
+  expect(session.review(request("az resource delete --ids hidden-target")).decision).toBe("native");
 });
 test("audit failure prevents an automatic approval", () => {
   const directory = join(root, "blocked-audit");

@@ -152,7 +152,7 @@ function classifyInstruction(
   context?: HookContext,
 ): string {
   const command = classifyCommand(harness, context);
-  return `Needs classification (not an error): not run yet. Ask the session's policy-manager agent whether this exact command is recoverable and non-sensitive, record its answer, then retry the same command unchanged. Rule: ${HUMAN_REVIEW_PRINCIPLE} Request ${decision.requestHash}: ${decision.reason}. Answer shape: {"requestHash":"${decision.requestHash}","category":"${CATEGORIES.join("|")}","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record it by replacing <json> in this command, with no single quotes in the answer: ${command} If no classification is available, retry once and the user will be asked.`;
+  return `Needs classification (not an error): not run yet. Ask the session's policy-manager agent whether this exact command is recoverable and non-sensitive, record its answer, then retry the same command unchanged. Rule: ${HUMAN_REVIEW_PRINCIPLE} Request ${decision.requestHash}: ${decision.reason}. Answer shape: {"requestHash":"${decision.requestHash}","category":"${CATEGORIES.join("|")}","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record it by replacing <json> in this command, with no single quotes in the answer: ${command} If no classification is available, retry once and the harness's own permission flow decides.`;
 }
 export function hookResponse(
   harness: Request["harness"],

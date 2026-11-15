@@ -552,7 +552,7 @@ describe("session scope wording", () => {
     const directory = join(root, "session");
     mkdirSync(directory, { mode: 0o700 });
     writeFileSync(join(worktree, "AGENTS.md"), "x");
-    const s = new PolicySession(directory, "codex", "s1", profile);
+    const s = new PolicySession(directory, "codex", "s1", { ...profile, alwaysAsk: ["sensitive"] });
     const shell = (command: string): Request => ({
       sessionId: "s1",
       harness: "codex",

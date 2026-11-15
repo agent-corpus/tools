@@ -137,6 +137,13 @@ try {
       console.log(`${row.count}\t${row.reason}`);
       for (const example of row.examples) console.log(`\t  ${example}`);
     }
+    console.log(
+      `Never stricter than native: ${report.deferred} of ${humans} escalations defer to the harness's own permission flow; ${report.stillAsk} still ask under alwaysAsk`,
+    );
+    for (const row of report.askReasons.slice(0, 10)) {
+      console.log(`${row.count}\t[${row.rule}] ${row.reason}`);
+      for (const example of row.examples) console.log(`\t  ${example}`);
+    }
   } else if (action === "review-classifications") {
     const { values } = parseArgs({
       args: args.slice(1),
@@ -247,7 +254,7 @@ try {
     } else {
       const directory = await start(harness, request.sessionId, cliPath);
       if (phase === "SessionStart") {
-        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. An ambiguous request is blocked once with instructions to have the policy-manager agent classify it and then retry; the person is asked only if classification fails. ${HUMAN_REVIEW_PRINCIPLE} If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent. Never ask an agent to approve its own tools.`;
+        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. An ambiguous request is blocked once with instructions to have the policy-manager agent classify it and then retry; if classification fails, the harness's own permission flow decides. Only a short hard list (force pushes, deleting unmerged work, harness settings and the policy profile) is always put to the user. ${HUMAN_REVIEW_PRINCIPLE} If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent. Never ask an agent to approve its own tools.`;
         console.log(
           JSON.stringify(
             harness === "copilot"

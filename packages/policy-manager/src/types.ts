@@ -31,8 +31,9 @@ export interface Classification {
 export type ClassificationStage = "requested" | "approved" | "denied" | "fallback";
 export interface Decision {
   /**
-   * `deny` is a decision the model sees and works around; `human` asks the person; `native` makes
-   * no decision and leaves the request to the harness's own permission flow.
+   * `deny` is a decision the model sees and works around; `human` asks the person (only for the
+   * profile's `alwaysAsk` hard list once a session reviews it); `native` makes no decision and
+   * leaves the request to the harness's own permission flow.
    */
   decision: "approve" | "human" | "deny" | "native";
   category: Category;
@@ -57,6 +58,10 @@ export interface Decision {
   credentialHelpers?: string[];
   /** The agent tried to approve a request itself: no approval instruction is offered for it. */
   userOnly?: boolean;
+  /** A `native` decision that would have asked a person: the reason it would have asked. */
+  deferred?: string;
+  /** A `human` decision on the profile's `alwaysAsk` hard list: the rule id or category it matched. */
+  alwaysAsk?: string;
 }
 
 export interface OutcomeReport {
@@ -67,3 +72,23 @@ export interface OutcomeReport {
   exitCode?: number;
   durationMs?: number;
 }
+
+/**
+ * Rules that still ask a person although the policy manager otherwise defers to the harness's
+ * native permission flow. A profile's `alwaysAsk` lists these ids or decision categories.
+ */
+export const ALWAYS_ASK_RULES = [
+  /** `git push --force`/`--mirror`, and `+` refspecs: they overwrite remote history. */
+  "force-push",
+  /** Deleting a local or remote branch whose commits are not verified merged. */
+  "delete-unmerged-branch",
+  /** `git worktree remove --force`/`prune`: discards a worktree's uncommitted and untracked work. */
+  "remove-worktree-force",
+  /** `git clean`: deletes untracked files. */
+  "git-clean",
+  /** Writes to harness permission and hook settings. */
+  "harness-settings",
+  /** Writes to the policy profile itself. */
+  "policy-profile",
+] as const;
+export type AlwaysAskRule = (typeof ALWAYS_ASK_RULES)[number];

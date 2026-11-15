@@ -9,6 +9,7 @@ import {
   withCreated,
 } from "./created.js";
 import { grantScope, scopeLabel } from "./grants.js";
+import { APPROVE_GUARD, deferToNative } from "./native.js";
 import { evaluate, hash, requestHash as requestHashOf, result, SHELL_TOOLS } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
@@ -26,8 +27,8 @@ const CLASSIFICATION_TTL_MS = 5 * 60_000;
 export const MAX_AI_APPROVALS = 50;
 /** How long after its approval an execution report may still record the files a tool created. */
 const CREATION_REPORT_MS = 15 * 60_000;
-export const APPROVE_GUARD =
-  "Only the user may approve a request, by running approve in their own terminal";
+
+export { APPROVE_GUARD };
 /** How long after a human decision the user may still approve that exact request once. */
 export const GRANT_WINDOW_MS = 15 * 60_000;
 
@@ -376,6 +377,8 @@ export class PolicySession {
       const allowed = this.granted(request, decision, phase);
       if (allowed) decision = allowed;
     }
+    // Never stricter than the harness: only the hard list asks; the rest is left to its native flow.
+    decision = deferToNative(request, decision, this.profile.alwaysAsk);
     if (decision.decision === "human" && decision.reason === APPROVE_GUARD) {
       this.cache.delete(key);
       decision = { ...decision, userOnly: true, sessionGrantable: false };
@@ -416,7 +419,9 @@ export class PolicySession {
     // A denied request is final for its remembered state: only a human decision or a request
     // still waiting for its first classification can be classified.
     if (
-      (decision.decision === "human" || decision.classification === "requested") &&
+      (decision.decision === "human" ||
+        decision.deferred !== undefined ||
+        decision.classification === "requested") &&
       (["unknown", "cloud-read"].includes(decision.category) || decision.needsClassification) &&
       !ai
     ) {
