@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readdirSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { audit, sessionDirectory, sessionDirectoryPath, sessionToken } from "./audit.js";
 import { hash, requestHash } from "./policy.js";
@@ -10,7 +11,7 @@ import type { Classification, OutcomeReport, Request } from "./types.js";
 
 interface Message {
   token: string;
-  action: "ping" | "review" | "classify" | "record" | "grant" | "stop";
+  action: "ping" | "review" | "classify" | "record" | "grant" | "pending" | "stop";
   request?: Request;
   classification?: Classification;
   report?: OutcomeReport;
@@ -61,13 +62,16 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
                 : message.grant
                   ? { requestHash: String(message.grant.requestHash) }
                   : {}),
-          action: ["ping", "review", "classify", "record", "grant", "stop"].includes(message.action)
+          action: ["ping", "review", "classify", "record", "grant", "pending", "stop"].includes(
+            message.action,
+          )
             ? message.action
             : "invalid",
         });
         idle.refresh();
         let result: unknown;
         if (message.action === "ping") result = { ready: true };
+        else if (message.action === "pending") result = session.latestHumanDecision() ?? null;
         else if (message.action === "stop") {
           audit(directory, { event: "session-end" });
           result = { stopped: true };
@@ -117,7 +121,11 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
       resolve();
     });
   });
-  audit(directory, { event: "session-start", harness, sessionHash: hash(sessionId) });
+  audit(directory, {
+    event: "session-start",
+    harness,
+    sessionHash: hash(sessionId),
+  });
   audit(directory, {
     event: "profile",
     mode: profile.mode,
@@ -134,7 +142,75 @@ export function send(
   sessionId: string,
   message: Omit<Message, "token">,
 ): Promise<unknown> {
-  const directory = sessionDirectory(harness, sessionId);
+  return sendTo(sessionDirectory(harness, sessionId), message);
+}
+/**
+ * The newest request waiting for a person across this user's running policy services, for
+ * `approve --last`. Only private session directories owned by this user are asked.
+ */
+export async function latestHumanDecision(): Promise<
+  | {
+      directory: string;
+      requestHash: string;
+      at: number;
+      harness: string;
+      sessionId: string;
+    }
+  | undefined
+> {
+  const root = tmpdir();
+  const prefix = `acp-${process.getuid?.() ?? "user"}-`;
+  let best:
+    | {
+        directory: string;
+        requestHash: string;
+        at: number;
+        harness: string;
+        sessionId: string;
+      }
+    | undefined;
+  for (const name of readdirSync(root)) {
+    if (!name.startsWith(prefix) || !/^[a-f0-9]{24}$/.test(name.slice(prefix.length))) continue;
+    const directory = join(root, name);
+    try {
+      const stat = lstatSync(directory);
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        (process.getuid && (stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0)) ||
+        !existsSync(join(directory, "token"))
+      )
+        continue;
+      const found = (await sendTo(directory, { action: "pending" })) as {
+        requestHash?: unknown;
+        at?: unknown;
+        harness?: unknown;
+        sessionId?: unknown;
+      } | null;
+      if (
+        found &&
+        typeof found.requestHash === "string" &&
+        /^[a-f0-9]{64}$/.test(found.requestHash) &&
+        typeof found.at === "number" &&
+        typeof found.harness === "string" &&
+        typeof found.sessionId === "string" &&
+        (!best || found.at > best.at)
+      )
+        best = {
+          directory,
+          requestHash: found.requestHash,
+          at: found.at,
+          harness: found.harness,
+          sessionId: found.sessionId,
+        };
+    } catch {
+      /* A stopped or unreachable service has nothing to approve. */
+    }
+  }
+  return best;
+}
+/** Sends to the service of an existing session directory (see `approve --last`). */
+export function sendTo(directory: string, message: Omit<Message, "token">): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(endpoint(directory));
     let data = "";

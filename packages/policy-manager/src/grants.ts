@@ -11,6 +11,7 @@ import {
 } from "./evidence.js";
 import { SHELL_TOOLS, words } from "./policy.js";
 import type { Profile } from "./profile.js";
+import { parseShell, SUBSTITUTION } from "./shell.js";
 import type { Decision, Request } from "./types.js";
 
 export const PROTECTED_PATH = "Protected path requires human approval";
@@ -55,6 +56,34 @@ function targets(request: Request): string[] | undefined {
   return undefined;
 }
 
+/**
+ * Every word of a single shell command that could name a file it touches: non-option arguments,
+ * the value of `--option=value` or `-oVALUE`, and redirect targets (`> f`, `>> f`, `< f`). One program, no
+ * operators, pipes, substitutions or variables. A word that is not a path only adds a scope, so
+ * treating it as one fails closed.
+ */
+function shellPaths(request: Request): string[] | undefined {
+  const command = request.input.command ?? request.input.cmd;
+  if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string") return undefined;
+  const pipelines = parseShell(command);
+  const only = pipelines?.length === 1 && pipelines[0]?.length === 1 ? pipelines[0][0] : undefined;
+  if (!only || only.env.length || only.subs.length || only.stdin !== undefined) return undefined;
+  const texts = [...only.argv, ...only.redirects.map((r) => r.target)];
+  if (texts.some((text) => text.includes(SUBSTITUTION))) return undefined;
+  const paths: string[] = [];
+  for (const word of only.argv.slice(1)) {
+    if (!word.startsWith("-")) paths.push(word);
+    else if (word.startsWith("--")) {
+      if (word.includes("=")) paths.push(word.slice(word.indexOf("=") + 1));
+    }
+    // `-oFILE` attaches a value to a short option; flags like `-rf` only add a harmless path.
+    else if (word.length > 2) paths.push(word.slice(2).replace(/^=/, ""));
+  }
+  for (const redirect of only.redirects)
+    if (redirect.op !== ">&" && redirect.target !== "/dev/null") paths.push(redirect.target);
+  return paths.filter((path) => path.length > 0);
+}
+
 /** A simple command (one program, no operators, expansions or redirects) as words. */
 function simple(request: Request): string[] | undefined {
   const command = request.input.command ?? request.input.cmd;
@@ -80,13 +109,7 @@ export function grantScope(
 ): string | undefined {
   try {
     if (decision.reason === PROTECTED_PATH) {
-      let paths = targets(request);
-      if (!paths) {
-        const argv = simple(request);
-        paths = argv
-          ?.slice(1)
-          .filter((word) => !word.startsWith("-") && (word.includes("/") || word.startsWith(".")));
-      }
+      const paths = targets(request) ?? shellPaths(request);
       if (!paths?.length) return undefined;
       const roots = new Set<string>();
       let top: string | undefined;

@@ -42,6 +42,8 @@ The canonical form is `policy-manager setup-hook <claude|codex|copilot>`. Each a
 
 Setup merges only the managed hook definitions. Existing custom hooks, permissions, settings, allow rules, and deny rules remain. Repeated setup is idempotent. Package upgrades replace hooks carrying the managed marker; unmarked manual entries remain. Existing settings receive an owner-only backup, and updates use a temporary file with atomic replacement. Invalid JSON, unsupported schemas, symbolic links, concurrent setup, and detected concurrent edits fail without replacing the existing settings.
 
+Setup also installs a small launcher named `pm` that runs this CLI, so a user can type `pm approve --last`: `~/.local/bin/pm` (a Node script, mode 0755) on macOS and Linux, `%LOCALAPPDATA%\agent-corpus\bin\pm.cmd` on Windows. It carries a marker with the version that wrote it. Setup replaces only a launcher it wrote for the same or an older version; a newer one, or a `pm` it did not write, is left alone and reported. Setup never edits `PATH`: the result's `shim.onPath` says whether the directory is on it, and the next steps say how to add it. `--shim-dir <directory>` puts the launcher elsewhere; with `--config-dir` and no `--shim-dir`, setup leaves the launcher alone.
+
 `--dry-run` prints the target path, proposed managed hooks, and next steps without writing files or printing existing settings. `--config-dir <directory>` selects a harness configuration root for portable profiles or testing. Defaults respect `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `COPILOT_HOME`, then use the standard user directories listed above. Setup refuses to activate an entrypoint inside a Git checkout, including an npm link into a checkout. Source builds can preview with `--dry-run`.
 
 Start a new session after setup. Codex still requires explicit review and trust through `/hooks`; setup does not grant that trust. Existing sandbox controls and host permission rules continue to apply. Ambiguous requests retain the documented classification or human fallback; setup does not enable automatic AI fallback across unsupported native interfaces.
@@ -116,13 +118,24 @@ The report shows how many ambiguous requests were approved, denied, fell back to
 
 ## Approving from the terminal
 
-Codex cannot ask in `PreToolUse`, so a request that needs a person is denied, and approving it in chat does not change the decision. The deny reason gives the command the user runs in their own terminal:
+Codex cannot ask in `PreToolUse`, so a request that needs a person is denied, and approving it in chat does not change the decision. The deny reason leads with what to do:
+
+```text
+⏸ Waiting for your approval. Not run: Protected path requires human approval.
+Run in your own terminal, then say "retry":
+  pm approve --last
+Add --session to also allow writes under /tmp/wt/.agent-config for the rest of this session.
+Agent: stop now and end your turn; approving it in chat does not unblock it. Show the user the command above exactly, in a code block. Never run it yourself.
+Request <64-character request hash>.
+```
+
+`pm approve --last` approves the newest request that any running policy session of this user sent to a person in the last 15 minutes. It shows the harness and session, the tool, the redacted request, the rule, and (with `--session`) the scope, then asks y/N; it refuses to run without an interactive terminal. To approve one exact request instead:
 
 ```sh
 policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--session]
 ```
 
-It shows the tool, the redacted request and the rule, and asks for confirmation; it refuses to run without an interactive terminal. The request must be one this session sent to a person in the last 15 minutes. Then the agent retries the same request unchanged.
+The deny reason uses `pm` when the managed launcher (see **Install native hooks**) for this version is installed and its directory is on `PATH`, and `node "<cli>" approve --last` otherwise. Then the agent retries the same request unchanged.
 
 - **Once (default).** The next review of that exact request is approved, once per hook phase (`PreToolUse`, then `PermissionRequest`), and the grant is spent.
 - **`--session`.** Also approves later requests in this session that hit the same rule for the same scope: a protected-path write under the same protected root of the same checkout (`<worktree>/.agent-config`, not `.claude` or another worktree), the same `humanPatterns` entries in the same checkout, or, for other rules, the exact same command in the same checkout. `approve --session` prints the scope before asking. Shell commands are covered only when they are a single simple command, so nothing else in a script hides behind the rule. Credential and secret reads, possible unrecoverable loss (force pushes, deleting unmerged work) and requests whose effect the engine could not determine (category `unknown`, such as an interpreter script) are approved once only, even with `--session`; the deny reason offers `--session` only when it applies.
@@ -194,6 +207,14 @@ Every command that could run is judged, not only the first. Understood: `;`, new
 - **Variables after an assignment chain.** `S=/abs && H=x; use $S $H` treats `H` as assigned: a bare assignment with no command substitution and no redirection cannot fail, so the `&&` chain always reaches `H=x`. This holds only for uppercase names the shell does not reserve. zsh's lowercase specials, read-only or numeric specials (`UID`, `SECONDS`, `BASH*`, `ZSH*`, ...), a value with `$(...)`, `export NAME=value` and a prefix assignment (`X=1 cmd`) can fail or do not persist, so the chain may stop there and a later name is still an environment variable. A value used as the program (`P=rm; $P -rf x`) is resolved and judged as that program. The remaining window is a `readonly` or `typeset -i` that the user's shell startup files set on a name outside that list (such as `HISTFILE`): bash 5 in default mode may then return 1 without exiting, so the chain could stop there. That is outside what the script controls and is accepted.
 - **Still sent to a human:** brace expansion (`{a,b}`, `{1..3}`; `{}` and `@{u}` are literal), arithmetic (`$((`, `$[`, `(( ))`), arrays, other parameter forms (`${X:=y}`, `${!X}`, `${X/a/b}`), `function name` definitions, unquoted heredocs whose body expands, and scripts that expand to more than a few hundred commands. `cloudWrites: "allow"` also approves non-destructive cloud changes.
 
+#### Harness tools approved by default
+
+Under the permissive profile, a harness tool that is not a shell, file, patch or MCP tool is approved without a prompt or classification: task control (`TaskStop`, `TaskOutput`), scheduling the session's own wakeup, listing agents, loading tool schemas, asking the user, plan mode, and tools a harness adds later. Shell, file and patch tools (`Bash`, `exec_command`, `Read`, `Write`, `Edit`, `apply_patch`, `Grep`, `Glob`, `view_image`, and `Monitor`, which runs a command) always get the engine's checks, and MCP tools follow `mcpReadOnly`. The strict profile approves none of them by default.
+
+`toolsDeny` keeps chosen tools on today's path, an AI classification for each call: `{ "claude": ["SendMessage", "WebFetch"], "codex": [], "copilot": [] }`, exact names, at most 100 per harness. An unknown harness, a non-list, or a name that is not a tool name makes the profile invalid (strict). The built-in deny list is empty.
+
+Each default approval's audit `decision` record carries `defaultTool` with the tool name. `review-classifications` lists these tools newest first by when each was first seen, so a tool a harness newly added is noticed and can be put in `toolsDeny`.
+
 #### MCP read-only tools
 
 `mcpReadOnly` lists MCP tools that run without a prompt, in any `mode`. Each entry is an exact `mcp__<server>__<tool>` name, or a name whose tool segment ends in `*` (`mcp__docs__search_*`). Neither segment may contain `__`, and a wildcard approves only a tool whose whole tool segment (after `mcp__<server>__`) is free of `__`, so it cannot reach another server such as `github__get`. Whole-server wildcards (`mcp__github__*`), regular expressions and other tool names are rejected, and the list holds at most 200 entries of 128 characters. List only tools that cannot change anything and cannot return credentials: the tool name is all the engine checks, not the arguments. Prefer exact names. A prefix also covers tools that a server adds later, and read-looking prefixes can include secret readers: the GitHub server's `get_*` and `list_*` cover its secret-scanning alert tools, which return the detected secret.
@@ -210,7 +231,7 @@ A listed tool is approved. Any other MCP tool gets no decision from the policy m
 
 Measure a profile against real usage with `policy-manager replay ~/.claude/projects --profile policy.json`: it replays the Bash commands recorded in Claude Code transcripts through the evaluator (nothing is executed) and prints the approval rate with and without the profile, plus the most common reasons that still need a human. Reports include short command excerpts, so keep them local.
 
-Protected names (`.claude`, `.agent-config`, `AGENTS.md`, ...) are judged relative to the repository root, so a linked worktree under `<repo>/.claude/worktrees/<name>` is ordinary code while `<worktree>/.claude/settings.json` stays protected. `git config` is limited to a short allowlist of local, non-executable keys; hooks, aliases, credential helpers, URLs and `--global` always need a human. Read-only cloud verbs (`list`, `show`, `describe`, `get-*`) and `az boards query` (a WIQL read) are approved beyond the exact catalog unless the arguments name credentials or override the endpoint.
+Protected names (`.claude`, `.agent-config`, `AGENTS.md`, ...) are judged relative to the repository root, so a linked worktree under `<repo>/.claude/worktrees/<name>` is ordinary code while `<worktree>/.claude/settings.json` stays protected. `git config` is limited to a short allowlist of local, non-executable keys; hooks, aliases, credential helpers, URLs and `--global` always need a human. For `--session`, a single shell command's scope comes from every word that could name a file it touches: non-option arguments, `--option=value` and `-oVALUE` values, and redirect targets (`>`, `>>`, `<`), so `printf x >> .agent-config/README.md` and `tee -a .agent-config/a` are covered like a patch, while a command that also names `AGENTS.md` or `.claude` is not. A variable assigned a single-quoted literal that is not one plain word (`Q='query($t: ID!)'`) is known only inside double quotes, so `gh api graphql -f query="$Q"` is judged on its value; an unquoted `$Q` stays unknown. Read-only cloud verbs (`list`, `show`, `describe`, `get-*`) and `az boards query` (a WIQL read) are approved beyond the exact catalog unless the arguments name credentials or override the endpoint.
 
 `git worktree remove --force <path>` is approved when `<path>` is a linked worktree of the repository (listed by `git worktree list`, never the main worktree), resolves strictly inside a `scratchRoots` entry or the system temp directory, lies outside the main checkout, and holds no other worktree; exactly one `-f`/`--force` may be given (a second one also removes a locked worktree), and not after a command that can create symlinks. A worktree under the main checkout (`.worktrees/x`) still needs a human. `git worktree prune` with only `-n`/`-v` is approved: it drops records of worktrees whose directories are already gone.
 

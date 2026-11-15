@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { approveCommand, hookResponse, looksLikeApproveGrant } from "../src/adapters.js";
+import {
+  approveCommand,
+  approveLastCommand,
+  hookResponse,
+  looksLikeApproveGrant,
+} from "../src/adapters.js";
 import { HUMAN_PATTERN, PROTECTED_PATH } from "../src/grants.js";
 import { parseProfile, strictProfile } from "../src/profile.js";
 import { APPROVE_GUARD, GrantError, PolicySession } from "../src/session.js";
@@ -314,16 +319,45 @@ describe("Codex deny message", () => {
         context,
       ).hookSpecificOutput as { permissionDecisionReason: string }
     ).permissionDecisionReason;
-  test("names the exact approve command, once by default", () => {
-    const text = reason(false);
-    expect(text).toContain(approveCommand("codex", "f".repeat(64), context));
-    expect(text).toContain("To allow it once");
-    expect(text).toContain("retry the same request unchanged");
-    expect(text).not.toContain("--session");
-    expect(text).not.toMatch(/policy profile/i);
+  test("leads with the wait, puts the command on its own line, and tells the agent to stop", () => {
+    const lines = reason(false).split("\n");
+    expect(lines[0]).toBe(`⏸ Waiting for your approval. Not run: ${PROTECTED_PATH}.`);
+    expect(lines[1]).toBe('Run in your own terminal, then say "retry":');
+    expect(lines[2]).toBe('  node "/opt/pm/dist/cli.js" approve --last');
+    expect(lines[3]).toMatch(/^Agent: stop now and end your turn/);
+    expect(lines.at(-1)).toBe(`Request ${"f".repeat(64)}.`);
+    expect(reason(false)).not.toContain("--session");
+    expect(reason(false)).not.toMatch(/policy profile/i);
   });
-  test("offers --session when the rule has a session scope", () => {
-    expect(reason(true)).toContain("--session");
+  test("offers --session with the scope it covers", () => {
+    const text = (
+      hookResponse(
+        "codex",
+        "PreToolUse",
+        {
+          decision: "human",
+          category: "sensitive",
+          reason: PROTECTED_PATH,
+          requestHash: "f".repeat(64),
+          cache: "none",
+          cached: false,
+          sessionGrantable: true,
+          sessionScopeLabel: "writes under /w/.agent-config",
+        },
+        context,
+      ).hookSpecificOutput as { permissionDecisionReason: string }
+    ).permissionDecisionReason;
+    expect(text).toContain(
+      "Add --session to also allow writes under /w/.agent-config for the rest of this session.",
+    );
+  });
+  test("uses pm when the launcher is installed and on PATH", () => {
+    expect(approveLastCommand({ ...context, pmOnPath: true })).toBe("pm approve --last");
+  });
+  test("keeps the exact approve form for one request", () => {
+    expect(approveCommand("codex", "f".repeat(64), context)).toBe(
+      `node "/opt/pm/dist/cli.js" approve codex s1 ${"f".repeat(64)}`,
+    );
   });
   test("a Windows CLI path is written with forward slashes", () => {
     expect(approveCommand("codex", "a", { cliPath: "D:\\pm\\cli.js", sessionId: "s1" })).toBe(

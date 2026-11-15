@@ -49,6 +49,11 @@ export interface ClassificationReview {
   reclassified: ClassifiedRequest[];
   /** Requests the AI denied and later approved. */
   deniedThenApproved: ClassifiedRequest[];
+  /**
+   * Harness tools approved by default (not shell, file, patch or MCP tools), newest first by when
+   * each was first seen, so a tool a harness newly added is noticed and can go into toolsDeny.
+   */
+  defaultTools: Array<{ tool: string; firstSeen: string; count: number }>;
 }
 
 const BUCKETS: Array<[string, number, number]> = [
@@ -86,6 +91,7 @@ export async function reviewClassifications(
   since?: string,
 ): Promise<ClassificationReview> {
   const requests: ClassifiedRequest[] = [];
+  const defaultTools = new Map<string, { tool: string; firstSeen: string; count: number }>();
   let sessions = 0;
   for (const directory of directories) {
     const records: AuditRecord[] = [];
@@ -124,6 +130,15 @@ export async function reviewClassifications(
     };
     for (const record of records) {
       const a = record.attributes;
+      const tool = text(a.defaultTool);
+      if (record.eventName === "decision" && tool) {
+        const seen = defaultTools.get(tool);
+        if (!seen) defaultTools.set(tool, { tool, firstSeen: record.timestamp, count: 1 });
+        else {
+          seen.count++;
+          if (record.timestamp < seen.firstSeen) seen.firstSeen = record.timestamp;
+        }
+      }
       // Only requests that entered the classification flow are reviewed.
       if (record.eventName !== "classification-requested" && !byRequest.has(record.requestId ?? ""))
         continue;
@@ -186,6 +201,7 @@ export async function reviewClassifications(
     fallbackReasons[key] = (fallbackReasons[key] ?? 0) + 1;
   }
   return {
+    defaultTools: [...defaultTools.values()].sort((x, y) => y.firstSeen.localeCompare(x.firstSeen)),
     sessions,
     requested: requests.length,
     approved: approved.length,
@@ -259,6 +275,9 @@ export function formatReview(review: ClassificationReview): string {
     "",
     `Commands a person later denied (${review.humanDenied.length}):`,
     ...review.humanDenied.map(row),
+    "",
+    `Harness tools approved by default, newest first (${review.defaultTools.length}):`,
+    ...review.defaultTools.map((t) => `  ${t.tool}  first seen ${t.firstSeen}  ${t.count}x`),
     "",
     `All AI-approved commands (${review.aiApproved.length}):`,
     ...review.aiApproved.map(row),

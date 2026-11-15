@@ -127,6 +127,16 @@ function replace(target: State, source: State): void {
 
 const isKnown = (values: string[] | null | undefined): values is string[] =>
   !!values?.length && values.every((v) => SIMPLE_VALUE.test(v));
+/** The one literal value of a variable, usable only inside double quotes. */
+function literalValue(values: string[] | null | undefined): string | undefined {
+  const value = values?.length === 1 ? values[0] : undefined;
+  return value !== undefined &&
+    value.length <= 4096 &&
+    !value.includes("\0") &&
+    !value.includes(SUBSTITUTION)
+    ? value
+    : undefined;
+}
 
 /**
  * Environment variables whose value is harmless to print or pass on. Any other variable the script
@@ -270,6 +280,9 @@ function instantiate(
         loose ||= !part.quoted;
       }
     } else if (known.has(part.name)) text += applyParamOp(env[part.name] ?? "", part.op);
+    else if (part.quoted && !part.op && literalValue(state?.vars.get(part.name)) !== undefined)
+      // Inside double quotes a literal value is one word with no further expansion.
+      text += literalValue(state?.vars.get(part.name));
     else {
       text += SUBSTITUTION;
       // "$@" is one word per parameter even when quoted.
@@ -368,7 +381,10 @@ const SPECIAL_BUILTINS = new Set([
  * The variable `printf -v` or zsh `print -v` stores into: `-v NAME` or `-vNAME`. A cluster that
  * contains `v` in any other form (`-rv`, `-vr`), or a computed option or name, is unreadable.
  */
-function printTargets(args: Array<string | undefined>): { names: string[]; unreadable: boolean } {
+function printTargets(args: Array<string | undefined>): {
+  names: string[];
+  unreadable: boolean;
+} {
   const names: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -515,7 +531,11 @@ function splitAssignment(word: Word): { name: string; value: Word } | undefined 
   if (eq < 0) return undefined;
   return {
     name,
-    value: { ...word, parts: [first.slice(eq + 1), ...word.parts.slice(1)], subs: [] },
+    value: {
+      ...word,
+      parts: [first.slice(eq + 1), ...word.parts.slice(1)],
+      subs: [],
+    },
   };
 }
 
@@ -699,6 +719,13 @@ function runSimple(
           continue;
         }
       }
+      // A single literal value that is not one plain word (`Q='query($t: ID!)'`) is kept for
+      // double-quoted use only: isKnown rejects it, so an unquoted `$Q` stays unknown.
+      const set = [...new Set(texts)];
+      if (set.length === 1 && literalValue(set) !== undefined) {
+        state.vars.set(a.name, set);
+        continue;
+      }
       state.vars.set(a.name, null);
     }
     ctx.box.last = result(request, "code-read", "Variable assignment", true);
@@ -768,7 +795,10 @@ function runSimple(
 
 /** In a loop, a pipeline or a background job, a later command can run first. */
 function fillFor(ctx: Ctx, piped: boolean): Fill {
-  return { script: ctx.box.script, reorder: ctx.loop > 0 || piped || !!ctx.reorder };
+  return {
+    script: ctx.box.script,
+    reorder: ctx.loop > 0 || piped || !!ctx.reorder,
+  };
 }
 
 /**
@@ -1691,11 +1721,18 @@ export function commandDecision(
     loop: 0,
     calls: 0,
     positional: !/argv/.test(command),
-    box: { calls: 0, script: fill?.script ?? { tainted: false, approved: false, jobs: 0 } },
+    box: {
+      calls: 0,
+      script: fill?.script ?? { tainted: false, approved: false, jobs: 0 },
+    },
     ...(fill?.reorder ? { reorder: true } : {}),
   };
   const opening = script.items[0];
   if (depth === 0 && opening && !opening.background) ctx.box.first = opening.node.first;
-  const refusal = runList(ctx, script, { cwds: [...start], vars: new Map(), funcs: new Map() });
+  const refusal = runList(ctx, script, {
+    cwds: [...start],
+    vars: new Map(),
+    funcs: new Map(),
+  });
   return refusal ?? ctx.box.last ?? human(request, "unknown", "Empty command");
 }

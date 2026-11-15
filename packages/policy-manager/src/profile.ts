@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { canonical, git } from "./evidence.js";
+import { TOOL_NAME } from "./tools.js";
 
 /**
  * A profile is policy *data*. The engine's checks (protected paths, secret retrieval, verified
@@ -22,6 +23,11 @@ export interface Profile {
    * last segment ends in `*` (`mcp__github__get_*`). Unlisted MCP tools are left to the harness.
    */
   mcpReadOnly: string[];
+  /**
+   * Harness tools, per harness, that are not approved by default and keep the classification
+   * path. Every other harness tool that is not a shell, file, patch or MCP tool is approved.
+   */
+  toolsDeny: { claude: string[]; codex: string[]; copilot: string[] };
   /** SHA-256 of the file the profile came from, for the audit log. */
   digest?: string;
 }
@@ -32,6 +38,7 @@ export const strictProfile: Profile = {
   humanPatterns: [],
   scratchRoots: [],
   mcpReadOnly: [],
+  toolsDeny: { claude: [], codex: [], copilot: [] },
 };
 
 export const MAX_MCP_READ_ONLY = 200;
@@ -51,6 +58,26 @@ export function mcpReadOnly(profile: Profile, tool: string): boolean {
     const server = entry.slice(0, entry.lastIndexOf("__") + 2);
     return tool.startsWith(entry.slice(0, -1)) && !tool.slice(server.length).includes("__");
   });
+}
+
+export const MAX_TOOLS_DENY = 100;
+function parseToolsDeny(raw: unknown): Profile["toolsDeny"] {
+  const result: Profile["toolsDeny"] = { claude: [], codex: [], copilot: [] };
+  if (raw === undefined) return result;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    throw new ProfileError("toolsDeny must be an object of per-harness tool name lists");
+  for (const [harness, names] of Object.entries(raw)) {
+    if (!(harness in result))
+      throw new ProfileError(`toolsDeny has an unknown harness: ${harness}`);
+    if (
+      !Array.isArray(names) ||
+      names.length > MAX_TOOLS_DENY ||
+      names.some((name) => typeof name !== "string" || !TOOL_NAME.test(name))
+    )
+      throw new ProfileError(`toolsDeny.${harness} must list at most ${MAX_TOOLS_DENY} tool names`);
+    result[harness as keyof typeof result] = [...new Set(names as string[])];
+  }
+  return result;
 }
 
 export function defaultProfilePath(): string {
@@ -99,6 +126,7 @@ export function parseProfile(text: string): Profile {
     "humanPatterns",
     "scratchRoots",
     "mcpReadOnly",
+    "toolsDeny",
     "description",
   ]);
   for (const key of Object.keys(value))
@@ -124,6 +152,7 @@ export function parseProfile(text: string): Profile {
     throw new ProfileError(
       `mcpReadOnly must list at most ${MAX_MCP_READ_ONLY} names like mcp__server__tool, optionally ending in *`,
     );
+  const toolsDeny = parseToolsDeny(value.toolsDeny);
   let humanPatterns: RegExp[];
   try {
     humanPatterns = (patterns as string[]).map((p) => new RegExp(p));
@@ -144,6 +173,7 @@ export function parseProfile(text: string): Profile {
     humanPatterns,
     scratchRoots: value.mode === "permissive" ? [...scratchRoots] : [],
     mcpReadOnly: [...new Set(mcp as string[])],
+    toolsDeny,
     digest: createHash("sha256").update(text).digest("hex"),
   };
 }
