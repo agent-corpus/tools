@@ -81,6 +81,8 @@ interface Ctx {
     created?: Set<string>;
     /** Whether a symlink may exist that the hook could not see (see `Fill`). */
     script: Fill["script"];
+    /** Listed credential helpers the script runs, for the audit record. */
+    helpers?: Set<string>;
   };
 }
 
@@ -741,7 +743,12 @@ function runSimple(
       const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd, fill);
       if (decision.decision !== "approve") return decision;
       ctx.box.last = decision;
-      if (!symlinkFree(unwrap(command.argv).argv)) {
+      if (decision.credentialHelpers?.length) {
+        ctx.box.helpers ??= new Set();
+        for (const helper of decision.credentialHelpers) ctx.box.helpers.add(helper);
+      }
+      // A listed credential helper only reads a secret and talks to its service.
+      if (!decision.credentialHelpers?.length && !symlinkFree(unwrap(command.argv).argv)) {
         if (ctx.box.script.approved)
           return human(
             request,
@@ -1734,5 +1741,9 @@ export function commandDecision(
     vars: new Map(),
     funcs: new Map(),
   });
-  return refusal ?? ctx.box.last ?? human(request, "unknown", "Empty command");
+  if (refusal) return refusal;
+  const last = ctx.box.last ?? human(request, "unknown", "Empty command");
+  return ctx.box.helpers?.size && last.decision === "approve"
+    ? { ...last, credentialHelpers: [...ctx.box.helpers] }
+    : last;
 }

@@ -18,6 +18,7 @@ import {
   tempWrite,
 } from "./evidence.js";
 import { commandDecision } from "./flow.js";
+import { helperMatch } from "./helpers.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -1737,6 +1738,32 @@ export function simpleDecision(
     return human(request, "unknown", "wait with options requires human review");
   if (program === "set" && !args.every((word) => /^[-+][B-Za-z]+$|^pipefail$/.test(word)))
     return human(request, "unknown", "Changing shell settings requires human review");
+  // A listed credential helper reads a secret for one narrow job. It runs only as committed on the
+  // default branch, with an accepted argument shape, and with nothing changing its environment.
+  const helper = helperMatch(profile.credentialHelpers, cwd, argv);
+  if (helper.kind === "refused") return human(request, "sensitive", helper.reason);
+  if (helper.kind === "match") {
+    if (
+      stageIndex > 0 ||
+      command.stdin !== undefined ||
+      command.env.length > 0 ||
+      unwrapped.env.length > 0 ||
+      argv.length !== command.argv.length
+    )
+      return human(
+        request,
+        "sensitive",
+        "A credential helper with a changed environment or input requires a person",
+      );
+    for (const file of helper.files) {
+      const check = permissiveRead(cwd, file);
+      if (!check.allowed) return human(request, check.category, check.reason);
+    }
+    return {
+      ...result(request, "impactful-write", "Listed credential helper", true),
+      credentialHelpers: [`${helper.helper.path}#${helper.shape}`],
+    };
+  }
   if (SHELLS.has(program) || INTERPRETERS.has(program)) {
     if (stageIndex > 0)
       return human(request, "unknown", "Piping into a shell or interpreter requires human review");

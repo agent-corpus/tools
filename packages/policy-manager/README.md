@@ -215,6 +215,31 @@ Under the permissive profile, a harness tool that is not a shell, file, patch or
 
 Each default approval's audit `decision` record carries `defaultTool` with the tool name. `review-classifications` lists these tools newest first by when each was first seen, so a tool a harness newly added is noticed and can be put in `toolsDeny`.
 
+#### Credential helpers
+
+Reading a credential always goes to a person, except through a script listed in `credentialHelpers` (permissive profile only). A helper reads a secret for one narrow job, such as posting a review as a GitHub App:
+
+```json
+"credentialHelpers": [
+  {
+    "path": ".agent-config/skills/code-review/app-auth.mjs",
+    "args": [
+      ["--repo", "<repo>", "check"],
+      ["--repo", "<repo>", "gh", "api", "repos/<repo>/pulls/<int>/reviews", "--input", "<file>"],
+      ["--repo", "<repo>", "gh", "pr", "review", "<int>", "-R", "<repo>", ["--approve", "--comment"], "--body-file", "<file>"]
+    ]
+  }
+]
+```
+
+`node <script> <args>` is approved, and named in the audit `decision` record as `credentialHelpers: ["<path>#<shape index>"]`, only when all of these hold:
+
+- The script, however it is named (relative, absolute, from another directory), is the regular file at `<checkout>/<path>` with no symlink on the way, tracked, and identical to the committed file on the default branch of `origin` (`origin/HEAD`, else `origin/main`). A local edit makes it a different script.
+- The arguments match one listed shape exactly, word for word. A token is a literal, a list of literal alternatives, or a word with placeholders: `<repo>` (`owner/name`), `<int>`, `<sha>` (7 to 40 hex digits), `<word>` (letters, digits, `_.-`), `<url>` (a `https://github.com/` URL), `<file>` (any path; it gets the usual read check), or `<text>` (any one argument, only as a whole word). Profiles hold no regular expressions.
+- No environment prefix, wrapper (`env`, `command`), standard input or pipe into it.
+
+Every other command in the same script is judged as usual. A script with a listed file name that fails any check (changed, untracked, outside a checkout, a symlink, other arguments) goes to a person as a credential read. A listed helper counts as creating no symlink, so a later temp write in the same script stays approvable. An entry's path must be repository-relative with `/` separators and no `.` or `..` segments; the list holds at most 20 helpers of 50 shapes each, and an invalid entry makes the profile invalid (strict).
+
 #### MCP read-only tools
 
 `mcpReadOnly` lists MCP tools that run without a prompt, in any `mode`. Each entry is an exact `mcp__<server>__<tool>` name, or a name whose tool segment ends in `*` (`mcp__docs__search_*`). Neither segment may contain `__`, and a wildcard approves only a tool whose whole tool segment (after `mcp__<server>__`) is free of `__`, so it cannot reach another server such as `github__get`. Whole-server wildcards (`mcp__github__*`), regular expressions and other tool names are rejected, and the list holds at most 200 entries of 128 characters. List only tools that cannot change anything and cannot return credentials: the tool name is all the engine checks, not the arguments. Prefer exact names. A prefix also covers tools that a server adds later, and read-looking prefixes can include secret readers: the GitHub server's `get_*` and `list_*` cover its secret-scanning alert tools, which return the detected secret.

@@ -53,6 +53,8 @@ export interface Decision {
   sessionScopeLabel?: string;
   /** A harness tool approved by default (not a shell, file, patch or MCP tool), by name. */
   defaultTool?: string;
+  /** Listed credential helpers this request runs, as `<path>#<shape index>`. */
+  credentialHelpers?: string[];
   /** The agent tried to approve a request itself: no approval instruction is offered for it. */
   userOnly?: boolean;
 }
