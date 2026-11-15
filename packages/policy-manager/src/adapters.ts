@@ -223,8 +223,12 @@ export function hookResponse(
   // ambiguous request (needsClassification) is classified, and a retry then sees the approval.
   // Codex's own approval prompt (PermissionRequest, above) still handles the requests it asks about.
   if (harness === "codex") {
+    // An ambiguous request reaches here unclassified only when the classification block is off
+    // (a hard-list item): it gets the approve command, not an invitation to classify.
     const classify =
-      decision.needsClassification === true && decision.classification !== "fallback";
+      decision.needsClassification === true &&
+      decision.tier !== "ambiguous" &&
+      decision.classification !== "fallback";
     const reason =
       !classify && !decision.userOnly
         ? approveInstruction(decision, context)

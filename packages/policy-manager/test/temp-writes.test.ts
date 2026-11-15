@@ -657,7 +657,7 @@ describe("temp-write classification", () => {
   test("the classifier may answer temp-write and it approves", () => {
     const dir = join(root, "session");
     mkdirSync(dir, { mode: 0o700 });
-    const s = new PolicySession(dir, "claude", "t", permissive);
+    const s = new PolicySession(dir, "claude", "t", { ...permissive, classify: true });
     const r: Request = {
       sessionId: "t",
       harness: "claude",

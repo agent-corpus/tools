@@ -333,7 +333,9 @@ export class PolicySession {
           this.remember(requestHash, { ai });
         }
       }
-      if (decision.needsClassification && !ai && phase === "PreToolUse") {
+      // The block that asks for a classification is opt-in: without it, an ambiguous request is
+      // left to the harness (or asks, on the hard list). A recorded classification still applies.
+      if (decision.needsClassification && !ai && phase === "PreToolUse" && this.profile.classify) {
         if (!known?.requested) {
           this.remember(requestHash, { requested: true });
           audit(this.directory, {

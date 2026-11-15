@@ -239,6 +239,62 @@ describe("profile alwaysAsk", () => {
   });
 });
 
+describe("classification block is opt-in", () => {
+  test("off by default: an ambiguous request defers with no block and no request to classify", async () => {
+    expect(permissive.classify).toBe(false);
+    const { directory, s } = session();
+    const r = shell("echo $UNSET_VALUE");
+    const d = s.review(r, undefined, "PreToolUse");
+    expect(d).toMatchObject({ decision: "native", tier: "ambiguous" });
+    expect(d.classification).toBeUndefined();
+    expect(hookResponse("claude", "PreToolUse", d)).toEqual({});
+    expect(hookOutput("codex", "PreToolUse", d)).toBe("");
+    const records = (await new AuditLog(directory).query({ limit: 1000 })).records;
+    expect(records.some((record) => record.eventName === "classification-requested")).toBe(false);
+  });
+
+  test("off, a recorded classification still approves the retry", () => {
+    const { s } = session();
+    const r = shell("echo $RECORDED_VALUE");
+    const first = s.review(r, undefined, "PreToolUse");
+    expect(first.decision).toBe("native");
+    const classified = s.classify({
+      requestHash: first.requestHash,
+      category: "code-read",
+      confidence: 0.99,
+      recoverable: true,
+    });
+    expect(classified.decision).toBe("approve");
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
+  });
+
+  test("off, an unparsed hard-list command asks at once; Codex gets the approve command", () => {
+    const r = shell("git push -f origin {feat/a,x}");
+    const { s } = session();
+    expect(s.review(r, undefined, "PreToolUse")).toMatchObject({
+      decision: "human",
+      alwaysAsk: "force-push",
+    });
+    const codex = session(permissive, "codex").s;
+    const d = codex.review({ ...r, harness: "codex" }, undefined, "PreToolUse");
+    const text = JSON.stringify(hookResponse("codex", "PreToolUse", d));
+    expect(text).toContain("approve --last");
+    expect(text).not.toContain("Classify it");
+  });
+
+  test("on: the first PreToolUse is a classification block", () => {
+    const { s } = session({ ...permissive, classify: true });
+    const d = s.review(shell("echo $BLOCKED_VALUE"), undefined, "PreToolUse");
+    expect(d).toMatchObject({ decision: "deny", classification: "requested" });
+  });
+
+  test.each([["yes"], [1], [null]])("classify %j is invalid", (value) =>
+    expect(() =>
+      parseProfile(JSON.stringify({ version: 1, mode: "permissive", classify: value })),
+    ).toThrow(ProfileError),
+  );
+});
+
 describe("replay", () => {
   test("splits escalations into native deferrals and hard-list asks", () => {
     const file = join(root, "transcript.jsonl");
@@ -258,7 +314,20 @@ describe("replay", () => {
       ].join("\n"),
     );
     const report = replayTranscripts([file], permissive);
-    expect(report).toMatchObject({ commands: 5, approved: 1, deferred: 2, stillAsk: 2 });
+    expect(report).toMatchObject({
+      commands: 5,
+      approved: 1,
+      deferred: 2,
+      classificationBlocks: 0,
+      stillAsk: 2,
+    });
     expect(report.askReasons.map((row) => row.rule).sort()).toEqual(["force-push", "git-clean"]);
+    // With classify on, the ambiguous `echo $ONE` is a classification block instead.
+    expect(replayTranscripts([file], { ...permissive, classify: true })).toMatchObject({
+      approved: 1,
+      deferred: 1,
+      classificationBlocks: 1,
+      stillAsk: 2,
+    });
   });
 });

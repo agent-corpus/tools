@@ -106,9 +106,13 @@ test("the hook's record command is approved, and the retry of the original then 
   const config = mkdtempSync(join(tmpdir(), "pm-config-"));
   const profileDirectory = join(config, "agent-corpus", "policy-manager");
   mkdirSync(profileDirectory, { recursive: true });
-  writeFileSync(join(profileDirectory, "policy.json"), '{"version":1,"mode":"permissive"}', {
-    mode: 0o600,
-  });
+  writeFileSync(
+    join(profileDirectory, "policy.json"),
+    '{"version":1,"mode":"permissive","classify":true}',
+    {
+      mode: 0o600,
+    },
+  );
   const env = { ...process.env, XDG_CONFIG_HOME: config };
   const hook = (command: string, description: string) =>
     JSON.parse(

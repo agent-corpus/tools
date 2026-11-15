@@ -16,7 +16,12 @@ import { MAX_AI_APPROVALS, PolicySession } from "../src/session.js";
 import type { Classification, Request } from "../src/types.js";
 
 const permissive = parseProfile(
-  JSON.stringify({ version: 1, mode: "permissive", humanPatterns: ["^terraform apply"] }),
+  JSON.stringify({
+    version: 1,
+    mode: "permissive",
+    humanPatterns: ["^terraform apply"],
+    classify: true,
+  }),
 );
 let root: string, work: string;
 let counter = 0;

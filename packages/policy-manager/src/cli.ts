@@ -138,7 +138,10 @@ try {
       for (const example of row.examples) console.log(`\t  ${example}`);
     }
     console.log(
-      `Never stricter than native: ${report.deferred} of ${humans} escalations defer to the harness's own permission flow; ${report.stillAsk} still ask under alwaysAsk`,
+      `Never stricter than native: ${report.deferred} of ${humans} escalations defer to the harness's own permission flow; ${report.classificationBlocks} are blocked for classification (classify ${profile.classify ? "on" : "off"}); ${report.stillAsk} still ask under alwaysAsk`,
+    );
+    console.log(
+      `First hook response: no policy-manager block ${report.approved + report.deferred} (approve ${report.approved} + native ${report.deferred}); classification block ${report.classificationBlocks}; ask ${report.stillAsk}`,
     );
     for (const row of report.askReasons.slice(0, 10)) {
       console.log(`${row.count}\t[${row.rule}] ${row.reason}`);
@@ -254,7 +257,16 @@ try {
     } else {
       const directory = await start(harness, request.sessionId, cliPath);
       if (phase === "SessionStart") {
-        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. An ambiguous request is blocked once with instructions to have the policy-manager agent classify it and then retry; if classification fails, the harness's own permission flow decides. Only a short hard list (force pushes, deleting unmerged work, harness settings and the policy profile) is always put to the user. ${HUMAN_REVIEW_PRINCIPLE} If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent. Never ask an agent to approve its own tools.`;
+        let classify = false;
+        try {
+          classify = loadProfile().classify;
+        } catch {
+          /* The service runs strict on an invalid profile, and strict does not classify. */
+        }
+        const flow = classify
+          ? `An ambiguous request is blocked once with instructions to have the policy-manager agent classify it and then retry; if classification fails, the harness's own permission flow decides. ${HUMAN_REVIEW_PRINCIPLE} If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent.`
+          : "A request the policy cannot approve is left to the harness's own permission flow; there are no classification blocks.";
+        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. ${flow} Only a short hard list (force pushes, deleting unmerged work, harness settings and the policy profile) is always put to the user. Never ask an agent to approve its own tools.`;
         console.log(
           JSON.stringify(
             harness === "copilot"

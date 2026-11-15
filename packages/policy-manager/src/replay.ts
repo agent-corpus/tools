@@ -14,6 +14,8 @@ export interface ReplayReport {
   reasons: Array<{ reason: string; count: number; examples: string[] }>;
   /** Escalations a session now leaves to the harness's native permission flow (no hook decision). */
   deferred: number;
+  /** Ambiguous requests first blocked for classification (only with the profile's `classify`). */
+  classificationBlocks: number;
   /** Escalations on the profile's `alwaysAsk` hard list, which still ask a person. */
   stillAsk: number;
   /** Hard-list escalations by reason, with the rule id or category each matched. */
@@ -49,6 +51,7 @@ export function replayTranscripts(paths: string[], profile: Profile, files = 50)
     classified: 0,
     reasons: [],
     deferred: 0,
+    classificationBlocks: 0,
     stillAsk: 0,
     askReasons: [],
   };
@@ -93,12 +96,13 @@ export function replayTranscripts(paths: string[], profile: Profile, files = 50)
         if (bucket.examples.length < 3)
           bucket.examples.push(command.split("\n")[0]?.slice(0, 100) ?? "");
         reasons.set(decision.reason, bucket);
-        // An ambiguous request that is not classified falls back the same way a human one does.
-        const rule =
-          decision.decision === "human"
-            ? stillAsks(request, decision, profile.alwaysAsk)
-            : undefined;
         if (decision.decision !== "human") continue;
+        // With `classify` on, an ambiguous request is first blocked for classification.
+        if (decision.tier === "ambiguous" && profile.classify) {
+          report.classificationBlocks++;
+          continue;
+        }
+        const rule = stillAsks(request, decision, profile.alwaysAsk);
         if (!rule) report.deferred++;
         else {
           report.stillAsk++;

@@ -37,6 +37,11 @@ export interface Profile {
    * harness's native permission flow. Rule ids from ALWAYS_ASK_RULES or decision categories.
    */
   alwaysAsk: string[];
+  /**
+   * Block an ambiguous request once on PreToolUse and ask the session's classifier (opt-in).
+   * Off, an ambiguous request is left to the harness's native flow; records are still accepted.
+   */
+  classify: boolean;
   /** SHA-256 of the file the profile came from, for the audit log. */
   digest?: string;
 }
@@ -50,6 +55,7 @@ export const strictProfile: Profile = {
   toolsDeny: { claude: [], codex: [], copilot: [] },
   credentialHelpers: [],
   alwaysAsk: [...ALWAYS_ASK_RULES],
+  classify: false,
 };
 
 export const MAX_ALWAYS_ASK = 50;
@@ -155,6 +161,7 @@ export function parseProfile(text: string): Profile {
     "toolsDeny",
     "credentialHelpers",
     "alwaysAsk",
+    "classify",
     "description",
   ]);
   for (const key of Object.keys(value))
@@ -182,6 +189,8 @@ export function parseProfile(text: string): Profile {
     );
   const toolsDeny = parseToolsDeny(value.toolsDeny);
   const alwaysAsk = parseAlwaysAsk(value.alwaysAsk);
+  const classify = value.classify === undefined ? false : value.classify;
+  if (typeof classify !== "boolean") throw new ProfileError("classify must be true or false");
   let credentialHelpers: CredentialHelper[];
   try {
     credentialHelpers = parseCredentialHelpers(value.credentialHelpers);
@@ -212,6 +221,7 @@ export function parseProfile(text: string): Profile {
     toolsDeny,
     credentialHelpers: value.mode === "permissive" ? credentialHelpers : [],
     alwaysAsk,
+    classify,
     digest: createHash("sha256").update(text).digest("hex"),
   };
 }

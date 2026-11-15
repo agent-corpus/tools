@@ -237,7 +237,7 @@ describe("files this session created", SLOW, () => {
   let n = 0;
   function session(id = `s${n++}`) {
     const directory = mkdtempSync(join(root, "audit-"));
-    return new PolicySession(directory, "claude", id, profile);
+    return new PolicySession(directory, "claude", id, { ...profile, classify: true });
   }
   const bash = (s: PolicySession, command: string, cwd = wt): Request => ({
     sessionId: s.sessionId,
