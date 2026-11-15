@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { hookOutput, hookResponse } from "../src/adapters.js";
-import { ALWAYS_ASK_RULES, DEFAULT_ALWAYS_ASK, deferToNative } from "../src/native.js";
+import { ALWAYS_ASK_RULES, DEFAULT_ALWAYS_ASK, deferToNative, stillAsks } from "../src/native.js";
 import { evaluate } from "../src/policy.js";
 import { defaultProfilePath, ProfileError, parseProfile, strictProfile } from "../src/profile.js";
 import { replayTranscripts } from "../src/replay.js";
@@ -35,6 +35,11 @@ beforeAll(() => {
   git(repo, "worktree", "add", join(root, "u"), "unmerged");
   git(join(root, "u"), "commit", "--allow-empty", "-m", "work");
   git(repo, "worktree", "remove", join(root, "u"));
+  // Repository aliases; linked worktrees share them.
+  git(repo, "config", "alias.pf", "push --force");
+  git(repo, "config", "alias.cl", "clean -fd");
+  git(repo, "config", "alias.shpf", "!git push -f origin feat/a");
+  git(repo, "config", "alias.st", "status");
 });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
@@ -278,6 +283,26 @@ describe("quoted, indirect and nested forms do not escape the hard list", () => 
     ["harness-settings", "tee ~/.copilot/hooks/x.json < /tmp/a"],
     ["harness-settings", "cd ~ && mv /tmp/a .claude.json"],
     ["policy-profile", "cd ~/.config/agent-corpus/policy-manager && echo '{}' > policy.json"],
+    // Commands the scanner reads as data but that still run: the plain-text reading catches them.
+    ["force-push", "echo 'git push -f origin x' | sh"],
+    ["force-push", "printf '%s\\n' 'git push --force origin x' | bash"],
+    ["force-push", "bash <(echo 'git push -f origin x')"],
+    ["force-push", "source <(echo 'git push -f origin x')"],
+    ["force-push", "find . -exec git push -f origin x ;"],
+    ["force-push", `node -e "require('child_process').execSync('git push -f origin x')"`],
+    ["force-push", `python3 -c "import os; os.system('git push -f origin x')"`],
+    ["force-push", "alias gp='git push --force'; gp origin x"],
+    ["force-push", "bash <<< 'git push --force origin x'"],
+    ["git-clean", "echo 'git clean -fdx' | sh"],
+    ["harness-settings", `python3 -c "open('/x/.claude/settings.json','w')"`],
+    // Push options known only at run time, or a configured forced push.
+    ["force-push", "git push $ARGS origin x"],
+    ["force-push", "git push ${F:- -f} origin x"],
+    ["force-push", "git push origin x $(echo -f)"],
+    ["force-push", "git push origin $B:+main"],
+    ["force-push", "F=-f; git push $F origin x"],
+    ["force-push", "git -c remote.origin.push=+refs/heads/*:refs/heads/* push origin"],
+    ["force-push", "git -c remote.origin.mirror=true push origin"],
   ];
   const profiles = [
     ["strict", strictProfile],
@@ -332,6 +357,60 @@ describe("a classification never approves a hard-list item", () => {
       expect(evaluate(r, ai, profile).decision).toBe("human");
       expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
     });
+});
+
+test("a long run of slashes in hook input is judged in linear time", () => {
+  const long = `/${"/".repeat(100_000)}x`;
+  const started = Date.now();
+  stillAsks(
+    shell(`echo ${long}/ > ${long}//`),
+    { ...evaluate(shell("ls"), undefined, permissive), decision: "human" },
+    [],
+  );
+  stillAsks(
+    write(`${long}/`),
+    { ...evaluate(shell("ls"), undefined, permissive), decision: "human" },
+    [],
+  );
+  expect(Date.now() - started).toBeLessThan(2000);
+});
+
+describe("git aliases are judged by what they run", () => {
+  const profiles = [
+    ["strict", strictProfile],
+    ["permissive", permissive],
+  ] as const;
+  for (const [mode, profile] of profiles) {
+    test.each([
+      ["force-push", "git pf origin feat/a"],
+      ["force-push", "git 'pf' origin feat/a"],
+      ["git-clean", "git cl"],
+      ["force-push", "git shpf"],
+    ])(`${mode}: %s through an alias: %s`, (rule, command) => {
+      const d = session(profile).s.review(shell(command), undefined, "PreToolUse");
+      expect(d, command).toMatchObject({ decision: "human", alwaysAsk: rule });
+    });
+
+    test(`${mode}: an unknown subcommand that is not an alias defers to the harness`, () => {
+      const d = session(profile).s.review(
+        shell("git frobnicate-nothing --force"),
+        undefined,
+        "PreToolUse",
+      );
+      expect(d.decision).not.toBe("approve");
+      const plain = session(profile).s.review(
+        shell("git frobnicate-nothing"),
+        undefined,
+        "PreToolUse",
+      );
+      expect(plain.decision).toBe("native");
+    });
+  }
+
+  test("an ordinary alias is approved as before", () => {
+    const d = session().s.review(shell("git st"), undefined, "PreToolUse");
+    expect(d.decision).toBe("approve");
+  });
 });
 
 describe("off-by-default rule ids", () => {

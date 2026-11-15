@@ -13,6 +13,8 @@ export interface Word {
   literal: boolean;
   /** The target of a redirection (`>`, `>>`, `<`, `<<<`, ...). */
   redirect?: boolean;
+  /** Holds an unquoted expansion or substitution, which can split into words and options. */
+  bare?: boolean;
 }
 
 export interface Scan {
@@ -26,6 +28,7 @@ interface Frame {
   text: string;
   active: boolean;
   literal: boolean;
+  bare: boolean;
   closer: ")" | "`";
   /** The substitution opened inside double quotes, which resume after it. */
   quoted: boolean;
@@ -38,16 +41,23 @@ export function scan(script: string): Scan {
   let text = "";
   let active = false;
   let literal = true;
+  let bare = false;
   let redirectNext = false;
   let quote: "" | "'" | '"' = "";
   const endWord = () => {
     if (active) {
-      segment.push({ text, literal, ...(redirectNext ? { redirect: true } : {}) });
+      segment.push({
+        text,
+        literal,
+        ...(redirectNext ? { redirect: true } : {}),
+        ...(bare ? { bare: true } : {}),
+      });
       redirectNext = false;
     }
     text = "";
     active = false;
     literal = true;
+    bare = false;
   };
   const endSegment = () => {
     endWord();
@@ -56,11 +66,20 @@ export function scan(script: string): Scan {
   };
   /** Opens a substitution: its body is read as commands, and the outer word is not literal. */
   const open = (closer: ")" | "`") => {
-    stack.push({ segment, text, active: true, literal: false, closer, quoted: quote === '"' });
+    stack.push({
+      segment,
+      text,
+      active: true,
+      literal: false,
+      bare: bare || quote !== '"',
+      closer,
+      quoted: quote === '"',
+    });
     segment = [];
     text = "";
     active = false;
     literal = true;
+    bare = false;
     quote = "";
   };
   const close = () => {
@@ -70,6 +89,7 @@ export function scan(script: string): Scan {
     text = `${frame.text}$`;
     active = frame.active;
     literal = frame.literal;
+    bare = frame.bare;
     quote = frame.quoted ? '"' : "";
   };
   for (let i = 0; i < script.length; i++) {
@@ -117,6 +137,7 @@ export function scan(script: string): Scan {
         open(")");
       } else {
         literal = false;
+        bare = true;
         active = true;
         text += c;
       }
@@ -124,6 +145,7 @@ export function scan(script: string): Scan {
     }
     if (c === "$") {
       literal = false;
+      bare = true;
       active = true;
       text += c;
       continue;
@@ -248,7 +270,9 @@ export function innerScript(cmd: Command): { script: string; literal: boolean } 
       literal: cmd.args.every((word) => word.literal),
     };
   if (!SHELLS.has(name)) return undefined;
-  const flag = cmd.args.findIndex((word) => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(word.text));
+  const flag = cmd.args.findIndex(
+    (word) => /^-[a-zA-Z]+$/.test(word.text) && word.text.includes("c"),
+  );
   if (flag < 0) return undefined;
   const body = cmd.args.slice(flag + 1).find((word) => !word.text.startsWith("-"));
   return body ? { script: body.text, literal: body.literal } : undefined;

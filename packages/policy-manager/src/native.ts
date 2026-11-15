@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { resolveWord, sensitive } from "./evidence.js";
+import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { defaultProfilePath } from "./profile.js";
 import { type Command, command, innerScript, scan, type Word } from "./shellscan.js";
 import {
@@ -66,22 +67,33 @@ const WRITE_TOOLS = new Set([
  */
 const HARNESS_SETTINGS = [
   // Claude Code: settings (permissions, hooks), hook scripts, and user MCP servers.
-  /(?<![\w-])\.claude\/+settings(?:\.local)?\.json$/i,
-  /(?<![\w-])\.claude\/+hooks(?:\/|$)/i,
+  /(?<![\w-])\.claude\/settings(?:\.local)?\.json$/i,
+  /(?<![\w-])\.claude\/hooks(?:\/|$)/i,
   /(?<![\w-])\.claude\.json$/i,
   // Codex: hooks, hook scripts and configuration (approval policy, sandbox, MCP servers).
-  /(?<![\w-])\.codex\/+(?:hooks\.json|config\.toml)$/i,
-  /(?<![\w-])\.codex\/+hooks(?:\/|$)/i,
+  /(?<![\w-])\.codex\/(?:hooks\.json|config\.toml)$/i,
+  /(?<![\w-])\.codex\/hooks(?:\/|$)/i,
   // Copilot: user hooks and configuration, and repository hooks.
-  /(?<![\w-])\.copilot\/+(?:config\.json|hooks(?:\/|$))/i,
-  /(?<![\w-])\.github\/+hooks(?:\/+[^/]*\.json)?$/i,
+  /(?<![\w-])\.copilot\/(?:config\.json|hooks(?:\/|$))/i,
+  /(?<![\w-])\.github\/hooks(?:\/[^/]*\.json)?$/i,
 ];
 /** File names a write in an unknown directory could be a harness setting through. */
 const SETTINGS_NAMES =
   /^(?:settings(?:\.local)?\.json|\.claude\.json|hooks\.json|config\.toml|config\.json|policy\.json|hooks)$/i;
-const PROFILE_NAME = /(?<![\w-])policy-manager\/+policy\.json$/i;
+const PROFILE_NAME = /(?<![\w-])policy-manager\/policy\.json$/i;
 
 const slashes = (path: string) => path.replace(/\\/g, "/");
+
+/**
+ * `path` with `/` separators, runs of separators collapsed and no trailing one. Done by splitting,
+ * not a regular expression, so a long run of slashes in hook input costs linear time.
+ */
+function normalize(path: string): string {
+  return slashes(path)
+    .split("/")
+    .filter((part, index) => part !== "" || index === 0)
+    .join("/");
+}
 
 /** Settings in a harness directory moved by an environment variable. */
 function configuredSettings(path: string): boolean {
@@ -103,7 +115,7 @@ function configuredSettings(path: string): boolean {
 
 /** The hard-list rules a path names. */
 function pathRules(path: string, rules: Set<Rule>, credentials: boolean): void {
-  const target = slashes(path).replace(/\/+$/, "");
+  const target = normalize(path);
   if (target === slashes(defaultProfilePath()) || PROFILE_NAME.test(target))
     rules.add("policy-profile");
   if (HARNESS_SETTINGS.some((pattern) => pattern.test(target)) || configuredSettings(target))
@@ -123,11 +135,6 @@ function resolutions(word: string, cwds: Set<string>): string[] {
   return found;
 }
 
-const KNOWN_GIT = new Set(
-  "add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-ref-format checkout cherry cherry-pick clean clone commit commit-tree config count-objects describe diff diff-files diff-index diff-tree difftool fetch filter-branch for-each-ref format-patch fsck gc grep hash-object help init log ls-files ls-remote ls-tree maintenance merge merge-base merge-file merge-tree mergetool mktag mktree mv interpret-trailers credential column bugreport request-pull send-email stage verify-pack verify-tag name-rev notes prune pull push range-diff read-tree rebase reflog remote repack replace rerere reset restore rev-list rev-parse revert rm shortlog show show-branch show-ref sparse-checkout stash status submodule switch symbolic-ref tag update-index update-ref var verify-commit version whatchanged worktree write-tree".split(
-    " ",
-  ),
-);
 /** Global options that take the next word as their value. */
 const GIT_VALUED = new Set([
   "-C",
@@ -301,12 +308,20 @@ function analyzeCommand(
     // `env GIT_DIR=...`, `GIT_CONFIG_*` and the like change what Git reads or runs.
     segment.some((word) => /^GIT_[A-Z_]*=/.test(word.text));
   let i = 0;
+  /** A `-c remote.*` or `push.*` setting can make a plain push forced or mirrored. */
+  let pushConfig = false;
   while (i < cmd.args.length && cmd.args[i]?.text.startsWith("-")) {
     const word = cmd.args[i] as Word;
     if (!word.literal || /^--exec-path/.test(word.text) || /^-c.*alias\./i.test(word.text))
       opaque = true;
+    if (/^-c(?:remote|push)\./i.test(word.text)) pushConfig = true;
     if (GIT_VALUED.has(word.text)) {
       const value = cmd.args[i + 1];
+      if (
+        (word.text === "-c" || word.text === "--config-env") &&
+        /^(?:remote|push)\./i.test(value?.text ?? "")
+      )
+        pushConfig = true;
       // A configuration value can define an alias; a directory (`-C $W`) cannot change what runs.
       if (
         (word.text === "-c" || word.text === "--config-env") &&
@@ -317,14 +332,66 @@ function analyzeCommand(
     } else i++;
   }
   const sub = cmd.args[i];
-  if (!sub || !sub.literal || !KNOWN_GIT.has(sub.text)) opaque = opaque || !!sub;
+  // A literal word Git does not know may be an alias: judge what it expands to, in each
+  // directory the command could run in (with `-C` applied, as Git reads it).
+  if (!opaque && sub?.literal && !KNOWN_GIT.has(sub.text) && program.literal && depth < 4) {
+    const dirs = [...context.cwds].map((dir) => {
+      const at = args.slice(0, i).lastIndexOf("-C");
+      return at >= 0 && args[at + 1] ? resolve(dir, args[at + 1] as string) : dir;
+    });
+    const rest = shellArgs(args.slice(i + 1));
+    let resolved = false;
+    for (const dir of dirs) {
+      const alias = gitAlias(dir, sub.text);
+      if (alias === undefined) continue;
+      resolved = true;
+      const script = alias.startsWith("!")
+        ? `cd ${shellArgs([aliasDirectory(dir)])} && ${alias.slice(1)} ${rest}`
+        : `git -C ${shellArgs([dir])} ${alias} ${rest}`;
+      const nested: Context = { ...context, cwds: new Set([dir]), words: [], assigned: [] };
+      analyzeScript(script, nested, rules, depth + 1);
+    }
+    if (resolved) return;
+  }
+  if (!sub?.literal || !KNOWN_GIT.has(sub.text)) opaque = opaque || !!sub;
   if (opaque) {
     // A literal `git` with an unknown subcommand could be anything Git runs: any forcing or
     // deleting flag is enough. An unknown program needs the subcommand's name somewhere too.
     opaqueGitRules([...segment.flatMap(split), ...context.assigned], !program.literal, rules);
     return;
   }
-  if (sub) gitRules(sub.text, args.slice(i + 1), rules);
+  if (!sub) return;
+  // A push whose options are only known at run time (`$ARGS`, `${F:- -f}`, `$(echo -f)`), or
+  // that a `remote.*`/`push.*` setting configures, could be forced.
+  if (sub.text === "push" && (pushConfig || cmd.args.slice(i + 1).some((word) => word.bare)))
+    rules.add("force-push");
+  gitRules(sub.text, args.slice(i + 1), rules);
+}
+
+/**
+ * The hard-list rules the command's text names, read as plain words after removing quotes and
+ * backslashes. This catches commands the scanner reads as data but that still run: a script
+ * piped into a shell, `bash <(...)`, `find -exec`, inline interpreter code, a shell alias. Linear
+ * time: splitting only, no backtracking pattern.
+ */
+function textRules(script: string, cwd: string, rules: Set<Rule>): void {
+  const stripped = script.replace(/['"\\]/g, "");
+  const cwds = new Set(cwd ? [cwd] : []);
+  for (const segment of stripped.split(/[;&|\n()`<>]/)) {
+    const tokens = segment.split(/[\s,]+/).filter(Boolean);
+    tokens.forEach((token, k) => {
+      const word = token.slice(token.lastIndexOf("=") + 1);
+      if (word) {
+        pathRules(word, rules, false);
+        for (const path of resolutions(word, cwds)) pathRules(path, rules, false);
+      }
+      if (word.split("/").pop() !== "git") return;
+      let j = k + 1;
+      while (tokens[j]?.startsWith("-")) j += GIT_VALUED.has(tokens[j] as string) ? 2 : 1;
+      const sub = tokens[j];
+      if (sub && KNOWN_GIT.has(sub)) gitRules(sub, tokens.slice(j + 1), rules);
+    });
+  }
 }
 
 /** The hard-list rules a shell script falls under, judged in its working directory. */
@@ -364,8 +431,11 @@ function requestRules(request: Request, rules: Set<Rule>): void {
     return;
   }
   const script = input.command ?? input.cmd;
-  if (SHELL_TOOLS.has(request.tool) && typeof script === "string")
+  if (SHELL_TOOLS.has(request.tool) && typeof script === "string") {
     for (const rule of scriptRules(script, request.cwd)) rules.add(rule);
+    // The union with the plain-text reading: either one naming a hard-list rule asks.
+    textRules(script, request.cwd, rules);
+  }
 }
 
 /** Every hard-list rule a decision that needs a person falls under, built-in rules first. */

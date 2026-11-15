@@ -266,7 +266,7 @@ try {
         const flow = classify
           ? `An ambiguous request is blocked once with instructions to have the policy-manager agent classify it and then retry; if classification fails, the harness's own permission flow decides. ${HUMAN_REVIEW_PRINCIPLE} If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent.`
           : "A request the policy cannot approve is left to the harness's own permission flow; there are no classification blocks.";
-        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. ${flow} Only a short hard list (force pushes, deleting unmerged work, harness settings and the policy profile) is always put to the user. Never ask an agent to approve its own tools.`;
+        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. ${flow} Only a short hard list (force pushes, deleting unmerged work, git clean, harness settings, the policy profile and the profile's humanPatterns) is always put to the user. Never ask an agent to approve its own tools.`;
         console.log(
           JSON.stringify(
             harness === "copilot"
