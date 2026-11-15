@@ -96,7 +96,7 @@ describe("one-time approval", () => {
 
   test("a Codex apply_patch retry after approval has the same hash and runs", () => {
     const { s } = session();
-    const r = patch(".agent-config/skills/workstream-tracker/references/plan.md");
+    const r = patch(".agent-config/skills/example-skill/references/plan.md");
     const first = s.review(r, undefined, "PreToolUse");
     expect([first.decision, first.reason]).toEqual(["human", PROTECTED_PATH]);
     s.grant(first.requestHash, true);

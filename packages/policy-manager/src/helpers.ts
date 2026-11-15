@@ -39,7 +39,7 @@ export function sameContent(working: Buffer, blob: Buffer): boolean {
  * listed for it; anything else stays with a person.
  */
 export interface CredentialHelper {
-  /** Repository-relative path with `/` separators, such as `tools/app-auth.mjs`. */
+  /** Repository-relative path with `/` separators, such as `tools/review-bot.mjs`. */
   path: string;
   /**
    * Accepted argument lists after the script. Each token is a literal, a list of literal
@@ -48,7 +48,7 @@ export interface CredentialHelper {
   args: Array<Array<string | string[]>>;
   /**
    * Where the helper's checkout must come from: normalized `host/owner/` prefixes (or a whole
-   * `host/owner/repo`) that `remote.origin.url` must match, such as `github.com/caredocs-ai/`.
+   * `host/owner/repo`) that `remote.origin.url` must match, such as `github.com/example-org/`.
    */
   remotes: string[];
 }
