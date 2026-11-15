@@ -1618,7 +1618,10 @@ function cannotFail(ctx: Ctx, node: PipelineNode, state: State): boolean {
     return false;
   const path =
     target === "~" || target.startsWith("~/") ? join(homedir(), target.slice(1)) : target;
-  if (!path.startsWith("/") || /[*?[\]]/.test(path)) return false;
+  // On Windows an absolute path starts with a drive (`C:/x` or `C:\x`), including the home directory.
+  const absolute =
+    path.startsWith("/") || (process.platform === "win32" && /^[A-Za-z]:[\\/]/.test(path));
+  if (!absolute || /[*?[\]]/.test(path)) return false;
   try {
     if (!statSync(path).isDirectory()) return false;
     accessSync(path, constants.X_OK);

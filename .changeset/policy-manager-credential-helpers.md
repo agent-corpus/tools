@@ -8,6 +8,6 @@ Local writes that could move remote-tracking refs or change the origin now go to
 
 Until `node <unlisted script>` in a worktree is checked (#48), a helper approval is an audit label, not a security boundary.
 
-A `~` right after a letter or digit (a Windows short name such as `RUNNER~1`) is now literal in a variable value, so a script that sets a temp path variable on Windows stays approvable.
+A `~` right after a letter or digit (a Windows short name such as `RUNNER~1`) is now literal in a variable value, so a script that sets a temp path variable on Windows stays approvable. A script's first `cd` to an existing Windows drive path (`cd C:/x && N=1`) now counts as unable to fail, as a POSIX absolute path already did, so assignments after it stay known.
 
 The `--session` scope for a protected file now reads "writes to <file>"; a directory stays "writes under <dir>".
