@@ -507,6 +507,30 @@ describe("profile loading", () => {
   });
 });
 
+describe("sort writes its output file", () => {
+  test.each([
+    "sort -o AGENTS.md src/a.txt",
+    "sort -oAGENTS.md src/a.txt",
+    "sort -ro AGENTS.md src/a.txt",
+    "sort --output=AGENTS.md src/a.txt",
+    "sort --output AGENTS.md src/a.txt",
+    "sort --out=AGENTS.md src/a.txt",
+    "sort -T .claude src/a.txt",
+  ])("a protected output target goes to a person: %s", (command) => {
+    expect(decide(command).decision).toBe("human");
+  });
+
+  test("sort that may run a program, or has an unknown option, is not approved", () => {
+    expect(decide("sort --compress-program=gzip src/a.txt").decision).not.toBe("approve");
+    expect(decide("sort --bogus src/a.txt").decision).not.toBe("approve");
+  });
+
+  test.each(["sort src/a.txt", "sort -o src/sorted.txt src/a.txt", "sort -k2 -t, -rn src/a.txt"])(
+    "an ordinary sort in a worktree is approved: %s",
+    (command) => expect(decide(command).decision).toBe("approve"),
+  );
+});
+
 describe("protected names are relative to the repository root", () => {
   test("a worktree under .claude/worktrees is ordinary code; its own .claude is protected", () => {
     const nested = join(repo, ".claude", "worktrees", "inner");

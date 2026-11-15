@@ -80,6 +80,55 @@ const WRITERS = new Set([
   "chown",
 ]);
 const WRAPPERS = new Set(["env", "nohup", "time", "command", "nice", "timeout", "xargs"]);
+const SORT_LONG = [
+  ...["ignore-leading-blanks", "dictionary-order", "ignore-case", "general-numeric-sort"],
+  ...["ignore-nonprinting", "month-sort", "human-numeric-sort", "numeric-sort", "random-sort"],
+  ...["random-source", "reverse", "sort", "version-sort", "batch-size", "check", "debug"],
+  ...["compress-program", "files0-from", "key", "merge", "output", "stable", "buffer-size"],
+  ...["field-separator", "temporary-directory", "parallel", "unique", "zero-terminated"],
+  ...["help", "version"],
+];
+const SORT_LONG_VALUE = new Set([
+  ...["random-source", "sort", "batch-size", "compress-program", "files0-from", "key"],
+  ...["output", "buffer-size", "field-separator", "temporary-directory", "parallel"],
+]);
+/**
+ * The files `sort` writes: its `-o`/`--output` file and its `-T`/`--temporary-directory`. Options
+ * are parsed as GNU getopt does (clustered short options, exact or unique long prefixes).
+ * Undefined when it may run another program (`--compress-program`) or an option is unknown.
+ */
+export function sortWrites(args: string[]): string[] | undefined {
+  const writes: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? "";
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      const [given = "", inline] = arg.slice(2).split(/=(.*)/s, 2);
+      const exact = SORT_LONG.includes(given)
+        ? [given]
+        : SORT_LONG.filter((n) => n.startsWith(given));
+      if (exact.length !== 1) return undefined;
+      const name = exact[0] ?? "";
+      if (!SORT_LONG_VALUE.has(name)) continue;
+      const value = inline ?? args[++i];
+      if (value === undefined) return undefined;
+      if (name === "compress-program") return undefined;
+      if (name === "output" || name === "temporary-directory") writes.push(value);
+    } else if (arg.startsWith("-") && arg.length > 1) {
+      for (let j = 1; j < arg.length; j++) {
+        const flag = arg[j] ?? "";
+        if ("ktSTo".includes(flag)) {
+          const value = arg.slice(j + 1) || args[++i];
+          if (value === undefined) return undefined;
+          if (flag === "o" || flag === "T") writes.push(value);
+          break;
+        }
+        if (!"bdfgiMhnRrVcCmsuz".includes(flag)) return undefined;
+      }
+    }
+  }
+  return writes;
+}
 /**
  * Programs whose behaviour cannot be changed by an unknown argument: they only print or compare
  * strings. The output of a command substitution may be an argument of these and of nothing else,
@@ -1743,6 +1792,15 @@ export function simpleDecision(
     )
   )
     return human(request, "destructive", "find with actions requires human review");
+  if (program === "sort") {
+    const outputs = sortWrites(args);
+    if (outputs === undefined)
+      return human(request, "unknown", "sort with an option that runs a program requires review");
+    for (const file of outputs) {
+      const check = permissiveWrite(cwd, file, profile, fill);
+      if (!check.allowed) return human(request, check.category, check.reason);
+    }
+  }
   if (["chmod", "chown"].includes(program) && args.some((arg) => /^-[a-zA-Z]*R/.test(arg)))
     return human(request, "destructive", "Recursive permission changes require human approval");
   if (
