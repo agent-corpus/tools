@@ -156,7 +156,9 @@ export class PolicySession {
         scope: "once",
         phase: slot,
       });
-      return { ...result(request, decision.category, "Approved once by the user", true) };
+      return {
+        ...result(request, decision.category, "Approved once by the user", true),
+      };
     }
     const scope = grantScope(request, decision, this.profile);
     if (scope === undefined) return undefined;
@@ -172,6 +174,16 @@ export class PolicySession {
     return {
       ...result(request, decision.category, "Approved for this session by the user", true),
     };
+  }
+  /** The newest request this session sent to a person that the user may still approve. */
+  latestHumanDecision():
+    | { requestHash: string; at: number; harness: string; sessionId: string }
+    | undefined {
+    let latest: { requestHash: string; at: number } | undefined;
+    for (const [requestHash, entry] of this.humanDecisions)
+      if (Date.now() - entry.at <= GRANT_WINDOW_MS && (!latest || entry.at >= latest.at))
+        latest = { requestHash, at: entry.at };
+    return latest && { ...latest, harness: this.harness, sessionId: this.sessionId };
   }
   /**
    * Looks up, and with `confirm` grants, a user approval of a request this session sent to a
@@ -333,7 +345,11 @@ export class PolicySession {
               300,
             ),
           });
-          decision = { ...decision, decision: "deny", classification: "requested" };
+          decision = {
+            ...decision,
+            decision: "deny",
+            classification: "requested",
+          };
         } else {
           const fallbackReason = known.limited
             ? "limit"
@@ -348,7 +364,11 @@ export class PolicySession {
               fallbackReason,
             });
           }
-          decision = { ...decision, classification: "fallback", fallbackReason };
+          decision = {
+            ...decision,
+            classification: "fallback",
+            fallbackReason,
+          };
         }
       }
     }
@@ -362,7 +382,13 @@ export class PolicySession {
     } else if (decision.decision === "human") {
       this.cache.delete(key);
       const sessionScope = grantScope(request, decision, this.profile);
-      decision = { ...decision, sessionGrantable: sessionScope !== undefined };
+      decision = {
+        ...decision,
+        sessionGrantable: sessionScope !== undefined,
+        ...(sessionScope === undefined
+          ? {}
+          : { sessionScopeLabel: scopeLabel(sessionScope, this.profile) }),
+      };
       if (this.humanDecisions.size >= 256)
         this.humanDecisions.delete(this.humanDecisions.keys().next().value ?? "");
       this.humanDecisions.delete(requestHash);
@@ -405,10 +431,14 @@ export class PolicySession {
       if (targets.length) {
         if (this.creating.size >= 256)
           this.creating.delete(this.creating.keys().next().value ?? "");
-        this.creating.set(decision.requestHash, { targets, approvedAt: Date.now() });
+        this.creating.set(decision.requestHash, {
+          targets,
+          approvedAt: Date.now(),
+        });
       }
     }
-    const { ai: classification, ...safe } = decision;
+    // The scope label names paths, which audit records never contain.
+    const { ai: classification, sessionScopeLabel: _label, ...safe } = decision;
     audit(this.directory, {
       event: "decision",
       ...safe,

@@ -11,9 +11,10 @@ import { HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
 import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
 import { replayTranscripts } from "./replay.js";
 import { formatReview, reviewClassifications, sessionDirectories } from "./review.js";
-import { send, serve, start, stop } from "./service.js";
+import { latestHumanDecision, send, sendTo, serve, start, stop } from "./service.js";
 import type { GrantPreview } from "./session.js";
 import { SetupError, setupHook } from "./setup.js";
+import { cliVersion, inspectShim, shimDirectory } from "./shim.js";
 import type { Classification, Decision, OutcomeReport, Request } from "./types.js";
 
 const usage = `policy-manager usage [--json]
@@ -21,9 +22,10 @@ policy-manager hook <claude|codex|copilot> <SessionStart|PreToolUse|PermissionRe
 policy-manager review <claude|codex|copilot> <session-id>   # normalized request JSON on stdin
 policy-manager classify <claude|codex|copilot> <session-id> # {requestHash,category,confidence} on stdin
 policy-manager record <claude|codex|copilot> <session-id>   # host-reported human response or execution result JSON
-policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--session]  # the user, in their own terminal: allow a blocked request once, or its rule and scope for the session
-policy-manager setup-hook <claude|codex|copilot> [--dry-run] [--config-dir <harness-config-directory>]
-policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run] [--config-dir <directory>]
+policy-manager approve --last [--session]  # the user, in their own terminal: allow the newest blocked request once, or its rule and scope for the session
+policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--session]  # the same for one exact request
+policy-manager setup-hook <claude|codex|copilot> [--dry-run] [--config-dir <harness-config-directory>] [--shim-dir <directory>]
+policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run] [--config-dir <directory>] [--shim-dir <directory>]
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
 policy-manager profile validate <file>   # check a policy profile without installing it
 policy-manager profile install <file>    # install it to the user config directory outside Git
@@ -56,6 +58,15 @@ const args = process.argv.slice(2);
 const [action, harnessArg, phase] = args;
 const harness = harnessArg as Request["harness"];
 const cliPath = fileURLToPath(import.meta.url);
+/** Whether a managed `pm` launcher for this CLI is installed and on PATH. */
+function pmReady(): boolean {
+  try {
+    const status = inspectShim(shimDirectory(), cliPath, cliVersion(cliPath));
+    return status.state === "current" && status.onPath;
+  } catch {
+    return false;
+  }
+}
 try {
   if (action === "usage" || !action)
     console.log(args.includes("--json") ? JSON.stringify({ usage }) : usage);
@@ -64,13 +75,18 @@ try {
     const selected = (alias ?? harnessArg) as Request["harness"];
     const { values } = parseArgs({
       args: args.slice(alias ? 1 : 2),
-      options: { "dry-run": { type: "boolean" }, "config-dir": { type: "string" } },
+      options: {
+        "dry-run": { type: "boolean" },
+        "config-dir": { type: "string" },
+        "shim-dir": { type: "string" },
+      },
     });
     console.log(
       JSON.stringify(
         setupHook(selected, cliPath, {
           dryRun: values["dry-run"],
           configDirectory: values["config-dir"],
+          shimDirectory: values["shim-dir"],
         }),
         null,
         2,
@@ -88,6 +104,7 @@ try {
       mode: profile.mode,
       cloudWrites: profile.cloudWrites,
       mcpReadOnly: profile.mcpReadOnly.length,
+      toolsDeny: Object.values(profile.toolsDeny).reduce((n, list) => n + list.length, 0),
       digest: profile.digest,
     };
     if (harnessArg === "install") {
@@ -134,26 +151,45 @@ try {
   } else if (action === "approve") {
     const { values, positionals } = parseArgs({
       args: args.slice(1),
-      options: { session: { type: "boolean" } },
+      options: { session: { type: "boolean" }, last: { type: "boolean" } },
       allowPositionals: true,
     });
-    const [target, sessionId, requestHash] = positionals as [Request["harness"], string, string];
-    if (
-      !["claude", "codex", "copilot"].includes(target) ||
-      !/^[A-Za-z0-9_.-]+$/.test(sessionId ?? "") ||
-      !/^[a-f0-9]{64}$/.test(requestHash ?? "")
-    )
-      throw new ApproveError(
-        "Usage: policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--session]",
-      );
-    if (!process.stdin.isTTY || !process.stdout.isTTY)
-      throw new ApproveError(
-        "Run approve yourself in an interactive terminal; it asks you to confirm the request.",
-      );
-    if (!existsSync(sessionDirectoryPath(target, sessionId)))
-      throw new ApproveError("No policy service is running for that session.");
+    const usageText =
+      "Usage: policy-manager approve --last [--session], or approve <claude|codex|copilot> <session-id> <request-hash> [--session]";
+    let directory: string;
+    let requestHash: string;
+    if (values.last) {
+      if (positionals.length) throw new ApproveError(usageText);
+      if (!process.stdin.isTTY || !process.stdout.isTTY)
+        throw new ApproveError(
+          "Run approve yourself in an interactive terminal; it asks you to confirm the request.",
+        );
+      const latest = await latestHumanDecision();
+      if (!latest)
+        throw new ApproveError(
+          "No running policy session has a request waiting for approval from the last 15 minutes. Have the agent retry so it is blocked again.",
+        );
+      ({ directory, requestHash } = latest);
+      console.log(`Session:  ${latest.harness} ${latest.sessionId}`);
+    } else {
+      const [target, sessionId, hashArg] = positionals as [Request["harness"], string, string];
+      if (
+        !["claude", "codex", "copilot"].includes(target) ||
+        !/^[A-Za-z0-9_.-]+$/.test(sessionId ?? "") ||
+        !/^[a-f0-9]{64}$/.test(hashArg ?? "")
+      )
+        throw new ApproveError(usageText);
+      if (!process.stdin.isTTY || !process.stdout.isTTY)
+        throw new ApproveError(
+          "Run approve yourself in an interactive terminal; it asks you to confirm the request.",
+        );
+      if (!existsSync(sessionDirectoryPath(target, sessionId)))
+        throw new ApproveError("No policy service is running for that session.");
+      directory = sessionDirectoryPath(target, sessionId);
+      requestHash = hashArg;
+    }
     const ask = (confirm: boolean) =>
-      send(target, sessionId, {
+      sendTo(directory, {
         action: "grant",
         grant: { requestHash, confirm, session: values.session === true },
       }) as Promise<GrantResult>;
@@ -168,7 +204,10 @@ try {
       );
     if (preview.scope === "session" && preview.sessionScope)
       console.log(`Scope:    ${preview.sessionScope}`);
-    const prompt = createInterface({ input: process.stdin, output: process.stdout });
+    const prompt = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
     const answer = await prompt.question(
       preview.scope === "session"
         ? "Allow this and later requests in this session that hit the same rule for the same scope? [y/N] "
@@ -213,7 +252,12 @@ try {
           JSON.stringify(
             harness === "copilot"
               ? { additionalContext: context }
-              : { hookSpecificOutput: { hookEventName: phase, additionalContext: context } },
+              : {
+                  hookSpecificOutput: {
+                    hookEventName: phase,
+                    additionalContext: context,
+                  },
+                },
           ),
         );
       } else if (phase === "PostToolUse" || phase === "PostToolUseFailure") {
@@ -231,6 +275,7 @@ try {
         const output = hookOutput(harness, phase, decision, {
           cliPath,
           sessionId: request.sessionId,
+          pmOnPath: decision.decision === "human" && harness === "codex" && pmReady(),
         });
         if (output) console.log(output);
       } else throw new Error("Unsupported hook event");

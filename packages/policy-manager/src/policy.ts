@@ -10,6 +10,7 @@ import {
 } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
+import { defaultAllowed } from "./tools.js";
 import {
   CATEGORIES,
   type Category,
@@ -341,6 +342,17 @@ function evaluateCore(request: Request, profile: Profile): Decision {
           ...result(request, "unknown", "MCP tool not listed as read-only; left to the harness"),
           decision: "native",
         };
+  // Harness tools that are not shell, file, patch or MCP tools (task control, plan mode, asking
+  // the user, loading tool schemas) are approved by default under the permissive profile; the
+  // profile's toolsDeny keeps chosen ones on the classification path. Each approval names the tool.
+  if (
+    profile.mode === "permissive" &&
+    defaultAllowed(request.harness, request.tool, profile.toolsDeny[request.harness] ?? [])
+  )
+    return {
+      ...result(request, "code-read", "Harness tool approved by default", true),
+      defaultTool: request.tool,
+    };
   const cwd = input.workdir ?? input.cwd ?? request.cwd;
   if (typeof cwd !== "string" || cwd !== request.cwd)
     return result(request, "unknown", "Execution directory differs from the reviewed directory");

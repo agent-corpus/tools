@@ -19,6 +19,8 @@ export function normalize(harness: Request["harness"], payload: Record<string, u
 export interface HookContext {
   cliPath: string;
   sessionId: string;
+  /** A managed `pm` launcher for this CLI is installed and on PATH. */
+  pmOnPath?: boolean;
 }
 /**
  * The exact command the model is told to run to record a classification. A here-string, not a
@@ -116,16 +118,32 @@ export function approveCommand(
     ? `node "${cliPath}" approve ${harness} ${context.sessionId} ${requestHash}`
     : `policy-manager approve ${harness} <session-id> ${requestHash}`;
 }
-function approveInstruction(
-  harness: Request["harness"],
-  decision: Decision,
-  context?: HookContext,
-): string {
-  const command = approveCommand(harness, decision.requestHash, context);
-  const session = decision.sessionGrantable
-    ? " Adding --session also allows later requests in this session that hit the same rule for the same scope."
-    : "";
-  return `Approving it in chat does not unblock it. To allow it once, the user runs in their own terminal: ${command} — then retry the same request unchanged.${session} Do not run that command yourself.`;
+/** The short command the user runs to approve the newest blocked request (`approve --last`). */
+export function approveLastCommand(context?: HookContext): string {
+  if (context?.pmOnPath) return "pm approve --last";
+  const cliPath =
+    context && /^[A-Za-z]:\\/.test(context.cliPath)
+      ? context.cliPath.replace(/\\/g, "/")
+      : context?.cliPath;
+  return cliPath ? `node "${cliPath}" approve --last` : "policy-manager approve --last";
+}
+/**
+ * What Codex shows for a decision that needs a person. Codex cannot ask, so the agent must stop
+ * and hand the user one command; the first line says so, and the command stands on its own line.
+ */
+export function approveInstruction(decision: Decision, context?: HookContext): string {
+  return [
+    `⏸ Waiting for your approval. Not run: ${decision.reason}.`,
+    'Run in your own terminal, then say "retry":',
+    `  ${approveLastCommand(context)}`,
+    ...(decision.sessionGrantable
+      ? [
+          `Add --session to also allow ${decision.sessionScopeLabel ?? "the same rule for the same scope"} for the rest of this session.`,
+        ]
+      : []),
+    "Agent: stop now and end your turn; approving it in chat does not unblock it. Show the user the command above exactly, in a code block. Never run it yourself.",
+    `Request ${decision.requestHash}.`,
+  ].join("\n");
 }
 /** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
 function classifyInstruction(
@@ -172,11 +190,19 @@ export function hookResponse(
       return decision.decision === "approve" ? { behavior: "allow" } : {};
     return decision.decision === "approve"
       ? { permissionDecision: "allow" }
-      : { permissionDecision: "ask", permissionDecisionReason: decision.reason };
+      : {
+          permissionDecision: "ask",
+          permissionDecisionReason: decision.reason,
+        };
   }
   if (phase === "PermissionRequest")
     return decision.decision === "approve"
-      ? { hookSpecificOutput: { hookEventName: phase, decision: { behavior: "allow" } } }
+      ? {
+          hookSpecificOutput: {
+            hookEventName: phase,
+            decision: { behavior: "allow" },
+          },
+        }
       : {};
   // Codex rejects PreToolUse `permissionDecision: "allow"` without `updatedInput` ("unsupported
   // permissionDecision:allow") and marks the hook failed. An approval there is no decision at all;
@@ -184,7 +210,12 @@ export function hookResponse(
   if (decision.decision === "approve")
     return harness === "codex"
       ? {}
-      : { hookSpecificOutput: { hookEventName: phase, permissionDecision: "allow" } };
+      : {
+          hookSpecificOutput: {
+            hookEventName: phase,
+            permissionDecision: "allow",
+          },
+        };
   // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
   // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
   // so a decision that needs a human is a deny. Approving it in chat does not change the decision;
@@ -192,17 +223,21 @@ export function hookResponse(
   // ambiguous request (needsClassification) is classified, and a retry then sees the approval.
   // Codex's own approval prompt (PermissionRequest, above) still handles the requests it asks about.
   if (harness === "codex") {
-    const next =
-      decision.needsClassification === true && decision.classification !== "fallback"
-        ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, the retry is blocked with the command the user runs to approve it."
-        : decision.userOnly
-          ? "Do not run approve yourself: ask the user to approve the original request from their own terminal."
-          : approveInstruction(harness, decision, context);
+    const classify =
+      decision.needsClassification === true && decision.classification !== "fallback";
+    const reason =
+      !classify && !decision.userOnly
+        ? approveInstruction(decision, context)
+        : `Policy manager: ${decision.reason}. This needs a human decision and was not run. ${
+            classify
+              ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, the retry is blocked with the command the user runs to approve it."
+              : "Do not run approve yourself: ask the user to approve the original request from their own terminal."
+          } Request ${decision.requestHash}.`;
     return {
       hookSpecificOutput: {
         hookEventName: phase,
         permissionDecision: "deny",
-        permissionDecisionReason: `Policy manager: ${decision.reason}. This needs a human decision and was not run. ${next} Request ${decision.requestHash}.`,
+        permissionDecisionReason: reason,
       },
     };
   }

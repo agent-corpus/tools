@@ -45,7 +45,7 @@ describe("Codex PreToolUse", () => {
     });
     const reason = (out.hookSpecificOutput as { permissionDecisionReason: string })
       .permissionDecisionReason;
-    expect(reason).toContain("was not run");
+    expect(reason).toContain("Not run");
     expect(reason).toContain("abc123");
   });
   // Approving in chat cannot change a deterministic decision: the retry is denied again. The reason
@@ -57,8 +57,8 @@ describe("Codex PreToolUse", () => {
       }
     ).permissionDecisionReason;
     expect(reason).toContain("does not unblock it");
-    expect(reason).toContain("approve codex");
-    expect(reason).toContain("in their own terminal");
+    expect(reason).toContain("approve --last");
+    expect(reason).toContain("in your own terminal");
     expect(reason).not.toMatch(/policy profile/i);
     expect(reason).not.toMatch(/ask the user to approve/i);
     expect(reason).not.toMatch(/classif/i);
