@@ -179,6 +179,32 @@ describe("pm launcher", () => {
     expect(result.shim).toMatchObject({ state: "absent", changed: true });
     expect(result.changed).toBe(true);
   });
+  test("a launcher failure does not fail the hook install", () => {
+    const installed = join(root, `nover${counter++}`, "dist", "cli.js");
+    mkdirSync(join(installed, ".."), { recursive: true });
+    writeFileSync(installed, "");
+    const config = join(root, `config${counter++}`);
+    const result = setupHook("codex", installed, {
+      configDirectory: config,
+      shimDirectory: join(root, `bin${counter++}`),
+    });
+    expect(result.changed).toBe(true);
+    expect(result.shim).toBeUndefined();
+    expect(result.nextSteps.some((step) => step.includes("launcher was not installed"))).toBe(true);
+  });
+  test.skipIf(process.platform === "win32")(
+    "the launcher runs under a package.json with type module",
+    () => {
+      const home = join(root, `esm${counter++}`);
+      const dir = join(home, "bin");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(home, "package.json"), '{"type":"module"}');
+      const target = join(home, "cli.js");
+      writeFileSync(target, "console.log(process.argv.slice(2).join(' '))");
+      installShim(dir, target, "0.9.0", false);
+      expect(execFileSync(shimPath(dir), ["a", "b"], { encoding: "utf8" }).trim()).toBe("a b");
+    },
+  );
 });
 
 describe("harness tools approved by default", () => {
@@ -202,12 +228,30 @@ describe("harness tools approved by default", () => {
       evaluate(tool("TaskStop"), undefined, parseProfile('{"version":1,"mode":"strict"}')).decision,
     ).not.toBe("approve");
   });
-  test.each(["Bash", "Write", "Edit", "Grep", "Glob", "Monitor", "apply_patch", "view_image"])(
-    "%s is never approved by default",
-    (name) => {
-      expect(evaluate(tool(name), undefined, permissive).defaultTool).toBeUndefined();
-    },
-  );
+  test.each([
+    "Bash",
+    "Write",
+    "Edit",
+    "Grep",
+    "Glob",
+    "Monitor",
+    "apply_patch",
+    "view_image",
+    // Command runners and stdin feeders, listed and unlisted.
+    "shell_command",
+    "local_shell",
+    "unified_exec",
+    "write_stdin",
+    "write_bash",
+    "write_powershell",
+    "run_terminal_cmd",
+    "container.exec",
+    "spawn_process",
+  ])("%s is never approved by default", (name) => {
+    const d = evaluate(tool(name), undefined, permissive);
+    expect(d.decision).not.toBe("approve");
+    expect(d.defaultTool).toBeUndefined();
+  });
   test("MCP tools still follow mcpReadOnly", () => {
     const d = evaluate(tool("mcp__github__create_issue"), undefined, permissive);
     expect(d.decision).toBe("native");

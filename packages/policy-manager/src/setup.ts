@@ -181,7 +181,16 @@ export function setupHook(
     options.shimDirectory ?? (options.configDirectory === undefined ? shimDirectory() : undefined);
   const shim = (dry: boolean) => {
     if (shimDir === undefined) return undefined;
-    const status = installShim(resolve(shimDir), installedCli, cliVersion(installedCli), dry);
+    let status: ReturnType<typeof installShim>;
+    // The launcher is a convenience: its failure never fails the hook install.
+    try {
+      status = installShim(resolve(shimDir), installedCli, cliVersion(installedCli), dry);
+    } catch (error) {
+      nextSteps.push(
+        `The \`pm\` launcher was not installed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return undefined;
+    }
     if (!status.onPath && (status.state === "current" || status.changed))
       nextSteps.push(
         `Add ${dirname(status.path)} to PATH to approve blocked requests with \`pm approve --last\`.`,

@@ -57,7 +57,8 @@ export function shimText(cliPath: string, version: string): string {
   return [
     "#!/usr/bin/env node",
     `// ${SHIM_MARKER} version=${version}`,
-    'const { spawnSync } = require("node:child_process");',
+    // Works whether Node loads this extensionless file as CommonJS or as ESM (Node 20.16+).
+    'const { spawnSync } = process.getBuiltinModule ? process.getBuiltinModule("node:child_process") : require("node:child_process");',
     `const result = spawnSync(process.execPath, [${JSON.stringify(cliPath)}, ...process.argv.slice(2)], { stdio: "inherit" });`,
     "process.exit(result.status ?? 1);",
     "",

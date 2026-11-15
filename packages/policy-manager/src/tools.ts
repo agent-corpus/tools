@@ -32,6 +32,13 @@ export const ENGINE_TOOLS = new Set(
     "view_image",
     // Runs a shell command in the background.
     "Monitor",
+    // Run a command or feed a running one.
+    "shell_command",
+    "local_shell",
+    "unified_exec",
+    "write_stdin",
+    "write_bash",
+    "write_powershell",
   ].map((name) => name.toLowerCase()),
 );
 
@@ -45,6 +52,12 @@ export const BUILTIN_TOOLS_DENY: Record<Request["harness"], ReadonlySet<string>>
   copilot: new Set(),
 };
 
+/**
+ * A name that suggests running a command or feeding a running one. Such a tool is never approved
+ * by default, even when ENGINE_TOOLS misses it, so a new or renamed command runner fails closed.
+ */
+export const COMMAND_TOOL = /bash|shell|powershell|pwsh|exec|stdin|terminal|command|cmd|spawn/i;
+
 /** A harness tool name a profile may list. */
 export const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 
@@ -57,6 +70,7 @@ export function defaultAllowed(
   return (
     TOOL_NAME.test(tool) &&
     !ENGINE_TOOLS.has(tool.toLowerCase()) &&
+    !COMMAND_TOOL.test(tool) &&
     !tool.toLowerCase().startsWith("mcp__") &&
     !BUILTIN_TOOLS_DENY[harness]?.has(tool) &&
     !deny.includes(tool)
