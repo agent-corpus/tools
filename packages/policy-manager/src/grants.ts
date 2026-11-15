@@ -152,7 +152,12 @@ export function grantScope(
 /** What a session scope covers, in words the user can check before approving it. */
 export function scopeLabel(scope: string, profile: Profile): string {
   if (scope.startsWith("protected:"))
-    return `writes under ${scope.slice("protected:".length).split("\u0000").join(", ")}`;
+    return `writes ${scope
+      .slice("protected:".length)
+      .split("\u0000")
+      // A root that is a file (`AGENTS.md`) is written to; a directory, or one not made yet, under.
+      .map((root) => (existsSync(root) && !statSync(root).isDirectory() ? "to " : "under ") + root)
+      .join(", ")}`;
   if (scope.startsWith("pattern:")) {
     const [, indexes = "", ...checkout] = scope.split(":");
     const patterns = indexes

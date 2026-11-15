@@ -18,6 +18,7 @@ import {
   tempWrite,
 } from "./evidence.js";
 import { commandDecision } from "./flow.js";
+import { helperMatch } from "./helpers.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -888,6 +889,22 @@ function gitDecision(
   const ok = (reason = "Permissive profile: Git operation has no destructive effect") =>
     result(request, "impactful-write", reason, true);
   if (!sub) return ok();
+  const refWrite = remoteRefWrite(cwd, sub, rest);
+  if (refWrite) return human(request, "sensitive", refWrite);
+  if (
+    (sub === "clone" || sub === "init") &&
+    rest.some(
+      (word) =>
+        CLONE_CONFIG.some((option) => word === option || abbreviates(word, option)) ||
+        /^-c./.test(word) ||
+        (sub === "clone" && /^-[A-Za-z]*[cou]/.test(word) && !word.startsWith("--")),
+    )
+  )
+    return human(
+      request,
+      "sensitive",
+      `git ${sub} with a configuration, origin, template or separate git directory requires human approval`,
+    );
   if (sub === "push") return gitPush(request, cwd, rest);
   if (sub === "branch" && (has("-d", "-D", "--delete") || cluster("d") || cluster("D"))) {
     if (has("-r", "--remotes")) return ok();
@@ -967,10 +984,123 @@ function gitDecision(
     return human(request, "sensitive", "Git configuration can install hooks or credential helpers");
   if (
     sub === "remote" &&
-    ["set-url", "remove", "rm", "rename", "set-head"].includes(positional[0] ?? "")
+    ["add", "set-url", "remove", "rm", "rename", "set-head", "set-branches"].includes(
+      positional[0] ?? "",
+    )
   )
     return human(request, "impactful-write", "Changing remotes requires human approval");
   return ok();
+}
+
+/**
+ * `git clone`/`init` options that set the new repository's configuration or origin, or run a
+ * program: a credential helper trusts a checkout by its configured origin.
+ */
+const CLONE_CONFIG = ["--config", "--origin", "--template", "--separate-git-dir", "--upload-pack"];
+
+/** Whether a credential helper's file argument lies in the working checkout or a temp/scratch root. */
+function helperFileAllowed(cwd: string, file: string, profile: Profile): boolean {
+  let path: string;
+  try {
+    path = canonical(resolveWord(cwd, file));
+  } catch {
+    return false;
+  }
+  const roots = [...profile.scratchRoots, ...tempRoots()];
+  try {
+    roots.push(canonical(git(cwd, ["rev-parse", "--show-toplevel"])));
+  } catch {
+    /* not in a checkout: temp and scratch roots only */
+  }
+  return roots.some((root) => inside(canonical(root), path));
+}
+
+/** A fetch or push target that is this machine, not a remote: `.`, a path, or a `file:` URL. */
+function localRepository(word: string): boolean {
+  return (
+    word === "." ||
+    word === ".." ||
+    word.startsWith("/") ||
+    word.startsWith("./") ||
+    word.startsWith("../") ||
+    word.startsWith("~") ||
+    word.startsWith("\\") ||
+    /^[A-Za-z]:/.test(word) ||
+    /^file:/i.test(word) ||
+    (!word.includes(":") && word.includes("/"))
+  );
+}
+
+/** Remote names configured in the repository, read locally. */
+function configuredRemotes(cwd: string): Set<string> | undefined {
+  try {
+    return new Set(git(cwd, ["remote"]).split("\n").filter(Boolean));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A local write that moves a remote-tracking ref. Remote-tracking refs are this policy's evidence
+ * of what a remote holds (merged branches, unchanged credential helpers), so only fetching the
+ * same branch from its own configured remote may move them.
+ */
+function remoteRefWrite(cwd: string, sub: string, rest: string[]): string | undefined {
+  const positional = rest.filter((word) => !word.startsWith("-"));
+  const remoteRef = (word: string) => /^(?:\+)?refs\/remotes\//.test(word);
+  const why = "Moving a remote-tracking ref locally requires human approval";
+  if (sub === "update-ref") {
+    // Only a plain branch or tag, named in full, that is not a symbolic ref: anything else could
+    // move a remote-tracking ref, a replace ref, or whatever HEAD points to.
+    const name = positional[0] ?? "";
+    if (
+      rest.some((w) => w === "--stdin" || w.startsWith("--no-deref")) ||
+      positional.some(remoteRef) ||
+      !/^refs\/(?:heads|tags)\/[^\s]+$/.test(name)
+    )
+      return "Updating a ref other than a plain branch or tag requires human approval";
+    try {
+      git(cwd, ["symbolic-ref", "--quiet", name]);
+      return "Updating a ref through a symbolic ref requires human approval";
+    } catch {
+      return undefined;
+    }
+  }
+  if (sub === "symbolic-ref") {
+    const writes = positional.length > 1 || rest.some((w) => w === "-d" || w === "--delete");
+    return writes && positional.some((w) => /^(?:refs\/)?remotes\//.test(w)) ? why : undefined;
+  }
+  if (sub === "push") {
+    const remote = positional[0];
+    return remote !== undefined && localRepository(remote)
+      ? "Pushing to a local repository requires human approval"
+      : undefined;
+  }
+  if (sub !== "fetch" && sub !== "pull") return undefined;
+  if (rest.some((w) => w.startsWith("--refmap") || w === "--stdin"))
+    return "A fetch with a custom ref map requires human approval";
+  const remote = positional[0];
+  if (remote === undefined) return undefined;
+  if (localRepository(remote)) return `A ${sub} from a local repository requires human approval`;
+  const remotes = configuredRemotes(cwd);
+  for (const spec of positional.slice(1)) {
+    const colon = spec.indexOf(":");
+    if (colon < 0) continue;
+    const source = spec.slice(spec.startsWith("+") ? 1 : 0, colon);
+    // Git also takes `remotes/<r>/<b>` as a short name for `refs/remotes/<r>/<b>`.
+    const raw = spec.slice(colon + 1);
+    const destination = raw.startsWith("remotes/") ? `refs/${raw}` : raw;
+    if (!destination.startsWith("refs/remotes/")) continue;
+    const [owner = "", ...branch] = destination.slice("refs/remotes/".length).split("/");
+    const name = branch.join("/");
+    if (
+      owner !== remote ||
+      !remotes?.has(remote) ||
+      (source !== name && source !== `refs/heads/${name}`)
+    )
+      return why;
+  }
+  return undefined;
 }
 
 /**
@@ -1737,6 +1867,50 @@ export function simpleDecision(
     return human(request, "unknown", "wait with options requires human review");
   if (program === "set" && !args.every((word) => /^[-+][B-Za-z]+$|^pipefail$/.test(word)))
     return human(request, "unknown", "Changing shell settings requires human review");
+  // A listed credential helper reads a secret for one narrow job. It runs only as committed on the
+  // default branch, with an accepted argument shape, and with nothing changing its environment.
+  const helper = helperMatch(profile.credentialHelpers, cwd, argv);
+  if (helper.kind === "refused") return human(request, "sensitive", helper.reason);
+  if (helper.kind === "match") {
+    if (
+      stageIndex > 0 ||
+      command.stdin !== undefined ||
+      command.redirects.some((r) => r.op === "<" || r.fd === "0") ||
+      command.env.length > 0 ||
+      unwrapped.env.length > 0 ||
+      argv.length !== command.argv.length
+    )
+      return human(
+        request,
+        "sensitive",
+        "A credential helper with a changed environment or input requires a person",
+      );
+    // A pattern or `~` would let the shell turn one checked word into other words or files.
+    if (
+      argv.some(
+        (word, index) => index > 0 && (command.glob?.[index] === true || word.startsWith("~")),
+      )
+    )
+      return human(
+        request,
+        "sensitive",
+        "A credential helper argument the shell would expand requires a person",
+      );
+    for (const file of helper.files) {
+      const check = permissiveRead(cwd, file);
+      if (!check.allowed) return human(request, check.category, check.reason);
+      if (!helperFileAllowed(cwd, file, profile))
+        return human(
+          request,
+          "sensitive",
+          "A credential helper may only send a file from this checkout or a temp directory",
+        );
+    }
+    return {
+      ...result(request, "impactful-write", "Listed credential helper", true),
+      credentialHelpers: [`${helper.helper.path}#${helper.shape}`],
+    };
+  }
   if (SHELLS.has(program) || INTERPRETERS.has(program)) {
     if (stageIndex > 0)
       return human(request, "unknown", "Piping into a shell or interpreter requires human review");

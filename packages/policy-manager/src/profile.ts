@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { canonical, git } from "./evidence.js";
+import { type CredentialHelper, HelperError, parseCredentialHelpers } from "./helpers.js";
 import { TOOL_NAME } from "./tools.js";
 
 /**
@@ -28,6 +29,8 @@ export interface Profile {
    * path. Every other harness tool that is not a shell, file, patch or MCP tool is approved.
    */
   toolsDeny: { claude: string[]; codex: string[]; copilot: string[] };
+  /** Scripts that may read a credential for one narrow job, as committed on the default branch. */
+  credentialHelpers: CredentialHelper[];
   /** SHA-256 of the file the profile came from, for the audit log. */
   digest?: string;
 }
@@ -39,6 +42,7 @@ export const strictProfile: Profile = {
   scratchRoots: [],
   mcpReadOnly: [],
   toolsDeny: { claude: [], codex: [], copilot: [] },
+  credentialHelpers: [],
 };
 
 export const MAX_MCP_READ_ONLY = 200;
@@ -127,6 +131,7 @@ export function parseProfile(text: string): Profile {
     "scratchRoots",
     "mcpReadOnly",
     "toolsDeny",
+    "credentialHelpers",
     "description",
   ]);
   for (const key of Object.keys(value))
@@ -153,6 +158,13 @@ export function parseProfile(text: string): Profile {
       `mcpReadOnly must list at most ${MAX_MCP_READ_ONLY} names like mcp__server__tool, optionally ending in *`,
     );
   const toolsDeny = parseToolsDeny(value.toolsDeny);
+  let credentialHelpers: CredentialHelper[];
+  try {
+    credentialHelpers = parseCredentialHelpers(value.credentialHelpers);
+  } catch (error) {
+    if (error instanceof HelperError) throw new ProfileError(error.message);
+    throw error;
+  }
   let humanPatterns: RegExp[];
   try {
     humanPatterns = (patterns as string[]).map((p) => new RegExp(p));
@@ -174,6 +186,7 @@ export function parseProfile(text: string): Profile {
     scratchRoots: value.mode === "permissive" ? [...scratchRoots] : [],
     mcpReadOnly: [...new Set(mcp as string[])],
     toolsDeny,
+    credentialHelpers: value.mode === "permissive" ? credentialHelpers : [],
     digest: createHash("sha256").update(text).digest("hex"),
   };
 }

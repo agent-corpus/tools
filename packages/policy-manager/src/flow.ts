@@ -34,8 +34,12 @@ const MAX_VARIANTS = 16;
 const MAX_SUBSTITUTION_DEPTH = 3;
 /** Commands one script may be judged as; past this it is too large to verify in time. */
 const MAX_JUDGEMENTS = 400;
-/** No whitespace, glob, quote, expansion or tilde characters: the value is exactly one word. */
-const SIMPLE_VALUE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+/**
+ * No whitespace, glob, quote or expansion characters: the value is exactly one word. A `~` is
+ * allowed only right after a letter or digit, where no shell expands it (a Windows short name
+ * such as `RUNNER~1`); at the start or after `=` or `:` it would become a home directory.
+ */
+const SIMPLE_VALUE = /^(?:[A-Za-z0-9_@%+=:,./-]|(?<=[A-Za-z0-9])~)+$/;
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const UNSUPPORTED = "Unsupported shell syntax; expansions and subshells need human review";
 const MAX_CALL_DEPTH = 4;
@@ -81,6 +85,8 @@ interface Ctx {
     created?: Set<string>;
     /** Whether a symlink may exist that the hook could not see (see `Fill`). */
     script: Fill["script"];
+    /** Listed credential helpers the script runs, for the audit record. */
+    helpers?: Set<string>;
   };
 }
 
@@ -634,6 +640,7 @@ function runSimple(
       redirects,
       subs: [],
       loose,
+      glob: node.argv.map((word) => word.glob === true),
       ...(stdin === undefined ? {} : { stdin }),
     };
   };
@@ -741,7 +748,12 @@ function runSimple(
       const decision = simpleDecision(request, command, profile, ctx.depth, stage, cwd, fill);
       if (decision.decision !== "approve") return decision;
       ctx.box.last = decision;
-      if (!symlinkFree(unwrap(command.argv).argv)) {
+      if (decision.credentialHelpers?.length) {
+        ctx.box.helpers ??= new Set();
+        for (const helper of decision.credentialHelpers) ctx.box.helpers.add(helper);
+      }
+      // A listed credential helper only reads a secret and talks to its service.
+      if (!decision.credentialHelpers?.length && !symlinkFree(unwrap(command.argv).argv)) {
         if (ctx.box.script.approved)
           return human(
             request,
@@ -1606,7 +1618,10 @@ function cannotFail(ctx: Ctx, node: PipelineNode, state: State): boolean {
     return false;
   const path =
     target === "~" || target.startsWith("~/") ? join(homedir(), target.slice(1)) : target;
-  if (!path.startsWith("/") || /[*?[\]]/.test(path)) return false;
+  // On Windows an absolute path starts with a drive (`C:/x` or `C:\x`), including the home directory.
+  const absolute =
+    path.startsWith("/") || (process.platform === "win32" && /^[A-Za-z]:[\\/]/.test(path));
+  if (!absolute || /[*?[\]]/.test(path)) return false;
   try {
     if (!statSync(path).isDirectory()) return false;
     accessSync(path, constants.X_OK);
@@ -1734,5 +1749,9 @@ export function commandDecision(
     vars: new Map(),
     funcs: new Map(),
   });
-  return refusal ?? ctx.box.last ?? human(request, "unknown", "Empty command");
+  if (refusal) return refusal;
+  const last = ctx.box.last ?? human(request, "unknown", "Empty command");
+  return ctx.box.helpers?.size && last.decision === "approve"
+    ? { ...last, credentialHelpers: [...ctx.box.helpers] }
+    : last;
 }

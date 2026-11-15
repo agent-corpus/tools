@@ -1,0 +1,13 @@
+---
+"@agent-corpus/policy-manager": minor
+---
+
+Add `credentialHelpers` to the profile: listed scripts that read a credential for one narrow job, such as posting a review as a GitHub App, run without a prompt. Each entry lists `remotes`, normalized `host/owner/` prefixes; the helper's checkout must have a `remote.origin.url` that matches one, with no `insteadOf` rewrite or push URL, so a clone of a local repository or a `git init` does not qualify. `node <script> <args>` is approved only when the script is the tracked file at its listed repository path, unchanged from the default branch on `origin` (full ref names only, replace refs ignored, blob bytes compared; an autocrlf checkout of an LF blob matches), with no symlink, environment prefix, wrapper, input redirect or standard input, and its arguments match a listed shape word for word (literals, alternatives, and the placeholders `<repo>`, `<int>`, `<sha>`, `<word>`, `<url>`, `<file>`, `<text>`), with no argument the shell would expand. A `<file>` must lie in the working checkout or a temp or scratch root. The audit record names the helper. A script with a helper's file name that fails any check goes to a person. A listed helper counts as creating no symlink, so a later temp write in the same script stays approvable.
+
+Local writes that could move remote-tracking refs or change the origin now go to a person: `update-ref` on anything but a plain branch or tag that is not a symbolic ref, `update-ref --stdin` or `--no-deref`, `symbolic-ref` with a name or target under `refs/remotes/`, a fetch from `.`, a path or a `file:` URL, a fetch refspec that writes `refs/remotes/<remote>/<branch>` (or `remotes/...`) from anything but that branch of that configured remote, `--refmap`, a push to `.` or a local path, `git remote add`/`set-branches` (besides the existing `set-url`/`rename`/`remove`/`set-head`), `git clone -c`/`--config`/`--origin`/`--template`/`--separate-git-dir`/`--upload-pack`, and `git init --template`/`--separate-git-dir`.
+
+Until `node <unlisted script>` in a worktree is checked (#48), a helper approval is an audit label, not a security boundary.
+
+A `~` right after a letter or digit (a Windows short name such as `RUNNER~1`) is now literal in a variable value, so a script that sets a temp path variable on Windows stays approvable. A script's first `cd` to an existing Windows drive path (`cd C:/x && N=1`) now counts as unable to fail, as a POSIX absolute path already did, so assignments after it stay known.
+
+The `--session` scope for a protected file now reads "writes to <file>"; a directory stays "writes under <dir>".
