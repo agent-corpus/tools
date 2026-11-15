@@ -3,6 +3,7 @@ import {
   appendFileSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -11,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { matchShape } from "../src/helpers.js";
+import { matchShape, sameContent } from "../src/helpers.js";
 import { evaluate } from "../src/policy.js";
 import { ProfileError, parseProfile } from "../src/profile.js";
 import { PolicySession } from "../src/session.js";
@@ -100,6 +101,12 @@ beforeAll(() => {
   writeFileSync(join(rw, "review.json"), "{}");
 });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
+/** A fresh clone of the helpers repository, for tests that change refs or files. */
+function clone(name: string): string {
+  const repo = join(root, name);
+  execFileSync("git", ["clone", "-q", join(root, "source"), repo], { stdio: "ignore" });
+  return repo;
+}
 
 describe("credential helpers", () => {
   test("a listed helper with an accepted shape is approved and named", () => {
@@ -286,6 +293,114 @@ describe("remote-tracking refs stay evidence of the remote", () => {
       ].join(" && "),
     );
     expect(d.decision).toBe("human");
+  });
+  test.each([
+    "git symbolic-ref HEAD refs/remotes/origin/main",
+    "git symbolic-ref refs/heads/foo refs/remotes/origin/main",
+    "git symbolic-ref -d refs/remotes/origin/HEAD",
+    "git update-ref refs/replace/0123456789abcdef0123456789abcdef01234567 HEAD",
+    "git update-ref HEAD HEAD~1",
+    "git update-ref --no-deref refs/heads/topic HEAD",
+    "git update-ref origin/main HEAD",
+  ])("%s goes to a person", (command) => {
+    expect(bash(command).decision).toBe("human");
+  });
+  test("update-ref through a symbolic branch goes to a person", () => {
+    const repo = clone("symref");
+    git(repo, "symbolic-ref", "refs/heads/alias", "refs/heads/main");
+    expect(bash("git update-ref refs/heads/alias HEAD", repo).reason).toMatch(/symbolic ref/);
+  });
+  test("chain: point HEAD at origin/main, then commit an edited helper", () => {
+    const d = bash(
+      [
+        "git symbolic-ref HEAD refs/remotes/origin/main",
+        `printf x >> ${AUTH}`,
+        "git commit -qam edit",
+        `node ${AUTH} --repo a/b check`,
+      ].join(" && "),
+    );
+    expect(d.decision).toBe("human");
+  });
+  test.each([
+    ["a tag", ["tag", "origin/HEAD", "HEAD"]],
+    ["a branch", ["branch", "origin/HEAD", "HEAD"]],
+    ["a tag for main", ["tag", "origin/main", "HEAD"]],
+  ])("shadowing origin with %s does not trust an edited, committed helper", (_name, shadow) => {
+    const repo = clone(`shadow-${shadow[0]}-${shadow[1]?.replace("/", "-")}`);
+    appendFileSync(join(repo, AUTH), "console.log('edited');\n");
+    git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "edit");
+    git(repo, ...shadow);
+    if (shadow[1] === "origin/main") git(repo, "symbolic-ref", "-d", "refs/remotes/origin/HEAD");
+    expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/differs/);
+  });
+  test("a replace ref cannot change the committed helper that is read", () => {
+    const repo = clone("replace");
+    const blob = (rev: string) =>
+      execFileSync("git", ["-C", repo, "rev-parse", rev], { encoding: "utf8" }).trim();
+    const original = blob(`refs/remotes/origin/main:${AUTH}`);
+    appendFileSync(join(repo, AUTH), "console.log('edited');\n");
+    const edited = execFileSync("git", ["-C", repo, "hash-object", "-w", AUTH], {
+      encoding: "utf8",
+    }).trim();
+    git(repo, "replace", original, edited);
+    expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/differs/);
+    expect(bash(`git update-ref refs/replace/${original} ${edited}`, repo).decision).toBe("human");
+  });
+  test.each([
+    ".git/refs/remotes/origin/main",
+    ".git/packed-refs",
+    ".git/HEAD",
+    ".git/info/grafts",
+    ".git/worktrees/feat/HEAD",
+  ])("a direct write to %s is refused", (path) => {
+    const main = join(worktree, "..", "..");
+    expect(bash(`printf x > ${posix(join(main, path))}`).decision).toBe("human");
+    const write = evaluate(
+      {
+        sessionId: "t",
+        harness: "claude",
+        cwd: worktree,
+        tool: "Write",
+        input: { file_path: join(main, path), content: "x" },
+      },
+      undefined,
+      profile,
+    );
+    expect(write.decision).toBe("human");
+  });
+});
+
+describe("line endings", () => {
+  test("a CRLF checkout of an LF helper matches", () => {
+    const repo = clone("crlf");
+    const file = join(repo, AUTH);
+    writeFileSync(file, readFileSync(file, "utf8").replace(/\n/g, "\r\n"));
+    expect(bash(`node ${AUTH} --repo a/b check`, repo).decision).toBe("approve");
+  });
+  test("a helper committed with CR must match byte for byte", () => {
+    const source = join(root, "cr-source");
+    execFileSync("git", ["init", "-q", "-b", "main", source], { stdio: "ignore" });
+    git(source, "config", "core.autocrlf", "false");
+    mkdirSync(join(source, ".agent-config", "skills", "code-review"), { recursive: true });
+    writeFileSync(join(source, AUTH), "// auth\r\nmore\r\n");
+    git(source, "add", ".");
+    git(source, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "cr");
+    const repo = join(root, "cr-clone");
+    execFileSync("git", ["-c", "core.autocrlf=false", "clone", "-q", source, repo], {
+      stdio: "ignore",
+    });
+    git(repo, "config", "core.autocrlf", "false");
+    expect(bash(`node ${AUTH} --repo a/b check`, repo).decision).toBe("approve");
+    writeFileSync(join(repo, AUTH), "// auth\nmore\n");
+    expect(bash(`node ${AUTH} --repo a/b check`, repo).reason).toMatch(/differs/);
+  });
+  test("sameContent", () => {
+    const b = (s: string) => Buffer.from(s, "latin1");
+    expect(sameContent(b("a\r\nb\r\n"), b("a\nb\n"))).toBe(true);
+    expect(sameContent(b("a\r\nb\r\n"), b("a\r\nb\r\n"))).toBe(true);
+    expect(sameContent(b("a\nb\n"), b("a\r\nb\r\n"))).toBe(false);
+    expect(sameContent(b("a\r\nb\n"), b("a\r\nb\r\n"))).toBe(false);
+    expect(sameContent(b("a\r\nc\r\n"), b("a\nb\n"))).toBe(false);
   });
 });
 

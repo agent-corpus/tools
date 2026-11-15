@@ -1027,11 +1027,26 @@ function remoteRefWrite(cwd: string, sub: string, rest: string[]): string | unde
   const positional = rest.filter((word) => !word.startsWith("-"));
   const remoteRef = (word: string) => /^(?:\+)?refs\/remotes\//.test(word);
   const why = "Moving a remote-tracking ref locally requires human approval";
-  if (sub === "update-ref")
-    return rest.includes("--stdin") || positional.some(remoteRef) ? why : undefined;
+  if (sub === "update-ref") {
+    // Only a plain branch or tag, named in full, that is not a symbolic ref: anything else could
+    // move a remote-tracking ref, a replace ref, or whatever HEAD points to.
+    const name = positional[0] ?? "";
+    if (
+      rest.some((w) => w === "--stdin" || w.startsWith("--no-deref")) ||
+      positional.some(remoteRef) ||
+      !/^refs\/(?:heads|tags)\/[^\s]+$/.test(name)
+    )
+      return "Updating a ref other than a plain branch or tag requires human approval";
+    try {
+      git(cwd, ["symbolic-ref", "--quiet", name]);
+      return "Updating a ref through a symbolic ref requires human approval";
+    } catch {
+      return undefined;
+    }
+  }
   if (sub === "symbolic-ref") {
     const writes = positional.length > 1 || rest.some((w) => w === "-d" || w === "--delete");
-    return writes && positional[0]?.startsWith("refs/remotes/") ? why : undefined;
+    return writes && positional.some((w) => w.startsWith("refs/remotes/")) ? why : undefined;
   }
   if (sub === "push") {
     const remote = positional[0];

@@ -1,6 +1,37 @@
-import { lstatSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { git } from "./evidence.js";
+
+/** Git with replace refs ignored, so `refs/replace/*` cannot change what is read. */
+const exact = (top: string, args: string[]) => git(top, ["--no-replace-objects", ...args]);
+
+/** The raw bytes of a blob, with replace refs ignored and no filters applied. */
+function blobBytes(top: string, oid: string): Buffer {
+  return execFileSync(
+    "git",
+    ["-c", "core.fsmonitor=false", "-C", top, "--no-replace-objects", "cat-file", "blob", oid],
+    {
+      timeout: 3000,
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+      ),
+    },
+  );
+}
+
+/**
+ * Whether the working file is the committed blob: the same bytes, or, when the blob has no CR,
+ * the same bytes once the working file's CRLF line ends become LF (a `core.autocrlf` checkout).
+ * No clean filter or `.gitattributes` setting is applied.
+ */
+export function sameContent(working: Buffer, blob: Buffer): boolean {
+  if (working.equals(blob)) return true;
+  if (blob.includes(0x0d)) return false;
+  return Buffer.from(working.toString("latin1").replace(/\r\n/g, "\n"), "latin1").equals(blob);
+}
 
 /**
  * A script allowed to read a credential for one narrow job, such as posting a review as a GitHub
@@ -153,11 +184,25 @@ export function parseCredentialHelpers(raw: unknown): CredentialHelper[] {
   });
 }
 
-/** The default branch on `origin`: `origin/HEAD`, else `origin/main`. */
+/**
+ * The default branch on `origin`, by full ref name only, so a tag or branch called `origin/HEAD`
+ * cannot stand in for it: `refs/remotes/origin/HEAD` when it points into `refs/remotes/origin/`,
+ * else `refs/remotes/origin/main`.
+ */
 function defaultRef(top: string): string | undefined {
-  for (const ref of ["origin/HEAD", "origin/main"])
+  const candidates: string[] = [];
+  try {
+    const target = exact(top, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
+    if (/^refs\/remotes\/origin\/[^\s]+$/.test(target) && target !== "refs/remotes/origin/HEAD")
+      candidates.push(target);
+  } catch {
+    /* no origin/HEAD */
+  }
+  candidates.push("refs/remotes/origin/main");
+  for (const ref of candidates)
     try {
-      git(top, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+      // `show-ref --verify` takes only a full name and never falls back to a shorter match.
+      exact(top, ["show-ref", "--verify", "--quiet", ref]);
       return ref;
     } catch {
       /* try the next */
@@ -204,15 +249,17 @@ export function helperMatch(helpers: CredentialHelper[], cwd: string, argv: stri
   }
   const ref = defaultRef(top);
   if (!ref) return refused("Credential helper's default branch is unknown");
-  let committed: string;
-  let current: string;
+  let committed: Buffer;
+  let current: Buffer;
   try {
-    committed = git(top, ["rev-parse", "--verify", "--quiet", `${ref}:${helper.path}`]);
-    current = git(top, ["hash-object", "--no-filters", "--", helper.path]);
+    const oid = exact(top, ["rev-parse", "--verify", "--quiet", `${ref}:${helper.path}`]);
+    if (!/^[0-9a-f]{40,64}$/.test(oid)) throw new Error("not a blob id");
+    committed = blobBytes(top, oid);
+    current = readFileSync(real);
   } catch {
     return refused("Credential helper is not on the default branch");
   }
-  if (!committed || committed !== current)
+  if (!sameContent(current, committed))
     return refused("Credential helper differs from the default branch");
   const shape = matchShape(helper, argv.slice(2));
   if (!shape) return refused("Credential helper run with arguments outside its allowed shapes");
