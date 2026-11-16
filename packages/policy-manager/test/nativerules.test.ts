@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditLog } from "@agent-corpus/audit-log";
@@ -446,3 +446,22 @@ describe("the native rules layer in the session", () => {
     expect(hookOutput("codex", "PreToolUse", prompted)).toBe("");
   });
 });
+
+test.skipIf(process.platform === "win32")(
+  "a path rule matches a file not yet written, reached through another spelling of its directory",
+  () => {
+    const link = join(root, "link-to-worktree");
+    symlinkSync(worktree, link);
+    claudeSettings({ allow: ["Edit(/docs/*.md)"] });
+    // The project root is the real path; the file is named through the link, and its directory
+    // does not exist yet (as a Windows 8.3 short name differs from the long one).
+    const request: Request = {
+      sessionId: "s1",
+      harness: "claude",
+      cwd: link,
+      tool: "Write",
+      input: { file_path: join(link, "docs", "new.md") },
+    };
+    expect(nativeRules(request)?.verdict).toBe("allow");
+  },
+);

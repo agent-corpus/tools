@@ -309,14 +309,16 @@ describe("the prompt", () => {
   });
   test("carries the command, cwd, git facts, path facts and the engine reason", () => {
     const prompt = buildPrompt({
-      request: request(`rm -rf ${join(tmpdir(), "x")} ./y`),
+      request: request(`rm -rf ${join(tmpdir(), "x").replace(/\\/g, "/")} ./y`),
       reason: "Some engine reason",
     }) as string;
     expect(prompt).toContain(`Working directory: ${JSON.stringify(root)}`);
     expect(prompt).toContain("Git: not inside a git repository");
     expect(prompt).toContain('Engine reason: "Some engine reason"');
     expect(prompt).toContain("temp or session scratchpad");
-    expect(prompt).toContain(`rm -rf ${join(tmpdir(), "x")} ./y`);
+    expect(prompt).toContain(
+      JSON.stringify(`rm -rf ${join(tmpdir(), "x").replace(/\\/g, "/")} ./y`),
+    );
     expect(prompt).toContain('Reply only with JSON: {"category"');
   });
   test("a command longer than the cap is not classified", () => {

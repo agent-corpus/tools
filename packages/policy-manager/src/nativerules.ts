@@ -346,10 +346,13 @@ function claudeRuleMatches(rule: string, request: Request, base: string): boolea
     try {
       forms.add(realpathSync.native(path));
     } catch {
+      // Missing: resolve the nearest existing ancestor and keep the rest as written.
+      let dir = dirname(path);
+      while (dir !== dirname(dir) && !existsSync(dir)) dir = dirname(dir);
       try {
-        forms.add(join(realpathSync.native(dirname(path)), basename(path)));
+        forms.add(join(realpathSync.native(dir), path.slice(dir.length)));
       } catch {
-        /* missing: as written */
+        /* unresolvable: as written */
       }
     }
     const out = new Set<string>();
