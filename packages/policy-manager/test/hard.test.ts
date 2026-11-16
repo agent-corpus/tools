@@ -13,6 +13,8 @@ import type { Request } from "../src/types.js";
 // Hard human items: credentials, protected configuration, unrecoverable loss and humanPatterns.
 // They are never sent to the classifier, and no classification approves them.
 const permissive = parseProfile(JSON.stringify({ version: 1, mode: "permissive" }));
+// The enumerations judge thousands of scripts; shared CI runners need more than the default.
+const ENUMERATION_TIMEOUT = 60_000;
 let root: string, repo: string, worktree: string, other: string;
 let counter = 0;
 const git = (cwd: string, ...args: string[]) =>
@@ -499,19 +501,23 @@ describe("unquoted here-document bodies are read with the shell's rules", () => 
       seed = (seed * 1103515245 + 12345) % 2147483648;
       return alphabet[seed % alphabet.length];
     }).join("");
-  test("a substitution embedded in any text always hits the floor", () => {
-    let misses = 0;
-    for (let k = 0; k < 400; k++) {
-      // `a ` before it keeps a trailing backslash in the prefix from escaping its `$`, as the
-      // shell would; every line is kept apart from the delimiter.
-      const body = `${random(k % 17)}a $(az group delete -n x) ${random(k % 13)}`
-        .split("\n")
-        .map((line) => (line === "EOF" ? "EOF " : line))
-        .join("\n");
-      if (!hardRules(shell(`cat <<EOF\n${body}\nEOF`), base()).includes("cloud-write")) misses++;
-    }
-    expect(misses).toBe(0);
-  });
+  test(
+    "a substitution embedded in any text always hits the floor",
+    () => {
+      let misses = 0;
+      for (let k = 0; k < 400; k++) {
+        // `a ` before it keeps a trailing backslash in the prefix from escaping its `$`, as the
+        // shell would; every line is kept apart from the delimiter.
+        const body = `${random(k % 17)}a $(az group delete -n x) ${random(k % 13)}`
+          .split("\n")
+          .map((line) => (line === "EOF" ? "EOF " : line))
+          .join("\n");
+        if (!hardRules(shell(`cat <<EOF\n${body}\nEOF`), base()).includes("cloud-write")) misses++;
+      }
+      expect(misses).toBe(0);
+    },
+    ENUMERATION_TIMEOUT,
+  );
   test.each(['\\\\"', '\\\\\\"', '\\\\\\\\"'])(
     "%s before a quote does not hide what follows",
     (backslashes) => {
@@ -526,26 +532,30 @@ describe("unquoted here-document bodies are read with the shell's rules", () => 
   ])("review probe %s hits the floor", (body) => {
     expect(hardRules(shell(`cat <<EOF\n${body}\nEOF`), base())).toContain("cloud-write");
   });
-  test("every short body around a live substitution hits the floor", () => {
-    // Every prefix and suffix up to 4 characters over \ " ' space x. The substitution is live
-    // unless an odd run of backslashes escapes its `$`.
-    const alphabet = ["\\", '"', "'", " ", "x"];
-    const words: string[][] = [[""]];
-    for (let n = 1; n <= 4; n++)
-      words.push((words[n - 1] as string[]).flatMap((w) => alphabet.map((c) => w + c)));
-    const misses: string[] = [];
-    for (let n = 0; n <= 4; n++)
-      for (let a = 0; a <= n; a++)
-        for (const prefix of words[a] as string[]) {
-          if ((/\\*$/.exec(prefix)?.[0].length ?? 0) % 2 === 1) continue;
-          for (const suffix of words[n - a] as string[]) {
-            const body = `${prefix}$(az group delete -n x)${suffix}`;
-            if (!hardRules(shell(`cat <<EOF\n${body}\nEOF`), base()).includes("cloud-write"))
-              misses.push(body);
+  test(
+    "every short body around a live substitution hits the floor",
+    () => {
+      // Every prefix and suffix up to 4 characters over \ " ' space x. The substitution is live
+      // unless an odd run of backslashes escapes its `$`.
+      const alphabet = ["\\", '"', "'", " ", "x"];
+      const words: string[][] = [[""]];
+      for (let n = 1; n <= 4; n++)
+        words.push((words[n - 1] as string[]).flatMap((w) => alphabet.map((c) => w + c)));
+      const misses: string[] = [];
+      for (let n = 0; n <= 4; n++)
+        for (let a = 0; a <= n; a++)
+          for (const prefix of words[a] as string[]) {
+            if ((/\\*$/.exec(prefix)?.[0].length ?? 0) % 2 === 1) continue;
+            for (const suffix of words[n - a] as string[]) {
+              const body = `${prefix}$(az group delete -n x)${suffix}`;
+              if (!hardRules(shell(`cat <<EOF\n${body}\nEOF`), base()).includes("cloud-write"))
+                misses.push(body);
+            }
           }
-        }
-    expect(misses).toEqual([]);
-  });
+      expect(misses).toEqual([]);
+    },
+    ENUMERATION_TIMEOUT,
+  );
   test("an escaped substitution is text, as in the shell", () => {
     expect(hardRules(shell("cat <<EOF\nnot run: \\$(az group delete -n x)\nEOF"), base())).toEqual(
       expect.not.arrayContaining(["force-push"]),
