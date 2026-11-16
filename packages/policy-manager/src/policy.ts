@@ -2,12 +2,8 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
-import {
-  commandDecision,
-  permissiveRead,
-  permissiveWrite,
-  WORKTREE_DELETION,
-} from "./permissive.js";
+import { hardRule } from "./hard.js";
+import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
 import { redactText } from "./redact.js";
 import { defaultAllowed } from "./tools.js";
@@ -198,13 +194,11 @@ export function result(
 /** Self-reported confidence needed for the AI to approve an ambiguous request. */
 export const AMBIGUOUS_CONFIDENCE = 0.95;
 /**
- * Escalations that stay with a human in every profile. Category `sensitive` (credentials,
- * secrets, protected paths and configuration) is excluded by category; these are the remaining
- * boundaries: the request itself cannot be trusted, an organization or the profile asked for a
- * human, or a repository rule forbids the write. Of `destructive`, only deletion inside a linked
- * feature worktree is classified: recoverable is approved, anything else goes to a person.
+ * Escalations the classifier is never asked about because the request itself cannot be judged
+ * from what it is shown: an incomplete or malformed request, a working directory other than the
+ * reviewed one, an unreadable patch, or a custom environment the classifier does not see.
  */
-const HUMAN_BOUNDARIES: RegExp[] = [
+const NOT_CLASSIFIABLE: RegExp[] = [
   /^Incomplete request/,
   /^Invalid tool input/,
   /^Execution directory differs/,
@@ -212,62 +206,46 @@ const HUMAN_BOUNDARIES: RegExp[] = [
   /^Patch has no verified target paths/,
   /^Environment override requires human review/,
   /^Custom execution environment requires human review/,
-  /^Matches an organization human-approval pattern/,
-  /^Write requires a linked worktree on a feature branch/,
-  /^Cloud operation is outside the verified inspection catalog/,
 ];
 /**
- * Under the permissive profile, every escalation that is not a boundary is ambiguous: the
- * deterministic engine cannot decide it, so the session's AI classifier does. Strict mode is
- * unchanged.
+ * Every escalation the engine cannot decide goes to the AI classifier, in every profile, unless it
+ * is a hard human item (credentials, protected configuration, unrecoverable loss, humanPatterns),
+ * which goes straight to a person, or cannot be judged from what the classifier is shown.
  */
-function markAmbiguous(decision: Decision, profile: Profile): Decision {
-  if (
-    profile.mode !== "permissive" ||
-    decision.decision !== "human" ||
-    decision.needsClassification ||
-    decision.category === "sensitive" ||
-    // Git history, remote, cloud, publish and HTTP deletions are not provably recoverable, and the
-    // classifier is not independent; only local deletion inside a feature worktree is classified.
-    (decision.category === "destructive" && decision.reason !== WORKTREE_DELETION) ||
-    HUMAN_BOUNDARIES.some((pattern) => pattern.test(decision.reason))
-  )
-    return decision;
+function markAmbiguous(request: Request, decision: Decision): Decision {
+  if (decision.decision !== "human") return decision;
+  const hard = hardRule(request, decision);
+  if (hard) return { ...decision, needsClassification: false, tier: undefined, hard };
+  if (NOT_CLASSIFIABLE.some((pattern) => pattern.test(decision.reason))) return decision;
   return { ...decision, needsClassification: true, tier: "ambiguous" };
 }
+/**
+ * Approves iff `recoverable && confidence >= 0.95 && category not in {sensitive, unknown}`.
+ * Anything else is a person's decision; the engine's reason is kept (session grants key on it)
+ * and the classifier's answer is shown beside it.
+ */
 function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
-  // A `destructive` verdict approves only what the engine proved is a deletion inside a feature
-  // worktree; on anything else (an unparsable `rm -rf ~/{a,b}`) the label alone means a person.
-  const destructiveOk = ai.category !== "destructive" || decision.reason === WORKTREE_DELETION;
   const safe =
     ai.recoverable === true &&
     ai.confidence >= AMBIGUOUS_CONFIDENCE &&
-    destructiveOk &&
     !["sensitive", "unknown"].includes(ai.category);
-  const base = { ...decision, needsClassification: false, cache: "session" as const, ai };
+  const base = { ...decision, needsClassification: false, ai };
   if (safe)
     return {
       ...base,
       decision: "approve",
+      cache: "session",
       category: ai.category,
       classification: "approved",
-      reason: "Ambiguous request judged recoverable and non-sensitive by the same-session AI",
+      reason: "Judged recoverable and non-sensitive by the AI classifier",
     };
-  const why = ai.rationale ? ` Rationale: ${redactText(ai.rationale, 200)}` : "";
-  // Possible unrecoverable loss is a person's decision, not a deny the model works around.
-  if (decision.category === "destructive" || ai.category === "destructive")
-    return {
-      ...base,
-      decision: "human",
-      cache: "none",
-      classification: "denied",
-      reason: `Destructive request not judged recoverable by the classifier (confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"}); a person decides.${why}`,
-    };
+  const why = ai.rationale ? `: ${redactText(ai.rationale, 200)}` : "";
   return {
     ...base,
-    decision: "deny",
+    decision: "human",
+    cache: "none",
     classification: "denied",
-    reason: `Not run: the classifier did not approve this request (category ${ai.category}, confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"}).${why} Use a recoverable, non-sensitive alternative, or explain to the user what is needed.`,
+    classifierNote: `The AI classifier did not approve it (category ${ai.category}, confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"})${why}`,
   };
 }
 export function evaluate(
@@ -275,7 +253,9 @@ export function evaluate(
   ai?: Classification,
   profile: Profile = strictProfile,
 ): Decision {
-  const decision = markAmbiguous(evaluateCore(request, profile), profile);
+  const decision = markAmbiguous(request, evaluateCore(request, profile));
+  // A hard human item is a person's: no classification, however confident, approves it.
+  if (decision.hard) return decision;
   if (ai) {
     // Self-reported confidence is not a probability or a substitute for verified effects.
     if (

@@ -235,7 +235,12 @@ test("AI can approve a bounded cloud inspection and cache only that session requ
   const r = request("az network vnet list --resource-group example");
   expect(session.review(r).decision).toBe("human");
   expect(
-    session.classify({ requestHash: hash(r), category: "cloud-read", confidence: 0.999 }).decision,
+    session.classify({
+      requestHash: hash(r),
+      category: "cloud-read",
+      confidence: 0.999,
+      recoverable: true,
+    }).decision,
   ).toBe("approve");
   expect(session.review(r).cached).toBe(true);
   expect(session.review(request("az network vnet delete --name example")).decision).toBe("human");
@@ -252,7 +257,12 @@ test("request, classification, decision and reported outcomes share audit correl
   const session = new PolicySession(directory, "codex", "test"),
     r = request("az network vnet list --resource-group hidden-target");
   session.review(r);
-  session.classify({ requestHash: hash(r), category: "cloud-read", confidence: 0.999 });
+  session.classify({
+    requestHash: hash(r),
+    category: "cloud-read",
+    confidence: 0.999,
+    recoverable: true,
+  });
   session.record({ event: "human-response", requestHash: hash(r), response: "approved" });
   session.record({
     event: "execution-result",
@@ -263,7 +273,14 @@ test("request, classification, decision and reported outcomes share audit correl
   const { AuditLog } = await import("@agent-corpus/audit-log");
   const records = (await new AuditLog(directory).query({ requestId: hash(r) })).records;
   expect(new Set(records.map((r) => r.eventName))).toEqual(
-    new Set(["request", "classification", "decision", "human-response", "execution-result"]),
+    new Set([
+      "request",
+      "classification-requested",
+      "classification",
+      "decision",
+      "human-response",
+      "execution-result",
+    ]),
   );
   const text = JSON.stringify(records);
   expect(text).not.toContain("hidden-target");

@@ -1,8 +1,8 @@
 # @agent-corpus/policy-manager
 
-A coding-agent-independent permission evaluator. It starts a private background service for each session, verifies ordinary code operations and cloud inspection commands, and records requests and decisions in a temporary audit log. Uses the shared `@agent-corpus/audit-log` package and makes no model API calls.
+A coding-agent-independent permission evaluator. It starts a private background service for each session, verifies ordinary code operations and cloud inspection commands, and records requests and decisions in a temporary audit log. Uses the shared `@agent-corpus/audit-log` package and calls no model API itself.
 
-This is a conservative initial implementation. It grants ordinary operations through deterministic checks. For additional cloud inspection operations, AI can confirm a bounded read-only candidate. A same-session AI classifier can categorize candidates and recommend structured replacements for opaque commands. Confidence alone never authorizes an opaque command.
+Every request goes through three steps (see **How a request is decided**): a deterministic engine approves what it can prove safe; otherwise the hook asks an AI classifier, run through the user's own logged-in harness CLI, and approves what it judges recoverable; otherwise it asks the person and waits, and remembers a "yes" for the session.
 
 ## Usage
 
@@ -25,7 +25,7 @@ policy-manager config copilot /absolute/reviewed/install/dist/cli.js
 
 Use the generated absolute installed path. Do not point approval hooks at a mutable worktree or an unpinned `npx` download. Keep native sandboxes and interactive approval modes enabled. Existing host grants and other hooks can authorize actions independently; this service does not revoke them.
 
-The `SessionStart` hook starts one deterministic service and injects instructions to create a read-only policy-manager agent. Creation of the AI agent is a model action, not a native hook guarantee. Resident-agent availability varies by harness. This release has not established automatic resident-agent parity across the three CLIs. The fallback can run in the parent session when resident agents are unavailable.
+The `SessionStart` hook starts one service per session and tells the agent, in one line, how requests are decided. It does not ask the agent to classify anything: classification happens inside the hook.
 
 ## Install native hooks
 
@@ -46,7 +46,9 @@ Setup also installs a small launcher named `pm` that runs this CLI, so a user ca
 
 `--dry-run` prints the target path, proposed managed hooks, and next steps without writing files or printing existing settings. `--config-dir <directory>` selects a harness configuration root for portable profiles or testing. Defaults respect `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `COPILOT_HOME`, then use the standard user directories listed above. Setup refuses to activate an entrypoint inside a Git checkout, including an npm link into a checkout. Source builds can preview with `--dry-run`.
 
-Start a new session after setup. Codex still requires explicit review and trust through `/hooks`; setup does not grant that trust. Existing sandbox controls and host permission rules continue to apply. Ambiguous requests retain the documented classification or human fallback; setup does not enable automatic AI fallback across unsupported native interfaces.
+Start a new session after setup. Codex still requires explicit review and trust through `/hooks`; setup does not grant that trust. Existing sandbox controls and host permission rules continue to apply.
+
+Every managed hook gets an explicit timeout of 45 seconds (Codex `SessionEnd`: 3, its limit), above the classifier's own timeout (15 s for Claude and Codex, 20 s for Copilot) plus the service's wait. This matters most for Copilot, whose default hook timeout is 30 seconds and whose command hooks fail open on a timeout. Setup also adds `PostToolUse` and, for Claude Code and Copilot, `PostToolUseFailure`, which remember a person's answer (step 3).
 
 ### Codex hook trust
 
@@ -74,47 +76,87 @@ Pass one JSON object on standard input:
 }
 ```
 
-Run `policy-manager review codex session-example`. The response includes `decision` (`approve`, `human`, `deny`, or `native` for an unlisted MCP tool left to the harness), `category`, `reason`, `requestHash`, `cache`, and `cached`. The library exports the same evaluator.
+Run `policy-manager review codex session-example`. The response includes `decision` (`approve`, `human`, `deny`, or `native` for no decision, which leaves the request to the harness), `category`, `reason`, `requestHash`, `cache`, and `cached`. It runs the same three steps as the hooks. The library exports the evaluator.
 
-The session's policy-manager agent returns the following object for an ambiguous request. The working agent submits it through `policy-manager classify codex session-example`:
+Categories are `code-read`, `worktree-write`, `temp-write` (a recoverable write outside any repository), `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`.
+
+`policy-manager classify <harness> <session-id>` still accepts a recorded classification (`{requestHash, category, confidence, recoverable, rationale}` on standard input) for a request a person was asked about, for compatibility. Nothing asks an agent to run it any more.
+
+## How a request is decided
+
+1. **The deterministic engine** approves what it can prove safe (see **Policy** and **Policy profiles**). Unchanged.
+2. **The AI classifier, in the hook.** Anything else the engine escalates is classified synchronously, inside the hook, by the harness's own CLI (below). The request is approved when the answer is `recoverable` with `confidence >= 0.95` and a category other than `sensitive` or `unknown`. Hard human items skip this step.
+3. **The person.** Otherwise the person is asked and the harness waits. Before asking, the user's own harness permission rules are applied (below). Claude Code and Copilot ask in their own prompt; a "yes" is remembered for the rest of the session with the same scope as `approve --session`, so the same kind of request is not asked again. Codex cannot ask: it gets a deny with `pm approve --last` and stops (see **Approving from the terminal**).
+
+The user's own deny or ask rules beat every approval here: when one matches, the hook makes no decision and the harness applies the rule. An allow rule counts as the person's answer.
+
+### Hard human items
+
+These go straight to step 3. They are never sent to the classifier, and no classification approves them:
+
+- credential or secret retrieval, and reads of credential paths;
+- protected configuration: the policy profile, harness settings and hooks (`.claude/settings*.json`, `.claude/hooks/`, `~/.claude.json`, `.codex/config.toml`, `.codex/hooks.json`, `.codex/hooks/`, `.codex/rules/`, `.copilot/config.json`, `.copilot/settings.json`, `.copilot/hooks/`, `.github/hooks/`, including under `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `COPILOT_HOME`), and protected repository paths;
+- unrecoverable loss: force and mirror pushes and `+` refspecs, deleting a branch whose work is not verified merged, forced worktree removal and `git worktree prune`, and `git clean`;
+- commands matching the profile's `humanPatterns`;
+- an agent running `approve` itself, or a classification record for another session.
+
+The check reads the command the way the shell runs it: quotes and backslashes removed, `eval`, `sh -c` and `$(…)` bodies read as commands, wrappers (`env`, `sudo`, `timeout`, `xargs`, …) skipped, `cd` targets followed for relative paths, and Git aliases resolved with a read-only `git config --get alias.<name>`. It is unioned with a plain-text reading of the command, so a script piped into a shell, `bash <(…)`, `find -exec` or inline interpreter code still counts. A false match asks rather than approves. Requests the classifier cannot judge from what it is shown (an incomplete request, another working directory, an unreadable patch, a custom environment) also go to a person.
+
+### The classifier
+
+| Harness     | Command (no shell, from a private empty directory)                                                                                                                                                                                                                                                                                 | Timeout |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| Claude Code | `claude -p --model <model> --tools "" --setting-sources "" --settings '{"disableAllHooks":true,"autoMemoryEnabled":false}' --no-session-persistence --strict-mcp-config --disable-slash-commands --permission-mode dontAsk --max-turns 2 --output-format json --json-schema <schema> <prompt>`; the answer is `.structured_output` | 15 s    |
+| Codex       | `codex exec --ephemeral --ignore-user-config --ignore-rules --disable hooks --skip-git-repo-check -s read-only -c approval_policy="never" -c model_reasoning_effort="low" -m <model> -C <empty dir> --output-schema <schema.json> -o <out.json> <prompt>`, standard input closed                                                   | 15 s    |
+| Copilot     | `copilot -p <prompt> --model <model> --available-tools "" --no-custom-instructions --disable-builtin-mcps --no-ask-user --no-auto-update --disable-client-telemetry --output-format json`, with `COPILOT_HOME` set to a private scratch directory whose `settings.json` is `{"disableAllHooks":true}`                              | 20 s    |
+
+Copilot still authenticates in that scratch home: its stored login lives in the system credential store (the Keychain on macOS), not in `COPILOT_HOME`, and `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` are passed through when set. A login stored in plain text (`storeTokenPlaintext`) lives in `COPILOT_HOME` and does not reach the scratch home, so the classifier fails and the person is asked. On Windows only an executable (`.exe`) CLI is run, since `.cmd` launchers need a shell; otherwise the person is asked.
+
+The prompt gives the command (at most 6000 characters; a longer one goes to the person), the working directory, Git facts (repository root, branch, default branch, main checkout or linked worktree), each path the command names with whether it is in the linked feature worktree, the main checkout, the temp directory or a session scratch directory, and whether this session created it, and the engine's reason. Deleting scratch files, screenshots, temp directories or files the session created is approvable.
+
+Verdicts are cached for the session by request hash, and concurrent hooks for one request share one run. Any failure (the CLI is not installed or not logged in, a nonzero exit, a timeout, output that is not JSON or not the schema) asks the person; it never approves. A missing CLI is not tried again in that session. After 50 AI approvals in a session, further requests go to the person.
+
+Configure it in the profile:
 
 ```json
-{ "requestHash": "<exact hash from review>", "category": "unknown", "confidence": 0.4 }
+{
+  "version": 1,
+  "mode": "permissive",
+  "classifier": {
+    "claude": { "model": "haiku" },
+    "codex": { "model": "gpt-6-luna" },
+    "copilot": { "model": "auto" }
+  }
+}
 ```
 
-Categories are `code-read`, `worktree-write`, `temp-write` (a recoverable write outside any repository), `cloud-read`, `git-read`, `impactful-write`, `destructive`, `sensitive`, and `unknown`. The threshold is 0.99 plus deterministic verification and category agreement. Explicitly listed metadata operations with permitted selectors can qualify through AI classification. Endpoint overrides and cloud writes cannot qualify. Unknown commands stay human decisions. No classifier starts a second harness or calls an external model API.
+Each harness uses its own CLI; the models above are the defaults. `"enabled": false` turns the classifier off, so everything the engine escalates goes to the person. An unknown key or an invalid model name makes the profile invalid, and an invalid profile is replaced by the strict default.
 
-## AI classification of ambiguous requests (experiment)
+**Privacy.** Commands, paths and the facts above are sent to the user's own model provider through their own logged-in CLI, under that account's terms. Nothing is sent anywhere else. The audit log records each classification's CLI, model, latency and verdict, never the prompt.
 
-The rule, exported as `HUMAN_REVIEW_PRINCIPLE` and included in every classification hint: _A human prompt is reserved for high-value, high-impact actions: unrecoverable data loss, credential/secret retrieval, protected config/paths, and profile humanPatterns. Recoverable or disposable effects, including destructive-but-safe ones, are automatic._
+### The user's own permission rules
 
-Under a `permissive` profile, a person is asked only for what code says must stay with a person. Every other escalation is _ambiguous_: the deterministic engine cannot decide it, so the session's AI decides it instead of the person. Strict mode, and calls made outside the hooks (`policy-manager review`), are unchanged.
+Read, never written, before asking:
 
-How a hook call flows (Claude Code, Codex and Copilot `PreToolUse`):
+- **Claude Code** ([permissions](https://code.claude.com/docs/en/permissions)): `permissions.allow`, `ask` and `deny` in `settings.json` under `CLAUDE_CONFIG_DIR` (default `~/.claude`) and the project's `.claude/settings.json` and `.claude/settings.local.json`. Deny, then ask, then allow; the first match decides. `Bash(cmd)` is exact, `Bash(cmd *)` and `Bash(cmd:*)` are prefixes, and `*` matches any text. A compound command (`&&`, `||`, `;`, `|`, `|&`, `&`, newlines) is allowed only when every subcommand is; deny and ask rules match any subcommand, including `$(…)` bodies. `timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`, `builtin`, `noglob` and bare `xargs` are stripped; `watch`, `setsid`, `ionice`, `flock` and `find -exec`/`-delete` are never allowed by a rule. `Read(...)` and `Edit(...)` path rules use the documented `//`, `~/`, `/` and relative forms, and `Edit` rules cover `Write`.
+- **Codex** ([rules](https://developers.openai.com/codex/rules), [configuration](https://developers.openai.com/codex/config-reference)): `prefix_rule(pattern=[...], decision="allow"|"prompt"|"forbidden")` in `*.rules` under `CODEX_HOME/rules` (default `~/.codex/rules`), and in the project's `.codex/rules` when `config.toml` marks the project trusted. A linear chain of plain commands is checked per command and the strictest decision wins; anything else is one `bash -lc` invocation. Codex documents no other command allowlist in `config.toml`.
+- **Copilot** ([allowing tools](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools)): none. Its allow and deny lists are the `--allow-tool` and `--deny-tool` flags, which apply to one session and are not saved; the format of saved per-location approvals is not documented, and trusted folders gate file access, not commands.
 
-1. **First call.** The command is _not run_ and the person is not asked. The hook blocks it with a reason that tells the model to ask the session's policy-manager agent whether the exact command is recoverable and non-sensitive, to record the answer with `policy-manager classify`, and to retry the same command. The reason starts with `Needs classification (not an error)` and states the rule the classifier applies (`HUMAN_REVIEW_PRINCIPLE`). A person is needed only for unrecoverable loss, credential or secret retrieval, protected configuration or paths, and `humanPatterns`. A recoverable outward-facing write such as an issue comment is approvable, and so is a destructive-but-safe deletion inside a feature worktree. The request hash covers only effect-relevant input, so a retry with a different Bash `description` reuses the classification.
-2. **Recorded.** The session approves the record command in that reason deterministically, in every profile: exactly `node "<this package's dist/cli.js>" classify <harness> <session-id> <<< '<json>'` for the current harness and session, with one single-quoted JSON object and nothing else in the command. Any other direct invocation of a classification record goes to a person: `node … cli.js classify` or `policy-manager classify`, at the start of a command or after an operator, including behind assignments, wrappers such as `env`, `exec` or `xargs`, or keywords such as `then`. That covers another session, harness or CLI path, and anything added before or after. A command that only mentions one, such as a `grep` pattern, gets the normal decision, and so does a record nested in a quoted script (`sh -c '…'`).
-3. **Classified.** `classify` takes `{requestHash, category, confidence, recoverable, rationale}`. The request is approved only when `recoverable` is `true`, `confidence` is at least 0.95, and the category is not `sensitive` or `unknown`. A `destructive` label approves only a deletion the engine itself identified inside a linked feature worktree, on the same terms. Any other request the AI labels `destructive` (an unparsable `rm -rf ~/{a,b}`, for example), and any such deletion not judged recoverable, goes to a **person** (under Codex, a deny), since it may lose data for good. No other deterministic `destructive` escalation is classified. Anything else is a **deny with a reason** the model sees and works around. The outcome is remembered for five minutes for that exact request, and a verdict is final in that time: a deny cannot be reclassified into an approve.
-4. **Fallback.** If the classifier is unavailable or its answer is invalid, the retry reaches a person through the normal prompt (under Codex, which cannot ask, it is a deny that gives the `approve` command the user runs; see **Approving from the terminal**). This happens at most once per request, so there is never a loop and never a lost prompt. After 50 AI approvals in a session, further ambiguous requests go to a person.
+An allow rule approves, audited with `userAllowRule`. It never approves an agent running `approve` itself.
 
-**What always stays with a person, in code, and is never AI-relaxable** (these are the owner's calls; they list exactly what this experiment does not change):
+### Remembering an answer
 
-- Credential and secret retrieval, protected paths and configuration such as the policy profile and hook settings (category `sensitive`).
-- Destructive operations: unmerged-work loss, history and remote rewrites, cloud deletion, publishing, and deletion outside a linked feature worktree. Recoverable deletion is approved deterministically (see **Recoverable deletions and resets**). The only destructive escalation the classifier decides is an `rm` inside a linked feature worktree that the evidence cannot prove recoverable.
-- Commands matching the profile's `humanPatterns`.
-- Writes outside a linked feature worktree (main clones and protected branches).
-- Cloud operations outside the read catalog. The profile's `cloudWrites: "allow"` is the way to automate these.
-- Requests the engine cannot trust: incomplete or invalid requests, a different execution directory, unrecognized patches, and environment or loader overrides such as `LD_PRELOAD`.
+Claude Code's `PreToolUse` carries a `tool_use_id`. When the hook asks, the session records it; the `PostToolUse` (or `PostToolUseFailure`) for that id means the person said yes, and a rejection is not counted. Copilot's `postToolUse` carries no id, so a pending prompt is matched by its request hash (tool, arguments and working directory). The answer gets the same scope as `approve --session`: the protected root, the matching `humanPatterns` entries, or for other rules the exact command, in the same checkout. Unknown, sensitive and destructive requests, possible unrecoverable loss and credential reads are approved once only.
 
-**Known weakness.** The classifier is the working model's own policy-manager agent, and the working model records its answer, so a model that wanted to approve itself could. Confidence is self-reported. This is why the experiment records everything and is reviewed after two days of use rather than trusted.
+## Recording and review
 
-**Recording.** The audit log gets `classification-requested` (with the command, redacted: secret-looking values, URL credentials and long tokens are replaced and the text is capped), `classification` (category, confidence, recoverable, redacted rationale), `decision` (with the stage `requested`, `approved`, `denied` or `fallback`), and `classification-fallback` (with the reason `unavailable`, `invalid-result` or `limit`). Review them across sessions:
+The audit log gets `classification-requested` the first time a request reaches the classifier (with the command redacted under a permissive profile: secret-looking values, URL credentials and long tokens are replaced and the text is capped; the strict default keeps only a vocabulary summary), `ai-classification` (CLI, model, latency, and the verdict or the failure reason), `classification` (category, confidence, recoverable, redacted rationale), `decision` (with the stage `approved`, `denied` or `fallback`, and `userAllowRule` or `userRule` when the user's own rule decided), `classification-fallback` (with the failure reason), and `human-response` and `human-grant` for a remembered answer. Review them across sessions:
 
 ```sh
 policy-manager review-classifications [--since 2026-11-12T00:00:00Z] [--json]
 ```
 
-The report shows how many ambiguous requests were approved, denied, fell back to a person (and why), and never resolved; a confidence histogram; every AI-approved command with its outcome; approved commands that then failed; and commands a person later denied. It reads the session logs under the temporary directory, which the operating system clears after a few days, so run it within two days of starting. `replay` prints how many escalations in recorded transcripts would go to the classifier instead of a person.
+The report shows how many ambiguous requests were approved, denied, fell back to a person (and why), and never resolved; a confidence histogram; every AI-approved command with its outcome; approved commands that then failed; and commands a person later denied. It reads the session logs under the temporary directory, which the operating system clears after a few days, so run it within two days of starting. `replay` prints how many escalations in recorded transcripts would go to the classifier instead of a person; `replay --classify` runs the real classifier on the newest escalations (`--limit`, default 300, four at a time) and reports engine, AI and user-rule approvals, what still asks and why, classifier errors and latency. It sends those commands to your model provider and executes nothing.
 
 ## Approving from the terminal
 
@@ -143,6 +185,8 @@ The deny reason uses `pm` when the managed launcher (see **Install native hooks*
 Each grant is audited as `human-grant` (and `human-response` `approved`), and each use as `human-grant-use` with its scope. A shell command that runs or names a policy-manager `approve`, at any nesting (`sh -c`, `npx`, wrappers), always goes to a person, so an agent that follows the deny reason cannot approve its own request. The guard is lexical and the service trusts any holder of the session token, so it is not a boundary against an agent that deliberately works around it. Grants live in the session's policy service; if it restarts (it exits after 30 idle minutes), retry the request and approve the new hash. Claude Code and Copilot ask natively and do not need this, though it works for them too.
 
 ## Policy
+
+What the list below says "requires human approval" is what the deterministic engine does not approve. It then goes to the AI classifier, unless it is a hard human item (see **How a request is decided**).
 
 - Ordinary file reads must resolve inside a Git repository.
 - Ordinary file writes must resolve inside a linked worktree on a feature branch.
@@ -278,7 +322,7 @@ Deletion that Git can undo is approved; anything Git cannot restore still goes t
 - **`git reset --hard [<commit>]`** (with at most `-q`) when no tracked change is uncommitted, every commit it drops from the branch is on a remote-tracking ref, no untracked or ignored file sits where the target writes, and the target changes no protected path.
 - **`git checkout -- <paths>`, `git checkout .` and `git restore [-W] <paths>`** when the working tree already matches the index for those paths, or the files are only missing. `git restore -SW` needs the working tree and index to match `HEAD`. A tree-ish, `--source`, `-p` or `-f` stays human.
 
-An `rm` whose operands are all plain paths inside a linked feature worktree, but which the evidence above cannot prove recoverable (another untracked file, a directory), goes to the session classifier. This holds only when such deletions are the script's whole effect. The script may also hold `pwd`, `echo`, `ls` and `true`, and at most a leading `cd <dir>` joined by `&&` alone. It may not contain redirections, assignments, variables or substitutions. Otherwise one verdict on the `rm` would carry later commands nobody judged, so the script goes to a person. It is approved on `recoverable: true` at 0.95, and otherwise goes to a person. Every other destructive escalation goes to a person and is never classified: `git clean`, forced pushes and refspecs, unmerged branch deletion, stash and reflog destruction, `find -delete`, `xargs rm`, `unlink`, `sudo`, cloud and infrastructure deletion, publishing, destructive HTTP verbs, and anything in the main checkout or outside a worktree.
+An `rm` whose operands are all plain paths inside a linked feature worktree, but which the evidence above cannot prove recoverable (another untracked file, a directory), is not approved by the engine and goes to the AI classifier (step 2 of **How a request is decided**) like any other escalation, which approves it on `recoverable: true` at 0.95. `git clean`, forced pushes and refspecs, unmerged branch deletion and forced worktree removal are hard human items and are never classified.
 
 Deleting a branch is automatic only when it is already merged into `origin/main` (or `master`): reachable from it, or patch-equivalent to a squash or rebase merge. Remote deletion also needs `origin` and a `git ls-remote` tip that matches the fetched tracking ref, so unfetched commits block it. Evidence uses the locally fetched default branch; fetch first for very recent merges.
 

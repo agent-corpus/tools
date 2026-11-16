@@ -6,10 +6,11 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { executionReport, hookOutput, normalize } from "./adapters.js";
 import { sessionDirectoryPath } from "./audit.js";
+import { CLASSIFIER_ENV } from "./classifier.js";
 import { hookConfig } from "./config.js";
-import { HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
+import { HUMAN_ONLY_FOR } from "./principle.js";
 import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
-import { replayTranscripts } from "./replay.js";
+import { replayClassified, replayTranscripts } from "./replay.js";
 import { formatReview, reviewClassifications, sessionDirectories } from "./review.js";
 import { latestHumanDecision, send, sendTo, serve, start, stop } from "./service.js";
 import type { GrantPreview } from "./session.js";
@@ -29,11 +30,11 @@ policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run]
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
 policy-manager profile validate <file>   # check a policy profile without installing it
 policy-manager profile install <file>    # install it to the user config directory outside Git
-policy-manager replay <transcript-dir-or-file...> [--profile <file>] [--files <n>]  # approval rate over recorded Bash commands; nothing is executed
+policy-manager replay <transcript-dir-or-file...> [--profile <file>] [--files <n>] [--classify [--limit <n>] [--json]]  # approval rate over recorded Bash commands; --classify runs the real AI classifier on the newest escalations; nothing is executed
 policy-manager review-classifications [--since <iso-time>] [--dir <session-dir>...] [--json]  # risk review of AI-classified ambiguous requests
 policy-manager stop <claude|codex|copilot> <session-id>
 A per-session background service checks policy and writes private temporary audit.jsonl logs.
-AI classification comes from the session's policy-manager agent, never an external API.
+What the engine cannot approve is classified by the harness CLI the user is logged in to (claude, codex or copilot), run inside the hook.
 Unknown effects require human approval. Exit 0: protocol response; exit 1: malformed input or service failure.
 `;
 /** An `approve` failure whose message is meant for the user. */
@@ -105,6 +106,7 @@ try {
       cloudWrites: profile.cloudWrites,
       mcpReadOnly: profile.mcpReadOnly.length,
       toolsDeny: Object.values(profile.toolsDeny).reduce((n, list) => n + list.length, 0),
+      classifier: profile.classifier,
       digest: profile.digest,
     };
     if (harnessArg === "install") {
@@ -118,12 +120,42 @@ try {
   } else if (action === "replay") {
     const { values, positionals } = parseArgs({
       args: args.slice(1),
-      options: { profile: { type: "string" }, files: { type: "string" } },
+      options: {
+        profile: { type: "string" },
+        files: { type: "string" },
+        classify: { type: "boolean" },
+        limit: { type: "string" },
+        json: { type: "boolean" },
+      },
       allowPositionals: true,
     });
     const profile = values.profile
       ? parseProfile(readFileSync(values.profile, "utf8"))
       : loadProfile();
+    if (values.classify) {
+      const report = await replayClassified(positionals, profile, {
+        limit: Number(values.limit ?? 300),
+        files: Number(values.files ?? 200),
+        concurrency: 4,
+      });
+      if (values.json) console.log(JSON.stringify(report, null, 2));
+      else {
+        console.log(
+          `${report.commands} unique commands read; engine approved ${report.engineApproved}; ${report.escalations} escalations replayed`,
+        );
+        console.log(
+          `AI approved ${report.aiApproved}; user allow rule approved ${report.userAllowApproved}; user deny/ask rule (left to the harness) ${report.userRuleNative}; other no-decision ${report.otherNative}; still ask ${report.stillAsk}`,
+        );
+        console.log(
+          `classifier runs ${report.classifierRuns}; errors ${JSON.stringify(report.classifierErrors)}; latency p50 ${report.latencyMs.p50} ms, p95 ${report.latencyMs.p95} ms, max ${report.latencyMs.max} ms`,
+        );
+        for (const row of report.askReasons.slice(0, 15)) {
+          console.log(`${row.count}\t${row.reason}`);
+          for (const example of row.examples) console.log(`\t  ${example}`);
+        }
+      }
+      process.exit(0);
+    }
     const report = replayTranscripts(positionals, profile, Number(values.files ?? 50));
     const pct = (n: number) => `${((100 * n) / Math.max(report.commands, 1)).toFixed(1)}%`;
     console.log(
@@ -241,13 +273,29 @@ try {
   } else if (action === "hook") {
     const payload = await stdin();
     const request = normalize(harness, payload);
-    if (phase === "SessionEnd") {
+    const toolUseId = payload.tool_use_id ?? payload.toolUseId;
+    if (process.env[CLASSIFIER_ENV] === "1") {
+      // Inside the classifier's own CLI run, which has no tools and no hooks: refuse anything that
+      // still reaches a policy hook, and start no service.
+      if (phase === "PreToolUse")
+        console.log(
+          hookOutput(harness, phase, {
+            decision: "deny",
+            category: "unknown",
+            reason: "The policy classifier runs without tools",
+            requestHash: "",
+            cache: "none",
+            cached: false,
+          }),
+        );
+      else console.log(harness === "codex" ? "" : "{}");
+    } else if (phase === "SessionEnd") {
       await stop(harness, request.sessionId);
       console.log("{}");
     } else {
       const directory = await start(harness, request.sessionId, cliPath);
       if (phase === "SessionStart") {
-        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Native hooks route tool and permission requests directly to the deterministic service. An ambiguous request is blocked once with instructions to have the policy-manager agent classify it and then retry; the person is asked only if classification fails. ${HUMAN_REVIEW_PRINCIPLE} If .agent-config/agents/policy-manager.md exists, read it before creating a read-only policy-manager agent. Never ask an agent to approve its own tools.`;
+        const context = `Policy service started. Audit log: ${join(directory, "audit.jsonl")}. Tool requests are checked by a deterministic policy engine; what it cannot approve is classified by an AI model through the user's own logged-in CLI, inside the hook. What neither approves goes to the user${harness === "codex" ? ", who approves it from their own terminal" : " in the normal permission prompt"}. A person is needed only for ${HUMAN_ONLY_FOR}. Never ask an agent to approve its own tools.`;
         console.log(
           JSON.stringify(
             harness === "copilot"
@@ -261,9 +309,20 @@ try {
           ),
         );
       } else if (phase === "PostToolUse" || phase === "PostToolUseFailure") {
+        const error = payload.error ?? payload.tool_error;
         await send(harness, request.sessionId, {
           action: "record",
           report: executionReport(request, phase, payload),
+          phase,
+          ...(typeof toolUseId === "string" ? { toolUseId } : {}),
+          ...(phase === "PostToolUseFailure"
+            ? {
+                failure: {
+                  ...(typeof error === "string" ? { error } : {}),
+                  interrupted: payload.is_interrupt === true,
+                },
+              }
+            : {}),
         });
         console.log("{}");
       } else if (phase === "PreToolUse" || phase === "PermissionRequest") {
@@ -271,6 +330,7 @@ try {
           action: "review",
           request,
           phase,
+          ...(typeof toolUseId === "string" ? { toolUseId } : {}),
         })) as Decision;
         const output = hookOutput(harness, phase, decision, {
           cliPath,

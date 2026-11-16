@@ -108,6 +108,21 @@ export function grantScope(
   profile: Profile,
 ): string | undefined {
   try {
+    // Possible unrecoverable loss and credential reads are approved once, whatever the engine's
+    // category for the command.
+    if (
+      decision.hard &&
+      [
+        "force-push",
+        "delete-unmerged-branch",
+        "remove-worktree-force",
+        "git-clean",
+        "credential-read",
+        "self-approve",
+        "foreign-classification-record",
+      ].includes(decision.hard)
+    )
+      return undefined;
     if (decision.reason === PROTECTED_PATH) {
       const paths = targets(request) ?? shellPaths(request);
       if (!paths?.length) return undefined;

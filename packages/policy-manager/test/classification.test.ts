@@ -7,7 +7,6 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { classifyCommand, hookResponse } from "../src/adapters.js";
 import { audit, requestSummary } from "../src/audit.js";
 import { evaluate, hash, requestHash } from "../src/policy.js";
-import { HUMAN_REVIEW_PRINCIPLE } from "../src/principle.js";
 import { parseProfile } from "../src/profile.js";
 import { redactText } from "../src/redact.js";
 import { replayTranscripts } from "../src/replay.js";
@@ -56,24 +55,36 @@ beforeAll(() => {
 });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-describe("hint and retry flow", () => {
-  test("the first hook call blocks with an instruction, never a human prompt", async () => {
-    const { directory, session: s } = session();
+describe("classification inside the hook", () => {
+  test("nothing blocks a request to ask for a classification: the hook classifies it itself", async () => {
+    const { directory } = session();
+    let runs = 0;
+    const s = new PolicySession(directory, "claude", "s1", permissive, undefined, {
+      classify: async (cli, prompt) => {
+        runs++;
+        expect(cli).toBe("claude");
+        expect(prompt).toContain("echo $");
+        return {
+          ok: true,
+          cli,
+          model: "haiku",
+          latencyMs: 5,
+          verdict: { category: "code-read", confidence: 0.97, recoverable: true, rationale: "ok" },
+        };
+      },
+      nativeRules: () => undefined,
+    });
     const r = ambiguous();
-    const d = s.review(r, undefined, "PreToolUse");
-    expect(d.decision).toBe("deny");
-    expect(d.classification).toBe("requested");
-    const out = JSON.stringify(
-      hookResponse("claude", "PreToolUse", d, { cliPath: "/opt/cli.js", sessionId: "s1" }),
-    );
-    expect(out).toContain('"permissionDecision":"deny"');
-    expect(out).toContain('"permissionDecisionReason":"Needs classification (not an error)');
-    expect(out).toContain("|temp-write|");
-    expect(out).toContain(hash(r));
-    expect(out).toContain("/opt/cli.js");
-    expect(out).toContain("classify claude s1");
-    expect(out).not.toContain('"ask"');
+    const pending = s.review(r, undefined, "PreToolUse");
+    expect(pending).toMatchObject({ decision: "human", needsClassification: true });
+    const d = await s.decide(r, "PreToolUse");
+    expect(d).toMatchObject({ decision: "approve", classification: "approved" });
+    expect(runs).toBe(1);
+    const out = JSON.stringify(hookResponse("claude", "PreToolUse", d));
+    expect(out).not.toContain("classify");
+    // Recorded for review-classifications; nothing is sent to the agent.
     expect(await events(directory, "classification-requested")).toHaveLength(1);
+    expect(await events(directory, "ai-classification")).toHaveLength(1);
   });
 
   test("a confident recoverable classification approves, and the retry runs", () => {
@@ -88,40 +99,27 @@ describe("hint and retry flow", () => {
     });
   });
 
-  test("a not-recoverable or low-confidence classification denies with a reason, every time", () => {
+  test("a not-recoverable or low-confidence classification asks a person, every time", () => {
     for (const extra of [{ recoverable: false }, { confidence: 0.6 }, { recoverable: undefined }]) {
       const { session: s } = session();
       const r = ambiguous();
       s.review(r, undefined, "PreToolUse");
       const first = s.classify(verdict(r, extra));
-      expect(first.decision).toBe("deny");
-      expect(first.reason).toContain("Not run");
+      expect(first.decision).toBe("human");
+      expect(first.classifierNote).toContain("did not approve");
       for (let i = 0; i < 3; i++) {
         const again = s.review(r, undefined, "PreToolUse");
-        expect(again.decision).toBe("deny");
+        expect(again.decision).toBe("human");
         expect(again.classification).toBe("denied");
       }
-      const response = hookResponse("claude", "PreToolUse", first);
-      expect(JSON.stringify(response)).toContain('"permissionDecision":"deny"');
+      const response = JSON.stringify(hookResponse("claude", "PreToolUse", first));
+      expect(response).toContain('"permissionDecision":"ask"');
+      expect(response).toContain("did not approve");
     }
   });
 
-  test("an unusable classifier falls back to a human exactly once, and the reason is recorded", async () => {
-    const { directory, session: s } = session();
-    const r = ambiguous();
-    expect(s.review(r, undefined, "PreToolUse").decision).toBe("deny");
-    const second = s.review(r, undefined, "PreToolUse");
-    expect(second.decision).toBe("human");
-    expect(second.fallbackReason).toBe("unavailable");
-    expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
-    expect(s.review(r, undefined, "PermissionRequest").decision).toBe("human");
-    const fallbacks = await events(directory, "classification-fallback");
-    expect(fallbacks).toHaveLength(1);
-    expect(fallbacks[0]?.attributes.fallbackReason).toBe("unavailable");
-  });
-
-  test("an invalid classification falls back to a human on the retry", async () => {
-    const { directory, session: s } = session();
+  test("an invalid classification goes to a person on the retry", () => {
+    const { session: s } = session();
     const r = ambiguous();
     s.review(r, undefined, "PreToolUse");
     expect(() => s.classify(verdict(r, { confidence: Number.NaN }))).toThrow();
@@ -129,9 +127,6 @@ describe("hint and retry flow", () => {
     const retry = s.review(r, undefined, "PreToolUse");
     expect(retry.decision).toBe("human");
     expect(retry.fallbackReason).toBe("invalid-result");
-    expect((await events(directory, "classification-fallback"))[0]?.attributes.fallbackReason).toBe(
-      "invalid-result",
-    );
   });
 
   test("a classification for another request is rejected and approves nothing", () => {
@@ -162,13 +157,13 @@ describe("hint and retry flow", () => {
     expect(retried.fallbackReason).toBe("limit");
   });
 
-  test("a verdict is final: a deny cannot be reclassified, and an approval cannot be replaced", () => {
+  test("a verdict is final: a refusal cannot be reclassified, and an approval cannot be replaced", () => {
     const { session: s } = session();
     const denied = ambiguous();
     s.review(denied, undefined, "PreToolUse");
-    expect(s.classify(verdict(denied, { recoverable: false })).decision).toBe("deny");
+    expect(s.classify(verdict(denied, { recoverable: false })).decision).toBe("human");
     expect(() => s.classify(verdict(denied, { confidence: 0.99 }))).toThrow();
-    expect(s.review(denied, undefined, "PreToolUse").decision).toBe("deny");
+    expect(s.review(denied, undefined, "PreToolUse").decision).toBe("human");
     const approved = ambiguous();
     s.review(approved, undefined, "PreToolUse");
     s.classify(verdict(approved));
@@ -176,17 +171,14 @@ describe("hint and retry flow", () => {
     expect(s.review(approved, undefined, "PreToolUse").decision).toBe("approve");
   });
 
-  test("calls outside a hook, and strict mode, behave as before", () => {
+  test("strict mode also sends what the engine escalates to the classifier", () => {
     const { session: s } = session();
     expect(s.review(ambiguous()).decision).toBe("human");
     const strict = session(parseProfile(JSON.stringify({ version: 1, mode: "strict" })));
     const r = ambiguous();
     const d = strict.session.review(r, undefined, "PreToolUse");
-    expect(d.decision).toBe("human");
-    expect(d.classification).toBeUndefined();
-    expect(hookResponse("claude", "PreToolUse", d)).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "ask" },
-    });
+    expect(d).toMatchObject({ decision: "human", tier: "ambiguous", needsClassification: true });
+    expect(strict.session.classify(verdict(r)).decision).toBe("approve");
   });
 });
 
@@ -196,7 +188,6 @@ describe("the AI never relaxes a deterministic boundary", () => {
     ["protected path", "echo x > .claude/settings.json"],
     ["organization pattern", "terraform apply"],
     ["environment override", "LD_PRELOAD=/tmp/x.so ls"],
-    ["cloud write", "az vm restart --name a --resource-group b"],
   ];
   for (const [name, command] of always)
     test(`${name} stays with a human even with a perfect classification`, () => {
@@ -216,36 +207,43 @@ describe("the AI never relaxes a deterministic boundary", () => {
       expect(evaluate(r, verdict(r, { confidence: 1 }), permissive).decision).toBe("human");
     });
 
-  test("sensitive and unknown categories from the AI are denied", () => {
+  test("sensitive and unknown categories from the AI ask a person", () => {
     for (const category of ["sensitive", "unknown"] as const) {
       const { session: s } = session();
       const r = ambiguous();
       s.review(r, undefined, "PreToolUse");
-      expect(s.classify(verdict(r, { category, confidence: 1 })).decision).toBe("deny");
+      expect(s.classify(verdict(r, { category, confidence: 1 })).decision).toBe("human");
     }
   });
 });
 
 describe("destructive requests follow recoverability", () => {
-  test("the classification hint carries the shared principle", () => {
-    const { session: s } = session();
-    const first = s.review(ambiguous(), undefined, "PreToolUse");
-    expect(first).toMatchObject({ decision: "deny", classification: "requested" });
-    expect(JSON.stringify(hookResponse("claude", "PreToolUse", first))).toContain(
-      HUMAN_REVIEW_PRINCIPLE,
-    );
-  });
-
-  // Deletion inside a linked feature worktree is classified; see recoverable.test.ts.
+  // Unrecoverable loss is a hard human item: never classified, never approved by a verdict.
   test.each([
-    "rm -rf build", // not in a linked feature worktree
     "git push --force origin feature",
     "git push origin +feature",
     "git push origin --delete wip",
     "git branch -D wip",
+    "git clean -fdx",
+    "git push --force origin {feature,x}",
+    "git clean -fdx {a,b}",
+  ])("%s stays with a person even on a confident recoverable verdict", (command) => {
+    const r = request(command);
+    const d = evaluate(r, undefined, permissive);
+    expect(d.decision).toBe("human");
+    expect(d.tier).toBeUndefined();
+    expect(d.hard).toEqual(expect.any(String));
+    for (const category of ["destructive", "worktree-write"] as const) {
+      const verdictFor = verdict(r, { category, confidence: 0.99, recoverable: true });
+      expect(evaluate(r, verdictFor, permissive).decision).toBe("human");
+    }
+  });
+
+  // Other destructive requests go to the classifier, which approves only what is recoverable.
+  test.each([
+    "rm -rf build",
     "git reflog expire --all",
     "git stash drop",
-    "git clean -fdx",
     "az group delete --name x",
     "terraform destroy",
     "npm publish",
@@ -253,35 +251,18 @@ describe("destructive requests follow recoverability", () => {
     "rm -rf ~/Documents",
     "curl -X DELETE https://example.com/x",
     "sudo ls",
-  ])("%s stays with a person even on a confident recoverable verdict", (command) => {
+  ])("%s follows the classifier's recoverability verdict", (command) => {
     const r = request(command);
     const d = evaluate(r, undefined, permissive);
-    expect(d.decision).toBe("human");
-    expect(d.tier).toBeUndefined();
-    const verdictFor = verdict(r, { category: "destructive", confidence: 0.99, recoverable: true });
-    expect(evaluate(r, verdictFor, permissive).decision).toBe("human");
-  });
-
-  test("a destructive label approves nothing the engine did not prove is a worktree deletion", () => {
-    for (const command of [
-      "rm -rf ~/{Documents,x}",
-      "git push --force origin {feature,x}",
-      "git clean -fdx {a,b}",
-      "echo $SOME_VAR",
-    ]) {
-      const { session: s } = session();
-      const r = request(command);
-      expect(s.review(r, undefined, "PreToolUse").classification, command).toBe("requested");
-      const d = s.classify(verdict(r, { category: "destructive", confidence: 0.99 }));
-      expect(d.decision, command).toBe("human");
-    }
-    // A non-destructive label on an ambiguous request still follows the verdict, as on main.
-    const { session: s } = session();
-    const r = request("echo $SOME_VAR");
-    s.review(r, undefined, "PreToolUse");
-    expect(s.classify(verdict(r, { category: "code-read", confidence: 0.99 })).decision).toBe(
-      "approve",
-    );
+    expect(d).toMatchObject({ decision: "human", tier: "ambiguous" });
+    const unrecoverable = verdict(r, {
+      category: "destructive",
+      confidence: 0.99,
+      recoverable: false,
+    });
+    expect(evaluate(r, unrecoverable, permissive).decision).toBe("human");
+    const recoverable = verdict(r, { category: "temp-write", confidence: 0.97, recoverable: true });
+    expect(evaluate(r, recoverable, permissive).decision).toBe("approve");
   });
 
   test("an ambiguous request the AI calls destructive but unrecoverable goes to a person", () => {
@@ -375,24 +356,10 @@ describe("recording", () => {
     const denied = ambiguous("DENIED");
     a.session.review(denied, undefined, "PreToolUse");
     a.session.classify(verdict(denied, { recoverable: false, confidence: 0.8 }));
-    const fallback = ambiguous("FALLBACK");
-    a.session.review(fallback, undefined, "PreToolUse");
-    a.session.review(fallback, undefined, "PreToolUse");
-    a.session.record({ event: "human-response", requestHash: hash(fallback), response: "denied" });
-    const abandoned = ambiguous("ABANDONED");
-    a.session.review(abandoned, undefined, "PreToolUse");
+    a.session.record({ event: "human-response", requestHash: hash(denied), response: "denied" });
 
     const review = await reviewClassifications([a.directory, join(root, "missing")]);
-    expect(review).toMatchObject({
-      sessions: 1,
-      requested: 4,
-      approved: 1,
-      denied: 1,
-      fallback: 1,
-      unresolved: 1,
-      fallbackReasons: { unavailable: 1 },
-    });
-    expect(review.fallbackRate).toBeCloseTo(0.25);
+    expect(review).toMatchObject({ sessions: 1, approved: 1, denied: 1 });
     expect(review.approvedButFailed).toHaveLength(1);
     expect(review.humanDenied).toHaveLength(1);
     expect(review.histogram.find((b) => b.range === "0.95-0.99")?.count).toBe(1);
@@ -432,14 +399,15 @@ describe("the classify round trip", () => {
       expect(command).toContain("classify claude s1");
       expect(evaluate(request(command), undefined, permissive).decision).toBe("approve");
     });
-  test("the hook's instruction contains exactly that command", () => {
+  test("no hook output asks the agent to run it any more", () => {
     const { session: s } = session();
     const d = s.review(ambiguous(), undefined, "PreToolUse");
-    const out = JSON.stringify(
-      hookResponse("claude", "PreToolUse", d, { cliPath: installed, sessionId: "s1" }),
-    );
-    const command = classifyCommand("claude", { cliPath: installed, sessionId: "s1" });
-    expect(out).toContain(JSON.stringify(command).slice(1, -1));
+    for (const harness of ["claude", "codex", "copilot"] as const) {
+      const out = JSON.stringify(
+        hookResponse(harness, "PreToolUse", d, { cliPath: installed, sessionId: "s1" }),
+      );
+      expect(out).not.toContain(" classify ");
+    }
   });
   test("a path or session id that cannot be quoted safely falls back to a generic command", () => {
     expect(classifyCommand("claude", { cliPath: '/x"y/cli.js', sessionId: "s1" })).toContain(
@@ -577,12 +545,8 @@ describe("the session approves only its own record command", () => {
     const s = recording();
     const original = { ...ambiguous(), input: { command: "echo $RETRY", description: "first" } };
     const blocked = s.review(original, undefined, "PreToolUse");
-    expect(blocked.classification).toBe("requested");
-    const out = JSON.stringify(
-      hookResponse("claude", "PreToolUse", blocked, { cliPath, sessionId: "s1" }),
-    );
+    expect(blocked).toMatchObject({ decision: "human", needsClassification: true });
     const record = own(answer({ ...original, input: { command: "echo $RETRY" } }));
-    expect(out).toContain(JSON.stringify(own("<json>")).slice(1, -1));
     expect(s.review(request(record), undefined, "PreToolUse").decision).toBe("approve");
     // What the CLI then sends the service.
     const classified = s.classify(JSON.parse(record.slice(record.indexOf("'") + 1, -1)));
@@ -657,23 +621,28 @@ describe("review history", () => {
 });
 
 describe("adapters", () => {
-  test("Codex cannot ask, so a fallback is a deny that does not invite another classification", () => {
-    const { session: s } = session();
-    const r = ambiguous();
-    s.review(r, undefined, "PreToolUse");
-    const fallback = s.review(r, undefined, "PreToolUse");
-    expect(fallback.classification).toBe("fallback");
+  test("Codex cannot ask: a request the classifier did not settle is a deny with the approve command", async () => {
+    const directory = join(root, `codex-${counter++}`);
+    mkdirSync(directory, { mode: 0o700 });
+    const s = new PolicySession(directory, "codex", "s1", permissive, undefined, {
+      classify: async (cli) => ({ ok: false, reason: "timeout", cli, model: "m", latencyMs: 1 }),
+      nativeRules: () => undefined,
+    });
+    const r = { ...ambiguous(), harness: "codex" as const };
+    const fallback = await s.decide(r, "PreToolUse");
+    expect(fallback).toMatchObject({ classification: "fallback", fallbackReason: "timeout" });
     const text = JSON.stringify(hookResponse("codex", "PreToolUse", fallback));
     expect(text).toContain('"permissionDecision":"deny"');
     expect(text).not.toContain("Classify it");
     expect(text).toContain("approve --last");
+    expect(text).toContain("timed out");
   });
 
-  test("Copilot gets a deny with a reason; approvals and ordinary asks are unchanged", () => {
+  test("Copilot asks with a reason; approvals and ordinary asks are unchanged", () => {
     const { session: s } = session();
     const d = s.review(ambiguous(), undefined, "PreToolUse");
     expect(hookResponse("copilot", "PreToolUse", d)).toMatchObject({
-      permissionDecision: "deny",
+      permissionDecision: "ask",
     });
     const approved = evaluate(request("git status"), undefined, permissive);
     expect(hookResponse("copilot", "PreToolUse", approved)).toEqual({
@@ -699,7 +668,7 @@ describe("replay", () => {
       [line("echo $ONE"), line("echo $TWO"), line("rm -rf build"), line("ls")].join("\n"),
     );
     const report = replayTranscripts([file], permissive);
-    expect(report).toMatchObject({ commands: 4, approved: 1, classified: 2 });
+    expect(report).toMatchObject({ commands: 4, approved: 1, classified: 3 });
   });
 });
 
@@ -732,18 +701,16 @@ describe("request hash and classifier rule", () => {
     const { session: s } = session();
     const r = ambiguous();
     const first = { ...r, input: { ...r.input, description: "first" } };
-    expect(s.review(first, undefined, "PreToolUse").decision).toBe("deny");
+    expect(s.review(first, undefined, "PreToolUse").decision).toBe("human");
     expect(s.classify(verdict(r)).decision).toBe("approve");
     const retry = { ...r, input: { ...r.input, description: "second" } };
     expect(s.review(retry, undefined, "PreToolUse").decision).toBe("approve");
   });
 
-  test("a recoverable impactful write is AI-approvable, and the hint says so", () => {
+  test("a recoverable impactful write is AI-approvable", () => {
     const { session: s } = session();
     const r = ambiguous();
-    const d = s.review(r, undefined, "PreToolUse");
-    const out = JSON.stringify(hookResponse("claude", "PreToolUse", d));
-    expect(out).toContain(HUMAN_REVIEW_PRINCIPLE);
+    s.review(r, undefined, "PreToolUse");
     expect(s.classify(verdict(r, { category: "impactful-write", confidence: 0.95 })).decision).toBe(
       "approve",
     );

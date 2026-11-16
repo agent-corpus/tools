@@ -18,9 +18,10 @@ import {
   tempWrite,
 } from "./evidence.js";
 import { commandDecision } from "./flow.js";
+import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { helperMatch } from "./helpers.js";
 import { mergedEvidence, remoteTipMatches } from "./merged.js";
-import { evaluateArgv, result } from "./policy.js";
+import { evaluateArgv, result, words as shellWords } from "./policy.js";
 import type { Profile } from "./profile.js";
 import {
   deletesProtected,
@@ -867,6 +868,9 @@ function gitDecision(
   sole: () => boolean,
   roots: string[],
   fill?: Fill,
+  /** Judges a `!` alias's shell command in the directory Git runs it in. */
+  shell?: (script: string, cwd: string) => Decision,
+  aliasDepth = 0,
 ): Decision {
   const args = argv.slice(1);
   let index = 0;
@@ -880,6 +884,30 @@ function gitDecision(
   }
   const sub = args[index];
   const rest = args.slice(index + 1);
+  // A word Git does not know is an alias (repository, global or system configuration) or an
+  // external command: judge what the alias expands to, and approve nothing else.
+  if (sub !== undefined && !KNOWN_GIT.has(sub)) {
+    const alias = aliasDepth < 4 ? gitAlias(cwd, sub) : undefined;
+    if (alias === undefined)
+      return human(request, "unknown", "Git subcommand is neither built in nor an alias");
+    if (alias.startsWith("!"))
+      return shell
+        ? shell(`${alias.slice(1)} ${shellArgs(rest)}`.trim(), aliasDirectory(cwd))
+        : human(request, "unknown", "Git shell alias requires human review");
+    const expanded = shellWords(alias);
+    if (!expanded)
+      return human(request, "unknown", "Git alias with shell syntax requires human review");
+    return gitDecision(
+      request,
+      ["git", ...expanded, ...rest],
+      cwd,
+      sole,
+      roots,
+      fill,
+      shell,
+      aliasDepth + 1,
+    );
+  }
   const flags = rest.filter((word) => word.startsWith("-"));
   const positional = rest.filter((word) => !word.startsWith("-"));
   const has = (...names: string[]) =>
@@ -2050,6 +2078,10 @@ export function simpleDecision(
       () => argv[0] === "git" && command.argv[0] === "git" && depth === 0 && soleEffect(request),
       [...profile.scratchRoots, ...tempRoots()],
       fill,
+      (script, dir) =>
+        depth >= 2
+          ? human(request, "unknown", "Git shell alias requires human review")
+          : commandDecision(request, script, profile, depth + 1, [dir], fill),
     );
   if (program === "gh") {
     const gh = ghDecision(request, argv);

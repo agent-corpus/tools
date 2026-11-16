@@ -665,7 +665,7 @@ describe("temp-write classification", () => {
       tool: "Bash",
       input: { command: "echo $UNKNOWN_VAR" },
     };
-    expect(s.review(r, undefined, "PreToolUse").decision).toBe("deny");
+    expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
     const d = s.classify({
       requestHash: hash(r),
       category: "temp-write",

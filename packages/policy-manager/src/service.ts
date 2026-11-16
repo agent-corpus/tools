@@ -17,7 +17,13 @@ interface Message {
   report?: OutcomeReport;
   phase?: string;
   grant?: { requestHash: string; confirm: boolean; session?: boolean };
+  /** Claude Code's `tool_use_id` for a PreToolUse or PostToolUse. */
+  toolUseId?: string;
+  /** A PostToolUseFailure's error text and interrupt flag, to tell a rejected prompt from a run. */
+  failure?: { error?: string; interrupted?: boolean };
 }
+/** How long a hook waits for a review, which can include the AI classifier's run. */
+export const REVIEW_TIMEOUT_MS = 40_000;
 function endpoint(directory: string): string {
   return process.platform === "win32"
     ? `\\\\.\\pipe\\acp-${hash(directory).slice(0, 32)}`
@@ -38,7 +44,7 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
     socket.setTimeout(3000, () => socket.destroy());
     let data = "";
     socket.on("error", () => {});
-    socket.on("data", (chunk) => {
+    socket.on("data", async (chunk) => {
       data += chunk.toString();
       if (data.length > 1024 * 1024) {
         socket.destroy();
@@ -69,6 +75,8 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
             : "invalid",
         });
         idle.refresh();
+        // A review can wait for the classifier; the connection stays open until it answers.
+        socket.setTimeout(REVIEW_TIMEOUT_MS + 5000);
         let result: unknown;
         if (message.action === "ping") result = { ready: true };
         else if (message.action === "pending") result = session.latestHumanDecision() ?? null;
@@ -77,12 +85,30 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
           result = { stopped: true };
           server.close();
         } else if (message.action === "review" && message.request)
-          result = session.review(message.request, undefined, message.phase);
+          result = await session.decide(
+            message.request,
+            message.phase,
+            typeof message.toolUseId === "string" ? message.toolUseId : undefined,
+          );
         else if (message.action === "classify" && message.classification)
           result = session.classify(message.classification);
         else if (message.action === "record" && message.report) {
           session.record(message.report);
-          result = { recorded: true };
+          const answer =
+            message.phase?.startsWith("PostToolUse") && message.report.event === "execution-result"
+              ? session.answered({
+                  requestHash: message.report.requestHash,
+                  phase: message.phase,
+                  ...(typeof message.toolUseId === "string"
+                    ? { toolUseId: message.toolUseId }
+                    : {}),
+                  ...(typeof message.failure?.error === "string"
+                    ? { error: message.failure.error.slice(0, 2000) }
+                    : {}),
+                  ...(message.failure?.interrupted === true ? { interrupted: true } : {}),
+                })
+              : undefined;
+          result = { recorded: true, ...(answer ? { answer } : {}) };
         } else if (message.action === "grant" && message.grant) {
           try {
             result = session.grant(
@@ -142,7 +168,11 @@ export function send(
   sessionId: string,
   message: Omit<Message, "token">,
 ): Promise<unknown> {
-  return sendTo(sessionDirectory(harness, sessionId), message);
+  return sendTo(
+    sessionDirectory(harness, sessionId),
+    message,
+    message.action === "review" ? REVIEW_TIMEOUT_MS : undefined,
+  );
 }
 /**
  * The newest request waiting for a person across this user's running policy services, for
@@ -210,11 +240,15 @@ export async function latestHumanDecision(): Promise<
   return best;
 }
 /** Sends to the service of an existing session directory (see `approve --last`). */
-export function sendTo(directory: string, message: Omit<Message, "token">): Promise<unknown> {
+export function sendTo(
+  directory: string,
+  message: Omit<Message, "token">,
+  timeoutMs = 4000,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(endpoint(directory));
     let data = "";
-    socket.setTimeout(4000, () => socket.destroy(new Error("Policy service timeout")));
+    socket.setTimeout(timeoutMs, () => socket.destroy(new Error("Policy service timeout")));
     socket.on("error", reject);
     socket.on("connect", () =>
       socket.write(`${JSON.stringify({ ...message, token: sessionToken(directory) })}\n`),
