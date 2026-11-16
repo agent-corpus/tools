@@ -606,6 +606,8 @@ describe("gh writes reach the classifier only in recoverable shapes", () => {
     "gh api graphql -f query='query{viewer{login}}' ",
     "gh ruleset list",
     "gh ruleset view 1",
+    "gh api repos/o/r/pulls/comments/$id -q .body",
+    'gh api "repos/o/r/contents/$f?ref=main" -q .content',
     "gh pr view 3",
   ])("classifier or engine: %s", (command) => {
     expect(hardRules(shell(command), base())).not.toContain("repo-delete");

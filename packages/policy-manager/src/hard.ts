@@ -374,8 +374,11 @@ function ghApiFloor(texts: string[]): boolean {
     } else if (/^-[Htqp]$|^--(?:header|jq|template|hostname|cache|preview)$/.test(text)) k++;
     else if (!text.startsWith("-") && endpoint === undefined) endpoint = text;
   }
-  if (endpoint === undefined || /\$/.test(endpoint)) return true;
   const effective = (method ?? (fields ? "POST" : "GET")).toUpperCase();
+  // A call with no method and no fields is a GET, whatever the endpoint; a write to an endpoint
+  // that cannot be read is a floor item.
+  if (endpoint === undefined) return true;
+  if (/\$/.test(endpoint)) return !["GET", "HEAD"].includes(effective);
   if (endpoint === "graphql") {
     // A query read from a file cannot be judged; one without a mutation reads.
     if (values.some((value) => value === "@" || /^query=@/.test(value))) return true;
