@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import {
@@ -200,6 +200,24 @@ export function readable(cwd: string, word: string, roots: readonly string[] = [
 }
 
 /**
+ * The directory a `cd` to `target` enters for certain, or undefined: an absolute path (or `~/...`)
+ * to an existing directory that can be entered now. As a script's first command such a `cd` cannot
+ * fail, so what follows runs only there, however it is joined.
+ */
+export function enterable(target: string): string | undefined {
+  if (!/^(?:\/|~\/|~$|[A-Za-z]:[\\/])/.test(target)) return undefined;
+  if (process.env.CDPATH && !/^[/~]/.test(target)) return undefined;
+  try {
+    const dir = resolveWord("/", target);
+    if (!statSync(dir).isDirectory()) return undefined;
+    accessSync(dir, constants.X_OK);
+    return dir;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Whether a word given to a read-only program may be read if it names a file: a word that names an
  * existing path must be `readable`, one that cannot be resolved is refused, and none may name a
  * secret. The value of `--opt=value` is judged the same way.
@@ -372,6 +390,15 @@ export function plainRead(request: Request, roots: readonly string[] = []): bool
         const target = cmd.argv[1];
         if (cmd.argv.length !== 2 || !target || target.startsWith("-") || cmd.redirects.length)
           return false;
+        // As the script's first command, a `cd` that cannot fail leaves only its target.
+        // After `||` the next command runs exactly when it fails, so `||` anywhere keeps the old one.
+        const sure =
+          pipeline === pipelines[0] && !command.includes("||") ? enterable(target) : undefined;
+        if (sure) {
+          cwds.clear();
+          cwds.add(sure);
+          continue;
+        }
         for (const dir of [...cwds]) {
           const next = resolveSafe(dir, target);
           if (next === undefined || !existsSync(next)) return false;

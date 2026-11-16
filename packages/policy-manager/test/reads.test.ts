@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { evaluate, PLAIN_READ } from "../src/policy.js";
 import { parseProfile, strictProfile } from "../src/profile.js";
@@ -292,4 +292,24 @@ describe("one path rule for plain reads and read-only prefixes", () => {
       );
     },
   );
+});
+
+describe("a first cd that cannot fail leaves only its target", () => {
+  const to = () => repo.replace(/\\/g, "/");
+  test.each([
+    (r: string) => `cd ${r} && git grep -n x`,
+    (r: string) => `cd ${r}; cat AGENTS.md | head -5`,
+    (r: string) => `cd ${r} && git log --oneline -1; git grep -n x -- 'src/**' | head -3`,
+  ])("approved from outside any checkout: %s", (make) => {
+    const command = make(to());
+    expect(evaluate(bash(command, homedir()), undefined, strictProfile).decision, command).toBe(
+      "approve",
+    );
+  });
+  test("a later or relative cd keeps the old directory possible", () => {
+    expect(plainRead(bash(`ls; cd ${to()}; cat AGENTS.md`, homedir()))).toBe(false);
+    expect(plainRead(bash(`cd ${to()} && ls || cat AGENTS.md`, homedir()))).toBe(false);
+    const rel = relative(homedir(), repo).replace(/\\/g, "/");
+    expect(plainRead(bash(`cd ${rel}; cat AGENTS.md`, homedir()))).toBe(false);
+  });
 });

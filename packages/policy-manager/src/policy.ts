@@ -19,7 +19,7 @@ const WRITE_TOOLS = new Set([
 import { onRemote } from "./merged.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
-import { plainRead, readOnly, secretPath } from "./reads.js";
+import { enterable, plainRead, readOnly } from "./reads.js";
 import { redactText } from "./redact.js";
 import { parseShell } from "./shell.js";
 import { defaultAllowed } from "./tools.js";
@@ -306,6 +306,14 @@ function chainApproved(request: Request, profile: Profile): boolean {
         (process.env.CDPATH && !/^[/~.]/.test(target))
       )
         return false;
+      // As the script's first command, a `cd` that cannot fail leaves only its target.
+      // After `||` the next command runs exactly when it fails, so `||` anywhere keeps the old one.
+      const sure = index === 0 && !command.includes("||") ? enterable(target) : undefined;
+      if (sure) {
+        cwds.clear();
+        cwds.add(sure);
+        continue;
+      }
       const next = new Set<string>();
       for (const dir of cwds) {
         try {
