@@ -117,6 +117,25 @@ describe("anything else is not a plain read", () => {
     "cat AGENTS.md &",
     // Outside a checkout and any protected directory.
     "cat ../outside/notes.txt",
+    // Options that run a program, abbreviations, and any option not on the allow-list.
+    "rg --hostname-bin ./x.sh --hyperlink-format=file foo",
+    "rg --hostname-bin=./x.sh foo",
+    "rg --pre ./x.sh foo",
+    "rg -uuu TOKEN",
+    "rg --hidden TOKEN",
+    "rg --no-ignore TOKEN",
+    "git grep --open-files=sh foo",
+    "git grep --open-files-in-pager=sh foo",
+    "git grep -Osh foo",
+    "git grep --untracked foo",
+    "git grep --no-index foo",
+    "grep --unknown-option foo AGENTS.md",
+    "find . -newerXY x",
+    // A recursive search that can reach a secret file.
+    "grep -r TOKEN .",
+    "grep -rn . .",
+    "grep -R x .claude",
+    "rg TOKEN .claude",
   ])("%s", (command) => {
     expect(plainRead(bash(command)), command).toBe(false);
   });
@@ -129,5 +148,59 @@ describe("anything else is not a plain read", () => {
 
   test("the plain-read reason is only for approvals", () => {
     expect(evaluate(bash("cat .env"), undefined, permissive).reason).not.toBe(PLAIN_READ);
+  });
+});
+
+describe("recursive searches", () => {
+  test("a search that excludes the secrets, or cannot reach them, is a plain read", () => {
+    expect(plainRead(bash("grep -rn foo src"))).toBe(true);
+    expect(plainRead(bash("grep -rn foo .claude/agents"))).toBe(true);
+    expect(
+      plainRead(
+        bash(
+          "grep -rn foo . --exclude=.env '--exclude=settings*.json' --exclude=config.toml --exclude-dir=.git",
+        ),
+      ),
+    ).toBe(true);
+    // ripgrep skips hidden files: `.env` and `.claude` are not reached.
+    expect(plainRead(bash("rg foo src"))).toBe(true);
+    // git grep reads tracked files only, and none is a secret here.
+    expect(plainRead(bash("git grep -n foo -- '**/*.md'"))).toBe(true);
+    expect(plainRead(bash("git grep -n foo -- ':(glob).github/**'"))).toBe(true);
+  });
+});
+
+describe("chains of a read-only prefix and a command approved on its own", () => {
+  test.each([
+    "git status && cat AGENTS.md",
+    "git log --oneline -3; git grep -n foo -- '**/*.md'",
+    "ls .claude && grep -n x .claude/agents/a.md",
+  ])("%s is approved", (command) => {
+    for (const profile of [strictProfile, permissive])
+      expect(evaluate(bash(command), undefined, profile).decision, command).toBe("approve");
+  });
+  test.each([
+    "git status && cat .env",
+    "git status && cat AGENTS.md | sh",
+    "touch x.txt && cat .env",
+    "cat AGENTS.md > out.md && cat AGENTS.md",
+    "git status && $(echo cat) AGENTS.md",
+  ])("%s is not", (command) => {
+    expect(evaluate(bash(command), undefined, strictProfile).decision, command).not.toBe("approve");
+  });
+});
+
+describe("read-only prefixes cannot read secrets", () => {
+  test.each([
+    "grep -r TOKEN . && git status",
+    "cat .env; git status",
+    "sort .env | uniq; git status",
+  ])("%s is not approved", (command) => {
+    expect(evaluate(bash(command), undefined, strictProfile).decision).not.toBe("approve");
+  });
+  test("a sed line range in the prefix is a read", () => {
+    expect(
+      evaluate(bash("sed -n 1,2p AGENTS.md; cat AGENTS.md"), undefined, strictProfile).decision,
+    ).toBe("approve");
   });
 });

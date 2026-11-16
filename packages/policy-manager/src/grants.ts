@@ -93,14 +93,35 @@ function simple(request: Request): string[] | undefined {
 }
 
 /**
- * The scope a `--session` approval of this human decision covers, or undefined when it can only
- * be approved once. Credential and secret reads, possible unrecoverable loss and anything whose
- * targets cannot be read from the request stay one-time. Scopes:
- * - a protected-path write: the protected roots it touches (`<worktree>/.agent-config`);
- * - a humanPatterns match: the matching patterns, in the same checkout;
- * - any other human rule for a simple command: that exact command, same checkout.
- * Category unknown (the engine could not rule out loss) is approved once only.
- * Shell scopes need a simple command, so nothing else in the script hides behind the rule.
+ * Hard items a session grant never covers: possible unrecoverable loss, credentials, the policy
+ * manager's own guards, deterministic-floor items, and every file that changes what the harness
+ * allows (settings, hooks, permission rules, the policy profile). Each is asked every time.
+ */
+const ONCE_ONLY = new Set([
+  "force-push",
+  "delete-unmerged-branch",
+  "remove-worktree-force",
+  "git-clean",
+  "credential-read",
+  "harness-settings",
+  "policy-profile",
+  "self-approve",
+  "foreign-classification-record",
+  "cloud-write",
+  "repo-delete",
+  "publish",
+  "rm-outside",
+]);
+
+/**
+ * The scope a session approval of this human decision covers, or undefined when it can only be
+ * approved once. A scope is always the same rule and the same exact target:
+ * - a protected-path write: the exact files it writes, in the same checkout;
+ * - any other rule for a simple command (a humanPatterns match included): that exact command, in
+ *   the same checkout.
+ * Category unknown, sensitive or destructive, the ONCE_ONLY hard items, and anything whose targets
+ * cannot be read from the request are approved once only. Shell scopes need a simple command, so
+ * nothing else in the script hides behind the rule.
  */
 export function grantScope(
   request: Request,
@@ -108,54 +129,37 @@ export function grantScope(
   profile: Profile,
 ): string | undefined {
   try {
-    // Possible unrecoverable loss and credential reads are approved once, whatever the engine's
-    // category for the command.
-    if (
-      decision.hard &&
-      [
-        "force-push",
-        "delete-unmerged-branch",
-        "remove-worktree-force",
-        "git-clean",
-        "credential-read",
-        "self-approve",
-        "foreign-classification-record",
-      ].includes(decision.hard)
-    )
-      return undefined;
+    if (decision.hard && ONCE_ONLY.has(decision.hard)) return undefined;
     if (decision.reason === PROTECTED_PATH) {
       const paths = targets(request) ?? shellPaths(request);
       if (!paths?.length) return undefined;
-      const roots = new Set<string>();
+      const files = new Set<string>();
       let top: string | undefined;
       for (const path of paths) {
         const lexical = resolveWord(request.cwd, path);
         if (sensitive(lexical) || policyState(lexical)) return undefined;
         const resolved = canonical(lexical);
         if (sensitive(resolved) || policyState(resolved)) return undefined;
-        const root = protectedRoot(resolved);
+        // A word that is not under a protected root (`printf test >> AGENTS.md`) is not the write.
+        if (!protectedRoot(resolved)) continue;
         const checkout = topLevel(resolved);
         if (top !== undefined && checkout !== top) return undefined;
         top = checkout;
-        if (root) roots.add(root);
+        files.add(resolved);
       }
-      return roots.size ? `protected:${[...roots].sort().join("\u0000")}` : undefined;
+      return files.size ? `protected:${[...files].sort().join("\u0000")}` : undefined;
     }
     const argv = simple(request);
     if (!argv) return undefined;
     const checkout = topLevel(request.cwd);
-    if (decision.reason === HUMAN_PATTERN) {
-      const joined = argv.join(" ");
-      const matched = profile.humanPatterns.flatMap((pattern, index) =>
-        pattern.test(joined) ? [index] : [],
-      );
-      return matched.length ? `pattern:${matched.join(",")}:${checkout}` : undefined;
-    }
-    if (
-      decision.category === "sensitive" ||
-      decision.category === "destructive" ||
-      decision.category === "unknown"
-    )
+    if (decision.reason !== HUMAN_PATTERN) {
+      if (
+        decision.category === "sensitive" ||
+        decision.category === "destructive" ||
+        decision.category === "unknown"
+      )
+        return undefined;
+    } else if (!profile.humanPatterns.some((pattern) => pattern.test(argv.join(" "))))
       return undefined;
     if (argv.slice(1).some((word) => sensitive(word))) return undefined;
     return `command:${decision.reason}:${JSON.stringify(argv)}:${checkout}`;
@@ -165,22 +169,9 @@ export function grantScope(
 }
 
 /** What a session scope covers, in words the user can check before approving it. */
-export function scopeLabel(scope: string, profile: Profile): string {
+export function scopeLabel(scope: string, _profile: Profile): string {
   if (scope.startsWith("protected:"))
-    return `writes ${scope
-      .slice("protected:".length)
-      .split("\u0000")
-      // A root that is a file (`AGENTS.md`) is written to; a directory, or one not made yet, under.
-      .map((root) => (existsSync(root) && !statSync(root).isDirectory() ? "to " : "under ") + root)
-      .join(", ")}`;
-  if (scope.startsWith("pattern:")) {
-    const [, indexes = "", ...checkout] = scope.split(":");
-    const patterns = indexes
-      .split(",")
-      .map((index) => profile.humanPatterns[Number(index)]?.source ?? index)
-      .join(", ");
-    return `commands matching ${patterns} in ${checkout.join(":")}`;
-  }
+    return `writes to ${scope.slice("protected:".length).split("\u0000").join(", ")}`;
   const rest = scope.slice(scope.indexOf(":[") + 1);
   const end = rest.lastIndexOf("]:");
   const argv = JSON.parse(rest.slice(0, end + 1)) as string[];

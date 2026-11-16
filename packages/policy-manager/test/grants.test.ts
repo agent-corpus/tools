@@ -127,7 +127,7 @@ describe("one-time approval", () => {
 });
 
 describe("session approval", () => {
-  test("covers later writes under the same protected root of the same worktree only", async () => {
+  test("covers later writes to the same protected file of the same worktree only", async () => {
     const { directory, s } = session();
     const first = s.review(
       write(join(worktree, ".agent-config", "skills", "a.md")),
@@ -136,8 +136,11 @@ describe("session approval", () => {
     );
     expect(s.grant(first.requestHash, true, true).scope).toBe("session");
     const same = [
-      write(join(worktree, ".agent-config", "agents", "b.md")),
-      patch(".agent-config/skills/x/SKILL.md"),
+      {
+        ...write(join(worktree, ".agent-config", "skills", "a.md")),
+        input: { file_path: join(worktree, ".agent-config", "skills", "a.md"), content: "y" },
+      },
+      patch(".agent-config/skills/a.md"),
     ];
     for (const r of same) {
       const d = s.review(r, undefined, "PreToolUse");
@@ -148,6 +151,7 @@ describe("session approval", () => {
       ]);
     }
     const outside = [
+      write(join(worktree, ".agent-config", "agents", "b.md")),
       write(join(worktree, ".claude", "settings.json")),
       write(join(worktree, "AGENTS.md")),
       write(join(other, ".agent-config", "skills", "a.md"), other),
@@ -157,17 +161,20 @@ describe("session approval", () => {
     expect(await events(directory, "human-grant-use")).toHaveLength(2);
   });
 
-  test("covers the same humanPatterns entry in the same checkout, not other rules", () => {
+  test("covers the same humanPatterns command in the same checkout, not the whole pattern", () => {
     const { s } = session();
     const first = s.review(shell("terraform apply -auto-approve"), undefined, "PreToolUse");
     expect(first.reason).toBe(HUMAN_PATTERN);
     expect(first.sessionGrantable).toBe(true);
     s.grant(first.requestHash, true, true);
-    expect(s.review(shell("terraform apply plan.out"), undefined, "PreToolUse").decision).toBe(
+    expect(s.review(shell("terraform apply -auto-approve"), undefined, "PreToolUse").decision).toBe(
       "approve",
     );
+    expect(s.review(shell("terraform apply plan.out"), undefined, "PreToolUse").decision).toBe(
+      "human",
+    );
     expect(
-      s.review(shell("terraform apply plan.out", other), undefined, "PreToolUse").decision,
+      s.review(shell("terraform apply -auto-approve", other), undefined, "PreToolUse").decision,
     ).toBe("human");
     expect(s.review(shell("git push --force origin HEAD"), undefined, "PreToolUse").decision).toBe(
       "human",
@@ -229,13 +236,13 @@ describe("a session grant on a generic command covers only that command", () => 
     const { s } = session();
     const first = s.review(shell("terraform apply -auto-approve"), undefined, "PreToolUse");
     expect(s.grant(first.requestHash, false, true).sessionScope).toMatch(
-      /^commands matching \^terraform apply in /,
+      /^the exact command `terraform apply -auto-approve` in /,
     );
     const w = s.review(write(join(worktree, ".agent-config", "a.md")), undefined, "PreToolUse");
     // Windows may report the temp directory by its short (8.3) name, so compare the tail only.
     const label = s.grant(w.requestHash, false, true).sessionScope ?? "";
-    expect(label.startsWith("writes under ")).toBe(true);
-    expect(label.endsWith(join(".worktrees", "feat", ".agent-config"))).toBe(true);
+    expect(label.startsWith("writes to ")).toBe(true);
+    expect(label.endsWith(join(".worktrees", "feat", ".agent-config", "a.md"))).toBe(true);
   });
 });
 

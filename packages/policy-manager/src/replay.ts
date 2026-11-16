@@ -5,7 +5,7 @@ import { classifyWithCli } from "./classifier.js";
 import { evaluate } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
 import { PolicySession, type SessionDependencies } from "./session.js";
-import type { Request } from "./types.js";
+import type { Decision, Request } from "./types.js";
 
 export interface ReplayReport {
   commands: number;
@@ -174,6 +174,8 @@ export async function replayClassified(
     concurrency?: number;
     harness?: Request["harness"];
     deps?: SessionDependencies;
+    /** Called with each replayed escalation and its decision. */
+    onDecision?: (command: string, cwd: string, decision: Decision) => void;
   } = {},
 ): Promise<ClassifiedReplay> {
   const limit = options.limit ?? 300;
@@ -250,6 +252,7 @@ export async function replayClassified(
           },
           "PreToolUse",
         );
+        options.onDecision?.(candidate.command, candidate.cwd, decision);
         if (decision.decision === "approve") {
           if (decision.userAllowRule) report.userAllowApproved++;
           else if (decision.classification === "approved") report.aiApproved++;

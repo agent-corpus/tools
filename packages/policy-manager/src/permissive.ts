@@ -20,7 +20,7 @@ import {
 import { commandDecision } from "./flow.js";
 import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { helperMatch } from "./helpers.js";
-import { mergedEvidence, remoteTipMatches } from "./merged.js";
+import { mergedEvidence, onRemote, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result, words as shellWords } from "./policy.js";
 import type { Profile } from "./profile.js";
 import {
@@ -936,10 +936,14 @@ function gitDecision(
   if (sub === "push") return gitPush(request, cwd, rest);
   if (sub === "branch" && (has("-d", "-D", "--delete") || cluster("d") || cluster("D"))) {
     if (has("-r", "--remotes")) return ok();
-    const unmerged = positional.filter((name) => !mergedEvidence(cwd, `refs/heads/${name}`).merged);
+    const unmerged = positional.filter(
+      (name) => !mergedEvidence(cwd, `refs/heads/${name}`).merged && !onRemote(cwd, name),
+    );
     return unmerged.length
       ? human(request, "destructive", branchEvidence(cwd, unmerged[0] ?? ""))
-      : ok("Branch is already merged into origin's default branch");
+      : ok(
+          "Every deleted branch is merged into origin's default branch or its tip is on a remote ref",
+        );
   }
   if (sub === "branch" && (has("-f", "--force") || cluster("f") || has("-M")))
     return human(request, "destructive", "Forced branch move requires human approval");

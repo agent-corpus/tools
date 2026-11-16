@@ -17,6 +17,8 @@ interface Message {
   report?: OutcomeReport;
   phase?: string;
   grant?: { requestHash: string; confirm: boolean; session?: boolean };
+  /** Claude Code's `permission_mode` for a PreToolUse: whether an ask reaches a person. */
+  permissionMode?: string;
   /** Claude Code's `tool_use_id` for a PreToolUse or PostToolUse. */
   toolUseId?: string;
   /** A PostToolUseFailure's error text and interrupt flag, to tell a rejected prompt from a run. */
@@ -89,6 +91,7 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
             message.request,
             message.phase,
             typeof message.toolUseId === "string" ? message.toolUseId : undefined,
+            typeof message.permissionMode === "string" ? message.permissionMode : undefined,
           );
         else if (message.action === "classify" && message.classification)
           result = session.classify(message.classification);

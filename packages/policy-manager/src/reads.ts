@@ -1,5 +1,5 @@
-import { existsSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
   canonical,
   git,
@@ -9,6 +9,7 @@ import {
   resolveWord,
   sensitive,
 } from "./evidence.js";
+import { wildcard } from "./nativerules.js";
 import { defaultProfilePath } from "./profile.js";
 import { parseShell } from "./shell.js";
 import type { Request } from "./types.js";
@@ -19,18 +20,100 @@ import type { Request } from "./types.js";
  * nothing. Writes, and reads of credential and secret files, still go to a person.
  *
  * A plain read is tight on purpose: one of a few reading programs (or the Read tool), joined only by
- * `&&`, `||`, `;` and pipes into another reading program; no command substitution, variables,
- * assignments, globs, here-documents or redirections other than `2>/dev/null`, `2>&1` and `<` from a
- * file; no option that runs a program or writes a file. Every named path must be inside a Git
- * checkout or under a protected directory, and none may be a secret.
+ * `&&`, `||`, `;` and pipes into another reading program, with an optional `cd <dir>`; no command
+ * substitution, variables, assignments, here-documents or redirections other than `2>/dev/null`,
+ * `2>&1` and `<` from a file. Options are allow-listed per program: any option not listed below is
+ * not a plain read. Every named path must be inside a Git checkout or under a protected directory,
+ * none may be a secret, and a recursive search may not reach one.
  */
-const READERS = new Set(["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail", "find"]);
-/** Options that run a program or write a file. */
-const UNSAFE_OPTIONS: Record<string, RegExp> = {
-  find: /^-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/,
-  rg: /^--pre(?:-glob)?(?:=|$)/,
-  git: /^(?:-O|--open-files-in-pager|--ext-diff|--textconv)/,
+interface Options {
+  /** Short flags that may be combined (`-rn`). */
+  flags: RegExp;
+  /** Options that take the next word (or an attached value) as their value. */
+  valued: Set<string>;
+  /** Of `valued`, those whose value is a file to read. */
+  files?: Set<string>;
+  /** Long options, with or without `=value`. */
+  long: Set<string>;
+  /** Long options whose value is a file to read. */
+  longFiles?: Set<string>;
+}
+const GREP: Options = {
+  flags: /^-[nrRiwvclLHhoEFsqxIZz]+$/,
+  valued: new Set(["-e", "-f", "-A", "-B", "-C", "-m"]),
+  files: new Set(["-f"]),
+  long: new Set([
+    ...["--include", "--exclude", "--exclude-dir", "--color", "--colour", "--line-number"],
+    ...["--recursive", "--ignore-case", "--files-with-matches", "--files-without-match"],
+    ...["--count", "--fixed-strings", "--extended-regexp", "--word-regexp", "--invert-match"],
+    ...["--max-count", "--context", "--before-context", "--after-context", "--no-messages"],
+    ...["--with-filename", "--no-filename", "--only-matching", "--quiet", "--null"],
+    ...["--binary-files", "--regexp", "--line-regexp"],
+  ]),
+  longFiles: new Set(["--file"]),
 };
+const OPTIONS: Record<string, Options> = {
+  cat: { flags: /^-[nbsvetAETu]+$/, valued: new Set(), long: new Set(["--number"]) },
+  ls: {
+    flags: /^-[aAlhRtrSs1dFGipcunog]+$/,
+    valued: new Set(),
+    long: new Set(["--color", "--all", "--almost-all", "--human-readable", "--recursive"]),
+  },
+  head: {
+    flags: /^-(?:\d+|[qv]+)$/,
+    valued: new Set(["-n", "-c"]),
+    long: new Set(["--lines", "--bytes", "--quiet", "--verbose"]),
+  },
+  tail: {
+    flags: /^-(?:\d+|[qv]+)$/,
+    valued: new Set(["-n", "-c"]),
+    long: new Set(["--lines", "--bytes", "--quiet", "--verbose"]),
+  },
+  grep: GREP,
+  egrep: GREP,
+  fgrep: GREP,
+  // ripgrep skips hidden files and honors ignore files; options that change that are not listed.
+  rg: {
+    flags: /^-[niSswlcFHNoqvxI0]+$/,
+    valued: new Set(["-e", "-g", "-t", "-T", "-A", "-B", "-C", "-m", "-M", "-f"]),
+    files: new Set(["-f"]),
+    long: new Set([
+      ...["--glob", "--iglob", "--type", "--type-not", "--max-count", "--context"],
+      ...["--before-context", "--after-context", "--no-heading", "--heading", "--line-number"],
+      ...["--ignore-case", "--smart-case", "--case-sensitive", "--fixed-strings", "--files"],
+      ...["--files-with-matches", "--count", "--json", "--color", "--word-regexp", "--trim"],
+      ...["--max-columns", "--sort", "--vimgrep", "--no-messages", "--only-matching"],
+      ...["--regexp", "--invert-match", "--with-filename", "--no-filename", "--null"],
+    ]),
+    longFiles: new Set(["--file"]),
+  },
+  // `git grep` reads tracked content only; `--untracked` and `--no-index` are not listed.
+  "git-grep": {
+    flags: /^-[niwlLcvEFPIhHz]+$/,
+    valued: new Set(["-e", "-f", "-A", "-B", "-C", "-m"]),
+    files: new Set(["-f"]),
+    long: new Set([
+      ...["--line-number", "--ignore-case", "--word-regexp", "--files-with-matches"],
+      ...["--count", "--heading", "--break", "--cached", "--name-only", "--invert-match"],
+      ...["--extended-regexp", "--fixed-strings", "--perl-regexp", "--max-depth", "--color"],
+      ...["--no-color", "--full-name", "--max-count", "--context", "--and", "--or", "--not"],
+    ]),
+  },
+};
+/** `find` predicates that only select and print names, with whether each takes a value. */
+const FIND: Record<string, boolean> = {
+  ...Object.fromEntries(
+    ["-name", "-iname", "-path", "-ipath", "-type", "-maxdepth", "-mindepth", "-newer"]
+      .concat(["-mtime", "-mmin", "-size", "-regex", "-iregex", "-perm", "-user", "-group"])
+      .map((name) => [name, true]),
+  ),
+  ...Object.fromEntries(
+    ["-print", "-print0", "-o", "-or", "-a", "-and", "-not", "!", "(", ")", "-prune", "-empty"]
+      .concat(["-true", "-false", "-depth", "-xdev"])
+      .map((name) => [name, false]),
+  ),
+};
+
 /**
  * File names that hold or may hold credentials: harness settings (they can carry tokens in `env`),
  * login stores, the policy profile, and the credential names `sensitive` already knows.
@@ -60,15 +143,19 @@ function inCheckout(path: string): boolean {
   }
 }
 
+function resolveSafe(cwd: string, word: string): string | undefined {
+  try {
+    return resolveWord(cwd, word);
+  } catch {
+    return undefined;
+  }
+}
+
 /** A path word a plain read may name: inside a checkout or a protected directory, and no secret. */
 function readable(cwd: string, word: string): boolean {
   if (secretPath(word)) return false;
-  let lexical: string;
-  try {
-    lexical = resolveWord(cwd, word);
-  } catch {
-    return false;
-  }
+  const lexical = resolveSafe(cwd, word);
+  if (lexical === undefined) return false;
   let real = lexical;
   try {
     real = canonical(lexical);
@@ -79,22 +166,132 @@ function readable(cwd: string, word: string): boolean {
   return inCheckout(real) || protectedPath(real) || protectedPath(lexical);
 }
 
-/** The words of a reading command that may name files: everything but its options. */
-function operands(argv: string[]): string[] | undefined {
-  const [program = "", ...args] = argv;
-  const unsafe = UNSAFE_OPTIONS[program];
-  const words: string[] = [];
-  for (const arg of args) {
-    if (unsafe?.test(arg)) return undefined;
-    if (arg.startsWith("-")) {
-      // `--file=x`, `-fx`: a value attached to an option can be a path.
-      const value = arg.startsWith("--") ? arg.split("=").slice(1).join("=") : "";
-      if (value) words.push(value);
+const WALK_LIMIT = 5000;
+/**
+ * Whether a recursive search of `dir` can reach a secret file. ripgrep (`hidden: false`) skips
+ * hidden entries; grep reads everything except what `--exclude`/`--exclude-dir` name. Fails closed
+ * past WALK_LIMIT entries or on an unreadable directory.
+ */
+function reachesSecret(
+  dir: string,
+  hidden: boolean,
+  exclude: string[],
+  excludeDir: string[],
+): boolean {
+  let seen = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const current = stack.pop() as string;
+    let names: string[];
+    try {
+      names = readdirSync(current);
+    } catch {
+      return true;
+    }
+    for (const name of names) {
+      if (++seen > WALK_LIMIT) return true;
+      if (!hidden && name.startsWith(".")) continue;
+      const path = join(current, name);
+      let stat: ReturnType<typeof lstatSync>;
+      try {
+        stat = lstatSync(path);
+      } catch {
+        return true;
+      }
+      if (stat.isSymbolicLink()) continue; // neither grep -r nor rg follows links by default
+      if (stat.isDirectory()) {
+        if (excludeDir.some((glob) => wildcard(glob, name))) continue;
+        if (secretPath(path)) return true;
+        stack.push(path);
+      } else if (!exclude.some((glob) => wildcard(glob, name)) && secretPath(path)) return true;
+    }
+  }
+  return false;
+}
+
+interface Parsed {
+  /** Words that name files to read (operands and file-valued options). */
+  paths: string[];
+  /** Recursive search (grep -r, any rg). */
+  recursive: boolean;
+  exclude: string[];
+  excludeDir: string[];
+}
+
+/** The options and operands of a reading command, or undefined if any option is not listed. */
+function parse(program: string, args: string[]): Parsed | undefined {
+  const parsed: Parsed = {
+    paths: [],
+    recursive: program === "rg",
+    exclude: [],
+    excludeDir: [],
+  };
+  if (program === "find") {
+    let predicates = false;
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i] as string;
+      if (arg in FIND) {
+        predicates = true;
+        if (FIND[arg]) i++;
+      } else if (arg.startsWith("-") || predicates) return undefined;
+      else parsed.paths.push(arg);
+    }
+    return parsed;
+  }
+  const options = OPTIONS[program];
+  if (!options) return undefined;
+  // grep and rg take the pattern as the first operand unless -e/-f gave one.
+  const given = args.some(
+    (arg) =>
+      arg === "--files" ||
+      /^-[ef]/.test(arg) ||
+      /^--(?:regexp|file)(?:=|$)/.test(arg) ||
+      /^-[^-]*[ef]$/.test(arg),
+  );
+  let pattern = ["grep", "egrep", "fgrep", "rg", "git-grep"].includes(program) && !given;
+  let operandsOnly = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (operandsOnly || arg === "-" || !arg.startsWith("-")) {
+      // A pattern is not read, but one that names a secret path is not taken on trust either.
+      if (pattern) {
+        if (secretPath(arg)) return undefined;
+        pattern = false;
+      } else parsed.paths.push(arg);
       continue;
     }
-    words.push(arg);
+    if (arg === "--") {
+      operandsOnly = true;
+      continue;
+    }
+    if (arg.startsWith("--")) {
+      const [name = "", ...rest] = arg.split("=");
+      const value = rest.join("=");
+      if (options.longFiles?.has(name)) {
+        parsed.paths.push(value || (args[++i] ?? ""));
+        pattern = false;
+        continue;
+      }
+      if (!options.long.has(name)) return undefined;
+      if (name === "--recursive") parsed.recursive = true;
+      if (name === "--regexp") pattern = false;
+      if (name === "--exclude" && value) parsed.exclude.push(value);
+      if (name === "--exclude-dir" && value) parsed.excludeDir.push(value);
+      continue;
+    }
+    const short = arg.slice(0, 2);
+    if (options.valued.has(short)) {
+      const value = arg.length > 2 ? arg.slice(2) : args[++i];
+      if (value === undefined) return undefined;
+      if (short === "-e" || short === "-f") pattern = false;
+      if (options.files?.has(short)) parsed.paths.push(value);
+      continue;
+    }
+    if (!options.flags.test(arg)) return undefined;
+    if (program !== "ls" && /[rR]/.test(arg.slice(1)) && program !== "git-grep")
+      parsed.recursive = true;
   }
-  return words;
+  return parsed;
 }
 
 /** Whether a request is a plain read of non-secret paths in a checkout or protected directory. */
@@ -118,52 +315,67 @@ export function plainRead(request: Request): boolean {
   for (const pipeline of pipelines)
     for (const cmd of pipeline) {
       if (cmd.env.length || cmd.subs.length || cmd.stdin !== undefined) return false;
-      if (cmd.loose?.some(Boolean) || cmd.glob?.some(Boolean)) return false;
       const program = cmd.argv[0] ?? "";
+      const gitGrep = program === "git" && cmd.argv[1] === "grep";
+      // `git grep` pathspecs (`'**/*.md'`, `':(glob)src/**'`) are Git's, not files to expand.
+      if (cmd.loose?.some(Boolean) || (!gitGrep && cmd.glob?.some(Boolean))) return false;
       if (program === "cd" && pipeline.length === 1) {
         const target = cmd.argv[1];
         if (cmd.argv.length !== 2 || !target || target.startsWith("-") || cmd.redirects.length)
           return false;
         for (const dir of [...cwds]) {
           const next = resolveSafe(dir, target);
-          if (next === "\0") return false;
+          if (next === undefined || !existsSync(next)) return false;
           cwds.add(next);
         }
         if (cwds.size > 4) return false;
         continue;
       }
-      const gitGrep = program === "git" && cmd.argv[1] === "grep";
-      if (!READERS.has(program) && !gitGrep) return false;
-      const words = operands(gitGrep ? ["git", ...cmd.argv.slice(2)] : cmd.argv);
-      if (!words) return false;
+      const parsed = parse(gitGrep ? "git-grep" : program, cmd.argv.slice(gitGrep ? 2 : 1));
+      if (!parsed) return false;
       for (const redirect of cmd.redirects) {
         if (redirect.op === ">&" && redirect.target === "1" && redirect.fd === "2") continue;
         if (redirect.op === ">" && redirect.fd === "2" && redirect.target === "/dev/null") continue;
         if (redirect.op === "<") {
-          words.push(redirect.target);
+          parsed.paths.push(redirect.target);
           continue;
         }
         return false;
       }
-      // A reader with no path searches or lists the directory it runs in.
-      for (const cwd of cwds) if (!readable(cwd, ".")) return false;
-      for (const word of words)
-        for (const cwd of cwds) {
-          // `git grep` revisions and pathspecs (`origin/main`, `--`) name no file to read here.
-          if (gitGrep && (word === "--" || !existsSync(resolveSafe(cwd, word)))) {
-            if (secretPath(word)) return false;
-            continue;
+      for (const cwd of cwds) {
+        // A reader with no path searches or lists the directory it runs in.
+        if (!readable(cwd, ".")) return false;
+        if (gitGrep) {
+          // Git reads tracked files only: none of them may be a secret.
+          if (parsed.paths.some((word) => secretPath(word))) return false;
+          try {
+            const tracked = git(cwd, ["ls-files", "-z"]).split("\0");
+            if (tracked.some((file) => file && secretPath(file))) return false;
+          } catch {
+            return false;
           }
-          if (++checked > 32 || !readable(cwd, word)) return false;
+          continue;
         }
+        const targets = parsed.paths.length ? parsed.paths : ["."];
+        for (const word of parsed.paths) if (++checked > 32 || !readable(cwd, word)) return false;
+        if (parsed.recursive)
+          for (const word of targets) {
+            const path = resolveSafe(cwd, word);
+            if (path === undefined) return false;
+            let directory = false;
+            try {
+              directory = statSync(path).isDirectory();
+            } catch {
+              return false;
+            }
+            if (
+              directory &&
+              reachesSecret(path, program !== "rg", parsed.exclude, parsed.excludeDir)
+            )
+              return false;
+            if (!directory && secretPath(basename(path))) return false;
+          }
+      }
     }
   return true;
-}
-
-function resolveSafe(cwd: string, word: string): string {
-  try {
-    return resolveWord(cwd, word);
-  } catch {
-    return "\0";
-  }
 }

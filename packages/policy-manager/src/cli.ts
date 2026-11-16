@@ -331,6 +331,9 @@ try {
           request,
           phase,
           ...(typeof toolUseId === "string" ? { toolUseId } : {}),
+          ...(typeof payload.permission_mode === "string"
+            ? { permissionMode: payload.permission_mode }
+            : {}),
         })) as Decision;
         const output = hookOutput(harness, phase, decision, {
           cliPath,

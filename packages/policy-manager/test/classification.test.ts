@@ -217,6 +217,20 @@ describe("destructive requests follow recoverability", () => {
     "git branch -D wip",
     "git clean -fdx",
     "git push --force origin {feature,x}",
+    // The deterministic floor: cloud and infrastructure writes, repository deletion, publishing,
+    // and a recursive rm in the home directory.
+    "az group delete --name x",
+    "terraform destroy",
+    "npm publish",
+    "gh repo delete o/r",
+    "rm -rf ~/Documents",
+    "rm -rf ~/{Documents,x}",
+    "kubectl delete ns prod",
+    "gh release delete v1",
+    "gh api -X DELETE repos/o/r",
+    "aws s3 rb s3://bucket --force",
+    "gcloud projects delete p",
+    "pulumi destroy --yes",
     "git clean -fdx {a,b}",
   ])("%s stays with a person even on a confident recoverable verdict", (command) => {
     const r = request(command);
@@ -235,11 +249,6 @@ describe("destructive requests follow recoverability", () => {
     "rm -rf build",
     "git reflog expire --all",
     "git stash drop",
-    "az group delete --name x",
-    "terraform destroy",
-    "npm publish",
-    "gh repo delete o/r",
-    "rm -rf ~/Documents",
     "curl -X DELETE https://example.com/x",
     "sudo ls",
   ])("%s follows the classifier's recoverability verdict", (command) => {
@@ -432,21 +441,21 @@ describe("the session approves only its own record command", () => {
 
   for (const harness of ["claude", "codex", "copilot"] as const)
     for (const profile of [permissive, parseProfile('{"version":1,"mode":"strict"}')])
-      test(`approved deterministically (${harness}, ${profile.mode})`, () => {
+      test(`never approved: the agent cannot record its own verdict (${harness}, ${profile.mode})`, () => {
         const d = recording(harness, profile).review(
           shell(own(undefined, harness), harness),
           undefined,
           "PreToolUse",
         );
-        expect(d.decision).toBe("approve");
+        expect(d).toMatchObject({ decision: "human", hard: "foreign-classification-record" });
         expect(d.classification).toBeUndefined();
       });
 
-  test("a Windows CLI path is matched in the form the hook writes", () => {
+  test("a Windows CLI path form goes to a person too", () => {
     const windows = "D:\\a\\pm\\dist\\cli.js";
     const command = classifyCommand("claude", { cliPath: windows, sessionId: "s1" }, "{}");
     const s = recording("claude", permissive, windows);
-    expect(s.review(request(command), undefined, "PreToolUse").decision).toBe("approve");
+    expect(s.review(request(command), undefined, "PreToolUse").decision).toBe("human");
   });
 
   test.each([
@@ -532,13 +541,13 @@ describe("the session approves only its own record command", () => {
     expect(s.review(request(own()), undefined, "PreToolUse").decision).toBe("human");
   });
 
-  test("a recorded classification approves the unchanged retry of the original", () => {
+  test("the record command asks; a classification the person records approves the unchanged retry", () => {
     const s = recording();
     const original = { ...ambiguous(), input: { command: "echo $RETRY", description: "first" } };
     const blocked = s.review(original, undefined, "PreToolUse");
     expect(blocked).toMatchObject({ decision: "human", needsClassification: true });
     const record = own(answer({ ...original, input: { command: "echo $RETRY" } }));
-    expect(s.review(request(record), undefined, "PreToolUse").decision).toBe("approve");
+    expect(s.review(request(record), undefined, "PreToolUse").decision).toBe("human");
     // What the CLI then sends the service.
     const classified = s.classify(JSON.parse(record.slice(record.indexOf("'") + 1, -1)));
     expect(classified.requestHash).toBe(blocked.requestHash);

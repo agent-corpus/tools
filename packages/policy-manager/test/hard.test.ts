@@ -351,3 +351,52 @@ describe("git aliases are judged by what they run", () => {
     expect(d.decision).toBe("approve");
   });
 });
+
+describe("data text is not code", () => {
+  test.each([
+    "cat > notes.md <<'EOF'\nDo not run git clean -fdx or git push --force here.\nEOF",
+    'gh pr create --title x --body "never git push --force or edit ~/.claude/settings.json"',
+    'git commit -m "explain why git clean -fd is unsafe"',
+    "printf '%s\\n' 'git push -f origin x' > doc.txt",
+  ])("%s is not a hard item", (command) => {
+    const d = { ...evaluate(shell("ls"), undefined, permissive), decision: "human" as const };
+    expect(hardRules(shell(command), d)).toEqual([]);
+  });
+
+  test.each([
+    ["git-clean", "bash <<'EOF'\ngit clean -fdx\nEOF"],
+    ["force-push", "cat <<'EOF' | sh\ngit push --force origin x\nEOF"],
+    ["force-push", "node <<'EOF'\nrequire('child_process').execSync('git push -f origin x')\nEOF"],
+    ["force-push", "python3 - <<'EOF'\nimport os; os.system('git push -f origin x')\nEOF"],
+    ["force-push", 'sh -c "git push -f origin x"'],
+  ])(
+    "%s: a here-document or string fed to a shell or interpreter is code (%s)",
+    (rule, command) => {
+      const d = { ...evaluate(shell("ls"), undefined, permissive), decision: "human" as const };
+      expect(hardRules(shell(command), d)).toContain(rule);
+    },
+  );
+});
+
+describe("more data is not code", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  test.each([
+    "sed -i '' 's|old|git push --force|' notes.md",
+    "gh pr create --body \"$(cat <<'EOF'\nsee ~/.claude/settings.json and git clean -fd\nEOF\n)\"",
+    "az rest --url https://example.com/api",
+    "az rest --method get --url https://example.com/api",
+    "az devops invoke --area build --resource timeline",
+  ])("%s is not a hard item", (command) => {
+    expect(hardRules(shell(command), base())).toEqual([]);
+  });
+  test.each([
+    ["force-push", "sed -n 's/x/git push --force origin x/e' f"],
+    ["cloud-write", "az rest --method delete --url https://example.com/api"],
+    ["cloud-write", "az rest -m PUT --url https://example.com/api"],
+  ])("%s: %s", (rule, command) => {
+    expect(hardRules(shell(command), base())).toContain(rule);
+  });
+});

@@ -1,5 +1,5 @@
 import { basename, dirname } from "node:path";
-import { isClassifyRecord, looksLikeApproveGrant, looksLikeClassifyRecord } from "./adapters.js";
+import { looksLikeApproveGrant, looksLikeClassifyRecord } from "./adapters.js";
 import { audit, requestSummary } from "./audit.js";
 import { type ClassifierResult, classifyWithCli } from "./classifier.js";
 import {
@@ -27,12 +27,17 @@ import {
   type Request,
 } from "./types.js";
 
-/** How long a classification verdict for one exact request is remembered: the session. */
-const CLASSIFICATION_TTL_MS = 24 * 60 * 60_000;
+/** How long a classification verdict for one exact request (tool, input and cwd) is reused. */
+const CLASSIFICATION_TTL_MS = 5 * 60_000;
 /** How long after its approval an execution report may still record the files a tool created. */
 const CREATION_REPORT_MS = 15 * 60_000;
 
 export { APPROVE_GUARD };
+
+/** Claude Code permission modes in which a hook's ask is shown to a person. */
+const PROMPTING_MODES = new Set(["default", "acceptEdits", "plan"]);
+/** Hard items no allow rule approves, at any level: they always ask the person. */
+const NO_ALLOW = new Set(["credential-read", "harness-settings", "policy-profile", "force-push"]);
 /** How long after a human decision the user may still approve that exact request once. */
 export const GRANT_WINDOW_MS = 15 * 60_000;
 /** How long a harness prompt may stay open and still have its answer remembered. */
@@ -139,9 +144,8 @@ export class PolicySession {
     };
   }
   /**
-   * The record command of the earlier "classify and retry" flow is still approved for this
-   * session, for agents that run it; nothing requests it any more. Any other classification
-   * record, for another session or CLI or with anything added, goes to a person.
+   * A command that runs a policy-manager `classify` record goes to a person: the hook classifies
+   * requests itself, and an agent that could record its own verdict could approve itself.
    */
   private classifyRecord(request: Request): Decision | undefined {
     const input = request.input;
@@ -152,24 +156,11 @@ export class PolicySession {
       !looksLikeClassifyRecord(command)
     )
       return undefined;
-    const cwd = input.workdir ?? input.cwd ?? request.cwd;
-    if (
-      this.cliPath &&
-      cwd === request.cwd &&
-      input.env === undefined &&
-      input.shell === undefined &&
-      input.stdin === undefined &&
-      isClassifyRecord(command, request.harness, {
-        cliPath: this.cliPath,
-        sessionId: this.sessionId,
-      })
-    )
-      return result(request, "temp-write", "Records a classification for this session", true);
     return {
       ...result(
         request,
         "unknown",
-        "A classification record for another session or CLI, or with anything added, requires human review",
+        "A classification record requires human review: the hook classifies requests itself",
       ),
       hard: "foreign-classification-record",
     };
@@ -523,7 +514,17 @@ export class PolicySession {
           prompt = undefined;
         }
         try {
-          outcome = await this.deps.classify(cli, prompt, this.profile);
+          // A command over the length cap (no prompt) is never sent anywhere: the person decides.
+          outcome =
+            prompt === undefined
+              ? {
+                  ok: false,
+                  reason: "too-long",
+                  cli,
+                  model: this.profile.classifier[cli].model,
+                  latencyMs: 0,
+                }
+              : await this.deps.classify(cli, prompt, this.profile);
         } catch {
           outcome = {
             ok: false,
@@ -563,7 +564,13 @@ export class PolicySession {
    * rules apply throughout: their deny or ask rule leaves the request to the harness (no
    * decision), and their allow rule counts as the person's answer.
    */
-  async decide(request: Request, phase?: string, toolUseId?: string): Promise<Decision> {
+  async decide(
+    request: Request,
+    phase?: string,
+    toolUseId?: string,
+    /** The harness's permission mode (Claude Code's `permission_mode`), when it reports one. */
+    permissionMode?: string,
+  ): Promise<Decision> {
     let decision = this.judge(request, undefined, phase);
     const native =
       decision.decision === "approve" || decision.decision === "human"
@@ -579,17 +586,20 @@ export class PolicySession {
       });
     // An allow rule is the person's answer, checked before the classifier so an allowed command
     // never waits on a run. Never for the built-in guards on the policy manager's own approvals,
-    // and never for a force push: the one place this is stricter than the user's allow rule.
+    // and never for NO_ALLOW: credential reads, writes to what the harness allows, a force push.
     const guarded =
       decision.reason === APPROVE_GUARD ||
       decision.hard === "self-approve" ||
       decision.hard === "foreign-classification-record";
     if (decision.decision === "human" && native?.verdict === "allow" && !guarded) {
-      if (hardRules(request, decision).includes("force-push")) {
+      const kept = hardRules(request, decision, this.profile.scratchRoots).find((rule) =>
+        NO_ALLOW.has(rule),
+      );
+      if (kept) {
         audit(this.directory, {
           event: "user-rule-overridden",
           requestHash: decision.requestHash,
-          rule: "force-push",
+          rule: kept,
         });
       } else {
         audit(this.directory, {
@@ -631,7 +641,7 @@ export class PolicySession {
     }
     decision = this.conclude(request, decision);
     if (decision.decision === "human" && phase === "PreToolUse")
-      this.awaitAnswer(request, decision, toolUseId);
+      this.awaitAnswer(request, decision, toolUseId, permissionMode);
     return decision;
   }
   /**
@@ -651,20 +661,23 @@ export class PolicySession {
     }
   }
   /**
-   * The harness asks the person now (Claude Code and Copilot; Codex cannot ask). Its PostToolUse
-   * for this tool call means the person said yes.
+   * The hook asked, so the harness prompts the person. Its PostToolUse for this exact tool call
+   * means they said yes, but only when the harness reports a permission mode in which an ask is
+   * really shown to a person: Claude Code's `default`, `acceptEdits` or `plan`. Under
+   * `bypassPermissions`, `dontAsk`, an auto mode, or with no mode reported (Copilot reports none,
+   * so `--allow-all`/`--yolo` cannot be told apart), nothing is remembered. Codex cannot ask.
    */
-  private awaitAnswer(request: Request, decision: Decision, toolUseId?: string): void {
-    if (this.harness === "codex") return;
-    const key =
-      this.harness === "claude"
-        ? toolUseId && /^[\w.:-]{1,200}$/.test(toolUseId)
-          ? toolUseId
-          : undefined
-        : `request:${decision.requestHash}`;
-    if (!key) return;
+  private awaitAnswer(
+    request: Request,
+    decision: Decision,
+    toolUseId: string | undefined,
+    permissionMode: string | undefined,
+  ): void {
+    if (this.harness !== "claude") return;
+    if (!permissionMode || !PROMPTING_MODES.has(permissionMode)) return;
+    if (!toolUseId || !/^[\w.:-]{1,200}$/.test(toolUseId)) return;
     if (this.asks.size >= 256) this.asks.delete(this.asks.keys().next().value ?? "");
-    this.asks.set(key, { request, decision, at: Date.now() });
+    this.asks.set(toolUseId, { request, decision, at: Date.now() });
   }
   /**
    * PostToolUse (or PostToolUseFailure) for a tool call the harness asked the person about: they
@@ -772,9 +785,12 @@ export class PolicySession {
   classify(classification: Classification): Decision {
     const request = this.pending.get(classification.requestHash);
     if (!request) throw new Error("No pending request matches the classification");
-    // One classification per request: a verdict, deny or approve, cannot be replaced.
-    if (this.state(classification.requestHash)?.ai)
-      throw new Error("The request is already classified");
+    // One classification per request: a verdict, deny or approve, cannot be replaced. A request
+    // the hook's classifier could not settle (too long, disabled, missing, failed) is a person's.
+    const known = this.state(classification.requestHash);
+    if (known?.ai) throw new Error("The request is already classified");
+    if (known?.fallback || known?.invalid)
+      throw new Error("The request is waiting for a person, not a classification");
     this.pending.delete(classification.requestHash);
     try {
       return this.review(request, classification);

@@ -61,40 +61,36 @@ const executed = (requestHash: string, toolUseId?: string, phase = "PostToolUse"
 describe("Claude Code: ask, wait, remember", () => {
   test("a yes in the prompt is remembered for the same command in this session", async () => {
     const { s, runs, directory } = session("claude");
-    const r = bash("az vm restart --name a --resource-group b");
-    const asked = await s.decide(r, "PreToolUse", "toolu_1");
+    const r = bash("git pull origin a");
+    const asked = await s.decide(r, "PreToolUse", "toolu_1", "default");
     expect(asked.decision).toBe("human");
     expect(hookResponse("claude", "PreToolUse", asked)).toMatchObject({
       hookSpecificOutput: { permissionDecision: "ask" },
     });
     expect(s.answered(executed(asked.requestHash, "toolu_1"))).toBe("session");
-    const again = await s.decide(r, "PreToolUse", "toolu_2");
+    const again = await s.decide(r, "PreToolUse", "toolu_2", "default");
     expect(again).toMatchObject({
       decision: "approve",
       reason: "Approved for this session by the user",
     });
     expect(runs()).toBe(1);
     // Another command is still asked.
-    expect(
-      (await s.decide(bash("az vm restart --name other --resource-group b"), "PreToolUse"))
-        .decision,
-    ).toBe("human");
+    expect((await s.decide(bash("git pull origin other"), "PreToolUse")).decision).toBe("human");
     const text = readFileSync(join(directory, "audit.jsonl"), "utf8");
     expect(text).toContain("User approved the harness prompt");
     expect(text).toContain('"scope":"session"');
   });
 
-  test("a humanPatterns answer covers that pattern in the same checkout", async () => {
+  test("a humanPatterns answer covers that exact command, not the pattern", async () => {
     const profile = parseProfile(
-      JSON.stringify({ version: 1, mode: "permissive", humanPatterns: ["^terraform apply"] }),
+      JSON.stringify({ version: 1, mode: "permissive", humanPatterns: ["^make deploy"] }),
     );
     const { s, runs } = session("claude", profile);
-    const asked = await s.decide(bash("terraform apply"), "PreToolUse", "toolu_p");
+    const asked = await s.decide(bash("make deploy"), "PreToolUse", "toolu_p", "default");
     expect(asked).toMatchObject({ decision: "human", hard: "human-patterns" });
     expect(s.answered(executed(asked.requestHash, "toolu_p"))).toBe("session");
-    expect((await s.decide(bash("terraform apply -auto-approve"), "PreToolUse")).decision).toBe(
-      "approve",
-    );
+    expect((await s.decide(bash("make deploy"), "PreToolUse")).decision).toBe("approve");
+    expect((await s.decide(bash("make deploy prod"), "PreToolUse")).decision).toBe("human");
     expect(runs()).toBe(0);
   });
 
@@ -106,7 +102,7 @@ describe("Claude Code: ask, wait, remember", () => {
       "frobnicate $X",
     ]) {
       const r = bash(command);
-      const asked = await s.decide(r, "PreToolUse", `toolu_${command.length}`);
+      const asked = await s.decide(r, "PreToolUse", `toolu_${command.length}`, "default");
       expect(asked.decision, command).toBe("human");
       expect(s.answered(executed(asked.requestHash, `toolu_${command.length}`)), command).toBe(
         "once",
@@ -117,8 +113,8 @@ describe("Claude Code: ask, wait, remember", () => {
 
   test("a rejected prompt (PostToolUseFailure) is not a yes", async () => {
     const { s, directory } = session("claude");
-    const r = bash("az vm restart --name a --resource-group b");
-    const asked = await s.decide(r, "PreToolUse", "toolu_r");
+    const r = bash("git pull origin a");
+    const asked = await s.decide(r, "PreToolUse", "toolu_r", "default");
     expect(
       s.answered({
         ...executed(asked.requestHash, "toolu_r", "PostToolUseFailure"),
@@ -132,8 +128,8 @@ describe("Claude Code: ask, wait, remember", () => {
 
   test("a tool that ran and failed after a yes still counts", async () => {
     const { s } = session("claude");
-    const r = bash("az vm restart --name a --resource-group b");
-    const asked = await s.decide(r, "PreToolUse", "toolu_f");
+    const r = bash("git pull origin a");
+    const asked = await s.decide(r, "PreToolUse", "toolu_f", "default");
     expect(
       s.answered({
         ...executed(asked.requestHash, "toolu_f", "PostToolUseFailure"),
@@ -144,40 +140,79 @@ describe("Claude Code: ask, wait, remember", () => {
 
   test("only the pending tool_use_id, for the same request, counts", async () => {
     const { s } = session("claude");
-    const r = bash("az vm restart --name a --resource-group b");
-    const asked = await s.decide(r, "PreToolUse", "toolu_x");
+    const r = bash("git pull origin a");
+    const asked = await s.decide(r, "PreToolUse", "toolu_x", "default");
     expect(s.answered(executed(asked.requestHash, "toolu_other"))).toBeUndefined();
     expect(s.answered(executed("f".repeat(64), "toolu_x"))).toBeUndefined();
     // No id: nothing is remembered.
-    const noId = await s.decide(bash("az vm restart --name z --resource-group b"), "PreToolUse");
+    const noId = await s.decide(bash("git pull origin z"), "PreToolUse");
     expect(s.answered(executed(noId.requestHash))).toBeUndefined();
     // PermissionRequest has no tool_use_id and records no pending prompt.
-    await s.decide(
-      bash("az vm restart --name y --resource-group b"),
-      "PermissionRequest",
-      "toolu_y",
-    );
+    await s.decide(bash("git pull origin y"), "PermissionRequest", "toolu_y");
     expect(s.answered(executed("0".repeat(64), "toolu_y"))).toBeUndefined();
   });
 });
 
-describe("Copilot: ask, and remember by request", () => {
-  test("postToolUse carries no id, so the pending prompt is matched by the request hash", async () => {
+describe("a yes is only remembered when a person was really asked", () => {
+  test("Copilot asks, but reports no permission mode, so nothing is remembered", async () => {
     const { s } = session("copilot");
-    const r = bash("az vm restart --name a --resource-group b", "copilot");
+    const r = bash("git pull origin a", "copilot");
     const asked = await s.decide(r, "PreToolUse");
     expect(hookResponse("copilot", "PreToolUse", asked)).toMatchObject({
       permissionDecision: "ask",
     });
-    expect(s.answered(executed(asked.requestHash))).toBe("session");
-    expect((await s.decide(r, "PreToolUse")).decision).toBe("approve");
+    expect(s.answered(executed(asked.requestHash))).toBeUndefined();
+    expect((await s.decide(r, "PreToolUse")).decision).toBe("human");
+  });
+
+  test.each([undefined, "bypassPermissions", "dontAsk", "auto"])(
+    "Claude Code in permission mode %s: nothing is remembered",
+    async (mode) => {
+      const { s } = session("claude");
+      const r = bash("git pull origin a");
+      const asked = await s.decide(r, "PreToolUse", "toolu_m", mode);
+      expect(s.answered(executed(asked.requestHash, "toolu_m"))).toBeUndefined();
+      expect((await s.decide(r, "PreToolUse")).decision).toBe("human");
+    },
+  );
+
+  test("harness settings, hooks and the policy profile are asked every time", async () => {
+    const { s } = session("claude");
+    for (const path of [
+      join(repo, ".claude", "settings.json"),
+      join(repo, ".claude", "settings.local.json"),
+      join(repo, ".claude", "hooks", "x.sh"),
+      join(repo, ".claude", "commands", "a.md"),
+    ]) {
+      const write: Request = {
+        sessionId: "s1",
+        harness: "claude",
+        cwd: repo,
+        tool: "Write",
+        input: { file_path: path, content: "x" },
+      };
+      const asked = await s.decide(write, "PreToolUse", "toolu_w", "default");
+      expect(asked.decision, path).toBe("human");
+      s.answered(executed(asked.requestHash, "toolu_w"));
+    }
+    // The yes for `.claude/commands/a.md` covered that file only.
+    for (const path of [".claude/settings.json", ".claude/hooks/x.sh", ".claude/commands/b.md"]) {
+      const write: Request = {
+        sessionId: "s1",
+        harness: "claude",
+        cwd: repo,
+        tool: "Write",
+        input: { file_path: join(repo, path), content: "x" },
+      };
+      expect((await s.decide(write, "PreToolUse")).decision, path).toBe("human");
+    }
   });
 });
 
 describe("Codex: unchanged in step 3", () => {
   test("a person is needed: deny with pm approve --last, and nothing waits on PostToolUse", async () => {
     const { s } = session("codex");
-    const r = bash("az vm restart --name a --resource-group b", "codex");
+    const r = bash("git pull origin a", "codex");
     const d = await s.decide(r, "PreToolUse", "call_1");
     const out = JSON.stringify(
       hookResponse("codex", "PreToolUse", d, {

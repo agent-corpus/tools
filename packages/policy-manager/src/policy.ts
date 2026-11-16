@@ -1,12 +1,27 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
-import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
-import { hardRule } from "./hard.js";
+import { branchEvidence, canonical, git, inside, pathEvidence, resolveWord } from "./evidence.js";
+import { hardRule, hardRules } from "./hard.js";
+
+/** Tools that write a file (a shell command is judged by the engine itself). */
+const WRITE_TOOLS = new Set([
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  "create",
+  "edit",
+  "write_file",
+  "apply_patch",
+]);
+
+import { onRemote } from "./merged.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
-import { plainRead } from "./reads.js";
+import { plainRead, secretPath } from "./reads.js";
 import { redactText } from "./redact.js";
+import { parseShell } from "./shell.js";
 import { defaultAllowed } from "./tools.js";
 import {
   CATEGORIES,
@@ -215,9 +230,9 @@ const NOT_CLASSIFIABLE: RegExp[] = [
  * is a hard human item (credentials, protected configuration, unrecoverable loss, humanPatterns),
  * which goes straight to a person, or cannot be judged from what the classifier is shown.
  */
-function markAmbiguous(request: Request, decision: Decision): Decision {
+function markAmbiguous(request: Request, decision: Decision, profile: Profile): Decision {
   if (decision.decision !== "human") return decision;
-  const hard = hardRule(request, decision);
+  const hard = hardRule(request, decision, profile.scratchRoots);
   if (hard) return { ...decision, needsClassification: false, tier: undefined, hard };
   if (NOT_CLASSIFIABLE.some((pattern) => pattern.test(decision.reason))) return decision;
   return { ...decision, needsClassification: true, tier: "ambiguous" };
@@ -251,6 +266,148 @@ function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
     classifierNote: `The AI classifier did not approve it (category ${ai.category}, confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"})${why}`,
   };
 }
+export const CHAIN_APPROVED = "A read-only prefix followed by a command approved on its own";
+/** A word as a single-quoted shell word. */
+const quote = (word: string) =>
+  /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
+/** Programs that change nothing a later command could see: they only read or print. */
+const READ_ONLY = new Set([
+  ...["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail", "wc", "pwd", "true"],
+  ...["echo", "printf", "stat", "file", "which", "basename", "dirname", "realpath", "date"],
+  ...["wc", "cut", "tr", "nl", "column", "jq", "diff", "cmp", "comm"],
+]);
+/** git subcommands that leave the working tree, index and local branches as they are. */
+const GIT_READ_ONLY = new Set([
+  ...["status", "log", "diff", "show", "grep", "rev-parse", "ls-files", "for-each-ref"],
+  ...["merge-base", "cat-file", "describe", "rev-list", "shortlog", "blame", "fetch"],
+]);
+const GIT_RUNS_PROGRAM = /^(?:-O|--open-files-in-pager|--upload-pack|--exec|--ext-diff|-c)/;
+function readOnly(argv: string[]): boolean {
+  const [program = "", ...args] = argv;
+  // sed only printing a line range (`sed -n 140,170p`); sort without an output file; uniq on
+  // standard input only (a second operand is a file it writes).
+  if (program === "sed") {
+    const operands = args.filter((arg) => !/^-[nEr]+$/.test(arg));
+    return (
+      args.some((arg) => /^-[nEr]*n[nEr]*$/.test(arg)) &&
+      /^(?:\d+|\$)(?:,(?:\d+|\$))?p$/.test(operands[0] ?? "") &&
+      operands.slice(1).every((arg) => !arg.startsWith("-"))
+    );
+  }
+  if (program === "sort")
+    return !args.some((arg) => /^-[a-zA-Z]*o/.test(arg) || arg.startsWith("--output"));
+  if (program === "uniq") return args.every((arg) => arg.startsWith("-"));
+  if (program === "find")
+    return !args.some((arg) =>
+      /^-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/.test(arg),
+    );
+  if (program === "git") {
+    let index = 0;
+    while (args[index] === "-C" || args[index] === "--no-pager")
+      index += args[index] === "-C" ? 2 : 1;
+    const sub = args[index] ?? "";
+    return GIT_READ_ONLY.has(sub) && !args.some((arg) => GIT_RUNS_PROGRAM.test(arg));
+  }
+  return READ_ONLY.has(program);
+}
+/**
+ * A chain (`a && b; c`) whose commands before the last only read (or `cd` into an existing
+ * directory), and whose last command the engine approves on its own in every directory the `cd`s
+ * could leave it in. Earlier commands change nothing the last one could see, so judging it alone
+ * is judging it in place. Rejected outright: substitutions, variables, assignments, globs,
+ * here-documents, background jobs, `CDPATH`, and pipes (unless every stage only reads). The last
+ * command still gets every check, hard human items included.
+ */
+function chainApproved(request: Request, profile: Profile): boolean {
+  const command = request.input.command ?? request.input.cmd;
+  if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string" || command.length > 20_000)
+    return false;
+  const pipelines = parseShell(command);
+  if (!pipelines || pipelines.length < 2 || pipelines.length > 24) return false;
+  const cwds = new Set([request.cwd]);
+  for (const [index, pipeline] of pipelines.entries()) {
+    const last = index === pipelines.length - 1;
+    for (const cmd of pipeline) {
+      if (cmd.env.length || cmd.subs.length || cmd.stdin !== undefined) return false;
+      if (cmd.loose?.some(Boolean) || cmd.glob?.some(Boolean)) return false;
+    }
+    if (pipeline.length > 1 && !pipeline.every((cmd) => readOnly(cmd.argv))) return false;
+    const [cmd] = pipeline;
+    if (!cmd) return false;
+    if (cmd.argv[0] === "cd") {
+      const target = cmd.argv[1];
+      if (
+        last ||
+        pipeline.length > 1 ||
+        cmd.argv.length !== 2 ||
+        !target ||
+        target.startsWith("-") ||
+        cmd.redirects.length ||
+        (process.env.CDPATH && !/^[/~.]/.test(target))
+      )
+        return false;
+      const next = new Set<string>();
+      for (const dir of cwds) {
+        try {
+          const to = resolveWord(dir, target);
+          if (!existsSync(to)) return false;
+          next.add(to);
+        } catch {
+          return false;
+        }
+      }
+      // `cd x || y` may leave the old directory; keep every place the next command could run.
+      for (const dir of next) cwds.add(dir);
+      if (cwds.size > 4) return false;
+      continue;
+    }
+    if (!last) {
+      // Output may only go nowhere: a read-only command that writes a file is not read-only.
+      const quiet = cmd.redirects.every(
+        (r) => (r.op === ">&" && r.target === "1") || (r.op === ">" && r.target === "/dev/null"),
+      );
+      if (!quiet) return false;
+      // Only reads, and none of a secret: the prefix's output reaches the agent too.
+      for (const stage of pipeline) {
+        if (!readOnly(stage.argv)) return false;
+        // A file reader (recursive searches included) gets the full plain-read check.
+        const [program = "", sub] = stage.argv;
+        if (
+          ["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail", "find"].includes(program) ||
+          (program === "git" && sub === "grep")
+        ) {
+          const text = stage.argv.map(quote).join(" ");
+          for (const cwd of cwds)
+            if (!plainRead({ ...request, cwd, input: { command: text } })) return false;
+          continue;
+        }
+        for (const arg of stage.argv.slice(1))
+          for (const cwd of cwds)
+            if (secretPath(arg) || secretPath(resolve(cwd, arg.replace(/^[^:=]*[:=]/, ""))))
+              return false;
+      }
+      continue;
+    }
+    const text = pipeline
+      .map((stage) =>
+        [
+          ...stage.argv.map(quote),
+          ...stage.redirects.map(
+            (r) => `${r.fd}${r.op}${r.op === ">&" ? r.target : quote(r.target)}`,
+          ),
+        ].join(" "),
+      )
+      .join(" | ");
+    for (const cwd of cwds) {
+      const input = { ...request.input, command: text };
+      if ("workdir" in input) input.workdir = cwd;
+      if ("cwd" in input) input.cwd = cwd;
+      if (evaluate({ ...request, cwd, input }, undefined, profile).decision !== "approve")
+        return false;
+    }
+  }
+  return true;
+}
 export function evaluate(
   request: Request,
   ai?: Classification,
@@ -264,7 +421,26 @@ export function evaluate(
     plainRead(request)
   )
     return result(request, "code-read", PLAIN_READ, true);
-  const decision = markAmbiguous(request, core);
+  if (
+    core.decision === "human" &&
+    !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
+    chainApproved(request, profile)
+  )
+    return result(request, "worktree-write", CHAIN_APPROVED, true);
+  // What the harness lets run (its settings, hooks, permission rules) and the policy profile are
+  // never approved by any step, the engine's included: wherever they live (`CLAUDE_CONFIG_DIR` in
+  // a temp directory, say), a write to them asks.
+  if (core.decision === "approve" && WRITE_TOOLS.has(request.tool)) {
+    const tamper = hardRules(request, { ...core, decision: "human" }, profile.scratchRoots).find(
+      (rule) => rule === "harness-settings" || rule === "policy-profile",
+    );
+    if (tamper)
+      return {
+        ...result(request, "sensitive", "Harness settings and the policy profile require a person"),
+        hard: tamper,
+      };
+  }
+  const decision = markAmbiguous(request, core, profile);
   // A hard human item is a person's: no classification, however confident, approves it.
   if (decision.hard) return decision;
   if (ai) {
@@ -505,8 +681,18 @@ export function evaluateArgv(request: Request, argv: string[]): Decision {
       }
       return result(request, "worktree-write", "Cannot verify worktree creation targets");
     }
-    if (args[0] === "branch" && args.some((a) => a === "-d" || a === "-D" || a === "--delete"))
+    if (args[0] === "branch" && args.some((a) => a === "-d" || a === "-D" || a === "--delete")) {
+      const names = args.slice(1).filter((a) => !a.startsWith("-"));
+      const flags = args.slice(1).filter((a) => a.startsWith("-"));
+      // A branch whose tip is on a remote-tracking ref loses nothing when deleted.
+      if (
+        names.length &&
+        flags.every((f) => ["-d", "-D", "--delete", "-q", "--quiet"].includes(f)) &&
+        names.every((name) => onRemote(gitCwd, name))
+      )
+        return result(request, "git-read", "Deleted branches' tips are on a remote ref", true);
       return result(request, "destructive", branchEvidence(gitCwd, args.at(-1) ?? ""));
+    }
     if (args.length === 1 && ["status", "diff", "log"].includes(args[0] ?? ""))
       return result(request, "git-read", "Verified Git inspection command", true);
     if (args.join(" ") === "branch --show-current" || args.join(" ") === "rev-parse HEAD")

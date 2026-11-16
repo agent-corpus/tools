@@ -850,7 +850,7 @@ describe("git reset --hard, checkout and restore", SLOW, () => {
     "git restore '*.txt'",
     "A=1 git reset --hard",
     "git -C . reset --hard",
-    "git status && git reset --hard",
+    "touch b.txt && git reset --hard",
     "bash -c 'git reset --hard'",
   ])("sends %s to a human", (command) => expect(decide(command)).toBe("human"));
 

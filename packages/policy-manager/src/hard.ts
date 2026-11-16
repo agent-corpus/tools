@@ -1,6 +1,7 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
-import { resolveWord, sensitive } from "./evidence.js";
+import { dirname, resolve } from "node:path";
+import { canonical, git, inside, resolveWord, sensitive, tempRoots } from "./evidence.js";
 import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { defaultProfilePath } from "./profile.js";
 import { type Command, command, innerScript, scan, type Word } from "./shellscan.js";
@@ -28,6 +29,16 @@ export const HARD_RULES = [
   "git-clean",
   /** A command matching the profile's `humanPatterns`. */
   "human-patterns",
+  /**
+   * The deterministic floor under the classifier: cloud and infrastructure writes and deletes
+   * (az, aws, gcloud, kubectl, helm, terraform, pulumi...), GitHub repository, release and secret
+   * deletion, package publishing, and a recursive `rm` outside a linked feature worktree, the
+   * temp directory and the profile's scratch roots. None of these is provably recoverable.
+   */
+  "cloud-write",
+  "repo-delete",
+  "publish",
+  "rm-outside",
   /** Any other decision the engine filed as sensitive: protected paths and configuration. */
   "protected",
   /** An agent running `approve` itself. */
@@ -40,7 +51,7 @@ export type HardRule = (typeof HARD_RULES)[number];
 /** The reason of session's approve guard (an agent running `approve`). */
 export const APPROVE_GUARD =
   "Only the user may approve a request, by running approve in their own terminal";
-const FOREIGN_RECORD_REASON = /^A classification record for another session or CLI/;
+const FOREIGN_RECORD_REASON = /^A classification record/;
 
 /** The engine's own reasons for hard cases it parsed. */
 const REASON_RULES: Array<[RegExp, HardRule]> = [
@@ -216,6 +227,110 @@ function opaqueGitRules(words: string[], keywords: boolean, rules: Set<HardRule>
 }
 
 const CLOUD = new Set(["az", "aws", "gcloud"]);
+/** A cloud CLI word that marks a read: anything without one is treated as a write. */
+const CLOUD_READ_VERB =
+  /^(?:list(?:-.*)?|show(?:-.*)?|get(?:-.*)?|describe(?:-.*)?|query|search|wait|exists|version|ls|tail|help|whoami|login|logout|status)$/;
+const INFRA_WRITE: Record<string, RegExp> = {
+  kubectl:
+    /^(?:apply|create|delete|replace|patch|edit|scale|autoscale|rollout|set|label|annotate|drain|cordon|uncordon|taint|expose|run|exec|cp|attach)$/,
+  oc: /^(?:apply|create|delete|replace|patch|edit|scale|rollout|set|label|annotate|expose|run|exec|new-app|start-build)$/,
+  helm: /^(?:install|upgrade|uninstall|delete|rollback|push)$/,
+  terraform: /^(?:apply|destroy|import|taint|untaint|state|force-unlock|workspace)$/,
+  tofu: /^(?:apply|destroy|import|taint|untaint|state|force-unlock|workspace)$/,
+  terragrunt: /^(?:apply|destroy|import|taint|untaint|state|force-unlock|run-all)$/,
+  pulumi: /^(?:up|update|destroy|refresh|import|state|cancel|stack)$/,
+  eksctl: /^(?:create|delete|upgrade|scale|set|unset|drain)$/,
+};
+const PUBLISHERS: Record<string, RegExp> = {
+  npm: /^(?:publish|unpublish|deprecate|dist-tag)$/,
+  pnpm: /^publish$/,
+  yarn: /^(?:publish|npm)$/,
+  cargo: /^(?:publish|yank|owner)$/,
+  twine: /^upload$/,
+  gem: /^(?:push|yank)$/,
+  poetry: /^publish$/,
+  docker: /^push$/,
+  podman: /^push$/,
+};
+const GH_DELETE: Record<string, RegExp> = {
+  repo: /^(?:delete|archive|rename|edit)$/,
+  release: /^(?:delete|delete-asset)$/,
+  secret: /^(?:delete|remove|set)$/,
+  variable: /^(?:delete|set)$/,
+};
+
+/** The floor rules for one literal program. */
+function floorRules(name: string, cmd: Command, context: Context, rules: Set<HardRule>): void {
+  const positional = cmd.args.filter((word) => !word.text.startsWith("-"));
+  const first = positional[0]?.text ?? "";
+  if (INFRA_WRITE[name]?.test(first)) rules.add("cloud-write");
+  if (name === "dotnet" && first === "nuget" && positional[1]?.text === "push")
+    rules.add("publish");
+  else if (PUBLISHERS[name]?.test(first)) rules.add("publish");
+  if (name === "gh") {
+    if (GH_DELETE[first]?.test(positional[1]?.text ?? "")) rules.add("repo-delete");
+    const method = cmd.args.findIndex((word) => /^(?:-X|--method)$/.test(word.text));
+    const value =
+      method >= 0
+        ? cmd.args[method + 1]?.text
+        : cmd.args
+            .find((word) => /^(?:-X|--method=)/.test(word.text))
+            ?.text.replace(/^(?:-X|--method=)/, "");
+    if (first === "api" && /^delete$/i.test(value ?? "")) rules.add("repo-delete");
+  }
+  if (name === "rm" && cmd.args.some((word) => /^-[a-zA-Z]*[rR]|^--recursive$/.test(word.text)))
+    for (const word of cmd.args) {
+      if (word.text.startsWith("-") && word.literal) continue;
+      if (!disposableTarget(word, context)) rules.add("rm-outside");
+    }
+}
+
+/**
+ * Whether a recursive `rm` target is strictly inside a linked feature worktree, the system temp
+ * directory or a profile scratch root. A word that is not literal, or that expands (a glob or a
+ * brace) under the home directory, is not.
+ */
+function disposableTarget(word: Word, context: Context): boolean {
+  if (!word.literal) return false;
+  const text = word.text;
+  const expands = /[*?[{]/.test(text);
+  const base = expands ? text.slice(0, text.search(/[*?[{]/)) : text;
+  if (expands && (base === "" || base === "~" || base.startsWith("~/") || base === "/")) {
+    // `rm -rf ~/{a,b}` or `rm -rf ~/*`: an expansion in the home directory is never disposable.
+    if (base.startsWith("~") || base === "/" || base === "") return false;
+  }
+  if (context.unknownCwd && !base.startsWith("/") && !base.startsWith("~")) return false;
+  const roots = [...tempRoots(), ...context.scratchRoots];
+  for (const path of resolutions(base || ".", context.cwds)) {
+    let real = path;
+    try {
+      real = canonical(path);
+    } catch {
+      /* judged as written */
+    }
+    if (expands && inside(homedir(), real) && !roots.some((root) => inside(root, real)))
+      return false;
+    const strictly = roots.some((root) => inside(root, real) && real !== root);
+    if (!strictly && !featureWorktree(real)) return false;
+  }
+  return true;
+}
+
+/** Whether a path is strictly inside a linked worktree on a feature branch. */
+function featureWorktree(path: string): boolean {
+  try {
+    let dir = path;
+    while (!existsSync(dir)) dir = dirname(dir);
+    const top = canonical(git(dir, ["rev-parse", "--show-toplevel"]));
+    if (!inside(top, path) || top === path) return false;
+    const gitDir = git(dir, ["rev-parse", "--path-format=absolute", "--git-dir"]);
+    const common = git(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const branch = git(dir, ["branch", "--show-current"]);
+    return gitDir !== common && !!branch && !/^(?:main|master)$/.test(branch);
+  } catch {
+    return false;
+  }
+}
 const SECRET_WORD =
   /(?:secret|credential|password|connection[-_]?strings?|(?:^|[-_])keys?(?:$|[-_])|listKeys|access-token|get-token|kubeconfig)/i;
 
@@ -226,6 +341,50 @@ interface Context {
   words: string[];
   /** The words of every assignment's value, which an expansion can bring into a command. */
   assigned: string[];
+  /** The script runs text as code somewhere (a shell, an interpreter, `eval`, `xargs`...). */
+  runsText?: boolean;
+  /** Absolute directories where a recursive rm is disposable (the profile's scratch roots). */
+  scratchRoots: string[];
+}
+
+const SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "source", "."]);
+/** Programs that run text they are given (inline code, a here-document, standard input). */
+const INTERPRETERS = new Set([
+  ...["node", "nodejs", "deno", "bun", "python", "python2", "python3", "perl", "ruby", "php"],
+  ...["osascript", "pwsh", "powershell", "lua", "tclsh", "expect"],
+  ...["jshell", "irb", "R", "Rscript", "julia", "swift", "groovy", "scala"],
+]);
+/** Programs that run another command from their arguments or input. */
+const RUNNERS = new Set([
+  ...["eval", "exec", "xargs", "find", "alias", "ssh", "su", "script", "watch", "parallel"],
+  ...["tmux", "screen", "docker", "podman", "kubectl", "nohup", "env", "sudo", "doas"],
+]);
+/** Whether a command (after wrappers) can run text as code. Unknown programs count. */
+export function runsText(cmd: Command): boolean {
+  const program = cmd.program;
+  if (!program) return false;
+  if (!program.literal) return true;
+  const name = (program.text.split(/[\\/]/).pop() ?? "").replace(/\d+(?:\.\d+)*$/, "");
+  const texts = cmd.args.map((word) => word.text);
+  // sed runs a command only through GNU `e` (a command or an `s///e` flag); awk through
+  // `system(`, a pipe to or from a command, or `|&`. An ordinary edit or print is data.
+  if (name === "sed")
+    return texts.some((text) =>
+      /(?:^|[;\n{}]\s*)e(?:\s|$)|\/[gpIiMm0-9w]*e[gpIiMm0-9]*\s*(?:$|[;}])/.test(text),
+    );
+  if (["awk", "gawk", "mawk", "nawk"].includes(name))
+    return texts.some((text) => /system\s*\(|\|\s*getline|print[^;]*\|\s*"|\|&/.test(text));
+  return (
+    SHELL_NAMES.has(name) ||
+    INTERPRETERS.has(name) ||
+    INTERPRETERS.has(program.text.split(/[\\/]/).pop() ?? "") ||
+    RUNNERS.has(name)
+  );
+}
+/** Whether any command of a script can run text as code, or the script could not be read. */
+export function scriptRunsText(script: string): boolean {
+  const { segments, complete } = scan(script);
+  return !complete || segments.some((segment) => runsText(command(segment)));
 }
 
 /** A word's text as the words it could split into (`X="push --force"; git $X`). */
@@ -243,14 +402,26 @@ function analyzeScript(
   depth: number,
 ): void {
   const { segments, complete } = scan(script);
+  // Here-document bodies are data unless something in the script runs text as code.
+  const runs = !complete || segments.some((segment) => runsText(command(segment)));
+  if (runs) context.runsText = true;
   for (const segment of segments)
     for (const word of segment) {
+      if (word.heredoc) continue;
       context.words.push(...split(word));
       if (/^[A-Za-z_]\w*\+?=/.test(word.text)) context.assigned.push(...split(word));
     }
   // A script the scanner could not read fully is judged on its words alone.
   if (!complete) opaqueGitRules(context.words, true, rules);
-  for (const segment of segments) analyzeCommand(command(segment), segment, context, rules, depth);
+  for (const segment of segments) {
+    analyzeCommand(command(segment), segment, context, rules, depth);
+    // A here-document fed to a shell, or in a script that runs text (`cat <<EOF | sh`), is code.
+    for (const doc of segment.filter((word) => word.heredoc))
+      if (runs && depth < 4) {
+        analyzeScript(doc.text, context, rules, depth + 1);
+        textRules(doc.text, [...context.cwds][0] ?? "", rules);
+      }
+  }
 }
 
 function analyzeCommand(
@@ -260,8 +431,12 @@ function analyzeCommand(
   rules: Set<HardRule>,
   depth: number,
 ): void {
-  // Every word could name a file: arguments, redirect targets, assignment values.
+  // Every word could name a file: arguments, redirect targets, assignment values. A here-document
+  // body, and an argument with whitespace in it (a message, a PR body), is text, not a path,
+  // unless the script runs text as code.
   for (const word of segment) {
+    if (word.heredoc) continue;
+    if (!word.redirect && !context.runsText && /\s/.test(word.text)) continue;
     const text = word.text.replace(/^[A-Za-z_]\w*=/, "").replace(/^--?[\w-]+=/, "");
     if (!text) continue;
     pathRules(text, rules, true);
@@ -294,8 +469,11 @@ function analyzeCommand(
   }
   if (program.literal && CLOUD.has(name)) {
     if (args.some((arg) => SECRET_WORD.test(arg))) rules.add("credential-read");
+    else if (!args.some((arg) => CLOUD_READ_VERB.test(arg)) && !cloudGet(args))
+      rules.add("cloud-write");
     return;
   }
+  if (program.literal) floorRules(name, cmd, context, rules);
   if (program.literal && name !== "git") return;
   // `git`, or a program that is not a literal word (`$GIT`), which could be Git.
   let opaque =
@@ -391,20 +569,25 @@ function textRules(script: string, cwd: string, rules: Set<HardRule>): void {
 }
 
 /** The hard rules a shell script falls under, judged in its working directory. */
-export function scriptRules(script: string, cwd: string): Set<HardRule> {
+export function scriptRules(
+  script: string,
+  cwd: string,
+  scratchRoots: string[] = [],
+): Set<HardRule> {
   const rules = new Set<HardRule>();
   const context: Context = {
     cwds: new Set(cwd ? [cwd] : []),
     unknownCwd: !cwd,
     words: [],
     assigned: [],
+    scratchRoots,
   };
   analyzeScript(script, context, rules, 0);
   return rules;
 }
 
 /** The hard rules a request falls under, from what it touches. */
-function requestRules(request: Request, rules: Set<HardRule>): void {
+function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: string[]): void {
   const input = request.input;
   const cwds = new Set(request.cwd ? [request.cwd] : []);
   const file = (path: string, write: boolean) => {
@@ -428,25 +611,55 @@ function requestRules(request: Request, rules: Set<HardRule>): void {
   }
   const script = input.command ?? input.cmd;
   if (SHELL_TOOLS.has(request.tool) && typeof script === "string") {
-    for (const rule of scriptRules(script, request.cwd)) rules.add(rule);
-    // The union with the plain-text reading: either one naming a hard rule makes it hard.
-    textRules(script, request.cwd, rules);
+    for (const rule of scriptRules(script, request.cwd, scratchRoots)) rules.add(rule);
+    // The union with the plain-text reading, which catches code the scanner reads as data (a
+    // script piped into a shell, inline interpreter code). Only when something runs text: in a
+    // script that does not, quoted text and here-documents are data (a commit message, a PR body).
+    if (scriptRunsText(script)) textRules(script, request.cwd, rules);
   }
 }
 
 /** Every hard rule a decision that needs a person falls under, built-in guards first. */
-export function hardRules(request: Request, decision: Decision): HardRule[] {
+export function hardRules(
+  request: Request,
+  decision: Decision,
+  scratchRoots: string[] = [],
+): HardRule[] {
   const rules = new Set<HardRule>();
   if (decision.userOnly || decision.reason === APPROVE_GUARD) rules.add("self-approve");
   if (FOREIGN_RECORD_REASON.test(decision.reason)) rules.add("foreign-classification-record");
   for (const [pattern, rule] of REASON_RULES) if (pattern.test(decision.reason)) rules.add(rule);
-  requestRules(request, rules);
+  requestRules(request, rules, scratchRoots);
   if (decision.category === "sensitive" && !rules.size) rules.add("protected");
   return [...rules];
 }
 
 /** The first hard rule a decision that needs a person falls under, or undefined. */
-export function hardRule(request: Request, decision: Decision): HardRule | undefined {
+export function hardRule(
+  request: Request,
+  decision: Decision,
+  scratchRoots: string[] = [],
+): HardRule | undefined {
   if (decision.decision !== "human") return undefined;
-  return hardRules(request, decision)[0];
+  return hardRules(request, decision, scratchRoots)[0];
+}
+
+/**
+ * `az rest` and `az devops invoke` send a GET unless a method says otherwise: with no method, or
+ * `GET`/`HEAD`, they read.
+ */
+function cloudGet(args: string[]): boolean {
+  const generic =
+    (args[0] === "rest" ? 1 : 0) || (args[0] === "devops" && args[1] === "invoke" ? 2 : 0);
+  if (!generic) return false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    const named = /^(?:--method|-m|--http-method)$/.test(arg)
+      ? args[i + 1]
+      : /^(?:--method|--http-method)=/.test(arg)
+        ? arg.slice(arg.indexOf("=") + 1)
+        : undefined;
+    if (named !== undefined && !/^(?:get|head)$/i.test(named)) return false;
+  }
+  return true;
 }

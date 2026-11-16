@@ -154,7 +154,10 @@ test.skipIf(process.platform === "win32")(
       expect(passed).toContain("--json-schema");
       expect(passed).toContain("disableAllHooks");
       verdict("impactful-write", false, 0.97);
-      const asked = pre("echo $HOOK_ASKED", { tool_use_id: "toolu_test_1" });
+      const asked = pre("echo $HOOK_ASKED", {
+        tool_use_id: "toolu_test_1",
+        permission_mode: "default",
+      });
       expect(asked.permissionDecision).toBe("ask");
       expect(asked.permissionDecisionReason).toContain("did not approve");
       expect(asked.permissionDecisionReason).toContain("stub verdict");
@@ -189,7 +192,7 @@ test.skipIf(process.platform === "win32")(
   60000,
 );
 
-test("the compatibility classify command still records a classification", () => {
+test("the compatibility classify command cannot settle a request the classifier did not", () => {
   const sessionId = `record-${randomUUID()}`;
   const directory = sessionDirectory("claude", sessionId);
   const config = mkdtempSync(join(tmpdir(), "pm-config-"));
@@ -228,15 +231,16 @@ test("the compatibility classify command still records a classification", () => 
       recoverable: true,
       rationale: "prints a variable",
     });
-    const recorded = JSON.parse(
+    // A request the classifier could not settle is the person's: a recorded verdict is refused.
+    expect(() =>
       execFileSync(process.execPath, [cli, "classify", "claude", sessionId], {
         encoding: "utf8",
         env,
         input: json,
+        stdio: ["pipe", "pipe", "pipe"],
       }),
-    );
-    expect(recorded.decision).toBe("approve");
-    expect(hook().permissionDecision).toBe("allow");
+    ).toThrow();
+    expect(hook().permissionDecision).toBe("ask");
   } finally {
     try {
       execFileSync(process.execPath, [cli, "stop", "claude", sessionId], { env });

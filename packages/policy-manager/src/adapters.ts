@@ -168,9 +168,13 @@ function askWhy(decision: Decision): string | undefined {
   return why && `${why[0]?.toUpperCase()}${why.slice(1)}`;
 }
 /** Why a person is asked, as the harness's prompt shows it. */
-export function askReason(decision: Decision): string {
+export function askReason(decision: Decision, remembers = false): string {
   const why = askWhy(decision);
-  return `Policy manager: ${decision.reason}${why ? `. ${why}` : ""}.`;
+  const remembered =
+    remembers && decision.sessionGrantable && decision.sessionScopeLabel
+      ? ` If you allow it, ${decision.sessionScopeLabel} is allowed for the rest of this session.`
+      : "";
+  return `Policy manager: ${decision.reason}${why ? `. ${why}` : ""}.${remembered}`;
 }
 export function hookResponse(
   harness: Request["harness"],
@@ -254,7 +258,7 @@ export function hookResponse(
     hookSpecificOutput: {
       hookEventName: phase,
       permissionDecision: "ask",
-      permissionDecisionReason: askReason(decision),
+      permissionDecisionReason: askReason(decision, harness === "claude"),
     },
   };
 }

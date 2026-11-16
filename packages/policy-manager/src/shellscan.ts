@@ -15,6 +15,8 @@ export interface Word {
   redirect?: boolean;
   /** Holds an unquoted expansion or substitution, which can split into words and options. */
   bare?: boolean;
+  /** The body of a here-document fed to this command's standard input (also `redirect`). */
+  heredoc?: boolean;
 }
 
 export interface Scan {
@@ -43,6 +45,11 @@ export function scan(script: string): Scan {
   let literal = true;
   let bare = false;
   let redirectNext = false;
+  /** The next word is a here-document delimiter (`<<` or `<<-`). */
+  let delimiterNext: "" | "<<" | "<<-" = "";
+  /** Here-documents whose bodies start after the next newline, with the command they feed. */
+  let pending: Array<{ delimiter: string; strip: boolean; segment: Word[] }> = [];
+  let unterminated = false;
   let quote: "" | "'" | '"' = "";
   const endWord = () => {
     if (active) {
@@ -53,6 +60,10 @@ export function scan(script: string): Scan {
         ...(bare ? { bare: true } : {}),
       });
       redirectNext = false;
+      if (delimiterNext) {
+        pending.push({ delimiter: text, strip: delimiterNext === "<<-", segment });
+        delimiterNext = "";
+      }
     }
     text = "";
     active = false;
@@ -171,11 +182,42 @@ export function scan(script: string): Scan {
         open(")");
         continue;
       }
-      while (/[<>|&]/.test(script[i + 1] ?? "")) i++;
+      // `<<` and `<<-` start a here-document (`<<<` is a here-string, an ordinary word).
+      const heredoc =
+        c === "<" && next === "<" && script[i + 2] !== "<"
+          ? script[i + 2] === "-"
+            ? "<<-"
+            : "<<"
+          : "";
+      while (/[<>|&-]/.test(script[i + 1] ?? "") && (script[i + 1] !== "-" || heredoc)) i++;
       redirectNext = true;
+      if (heredoc) delimiterNext = heredoc;
       continue;
     }
     if (c === "&" && next === ">") continue;
+    if (c === "\n" && (pending.length || delimiterNext)) endWord();
+    if (c === "\n" && pending.length) {
+      // The bodies follow, in order, each up to a line that is exactly its delimiter.
+      endSegment();
+      for (const doc of pending) {
+        const lines: string[] = [];
+        let found = false;
+        while (i + 1 < script.length) {
+          const end = script.indexOf("\n", i + 1);
+          const line = script.slice(i + 1, end < 0 ? script.length : end);
+          i = end < 0 ? script.length - 1 : end;
+          if ((doc.strip ? line.replace(/^\t+/, "") : line) === doc.delimiter) {
+            found = true;
+            break;
+          }
+          lines.push(line);
+        }
+        if (!found) unterminated = true;
+        doc.segment.push({ text: lines.join("\n"), literal: true, redirect: true, heredoc: true });
+      }
+      pending = [];
+      continue;
+    }
     if (/[;&|()\n]/.test(c)) {
       endSegment();
       continue;
@@ -187,7 +229,7 @@ export function scan(script: string): Scan {
     text += c;
     active = true;
   }
-  const complete = quote === "" && stack.length === 0;
+  const complete = quote === "" && stack.length === 0 && !unterminated && !pending.length;
   while (stack.length) close();
   endSegment();
   return { segments, complete };

@@ -192,16 +192,23 @@ describe("Claude Code rule matching, with the examples from the permissions docs
     expect(nativeRules(file("Edit", join(worktree, "lib", "c.ts")))).toBeUndefined();
   });
 
-  test("project settings and settings.local.json are read for the checkout", () => {
-    claudeSettings({ allow: ["Bash(make *)"] }, join(worktree, ".claude", "settings.json"));
+  test("a checkout's settings: deny and ask count, allow does not", () => {
+    claudeSettings(
+      { allow: ["Bash(make *)", "Bash(*)"], ask: ["Bash(make release)"] },
+      join(worktree, ".claude", "settings.json"),
+    );
     writeFileSync(
       join(worktree, ".claude", "settings.local.json"),
-      JSON.stringify({ permissions: { deny: ["Bash(make deploy)"] } }),
+      JSON.stringify({ permissions: { deny: ["Bash(make deploy)"], allow: ["Bash"] } }),
     );
     clearNativeRuleCache();
-    expect(nativeRules(bash("make test"))?.verdict).toBe("allow");
+    expect(nativeRules(bash("make test"))).toBeUndefined();
     expect(nativeRules(bash("make deploy"))?.verdict).toBe("deny");
-    expect(nativeRules(bash("make test", "claude", root))).toBeUndefined();
+    expect(nativeRules(bash("make release"))?.verdict).toBe("ask");
+    expect(nativeRules(bash("make deploy", "claude", root))).toBeUndefined();
+    // The same allow rule in the user's own settings counts.
+    claudeSettings({ allow: ["Bash(make *)"] });
+    expect(nativeRules(bash("make test"))?.verdict).toBe("allow");
   });
 
   test("MCP rules", () => {
@@ -270,17 +277,21 @@ prefix_rule(pattern = ["rm"], decision = "forbidden")
     expect(nativeRules(bash("git status $(echo x)", "codex"))).toBeUndefined();
   });
 
-  test("project rules apply only when config.toml trusts the project", () => {
+  test("a checkout's rules can only make it stricter: prompt and forbidden count, allow does not", () => {
     rules(
-      'prefix_rule(pattern = ["make"], decision = "allow")',
+      'prefix_rule(pattern = ["make"], decision = "allow")\nprefix_rule(pattern = ["make", "deploy"], decision = "forbidden")',
       join(worktree, ".codex", "rules", "p.rules"),
     );
-    expect(nativeRules(bash("make x", "codex"))).toBeUndefined();
+    // Trusted or not, a checkout's allow rule does not count.
     writeFileSync(
       join(codexHome, "config.toml"),
       `[projects."${worktree}"]\ntrust_level = "trusted"\n`,
     );
     clearNativeRuleCache();
+    expect(nativeRules(bash("make x", "codex"))).toBeUndefined();
+    expect(nativeRules(bash("make deploy", "codex"))?.verdict).toBe("deny");
+    // The same allow rule under CODEX_HOME counts.
+    rules('prefix_rule(pattern = ["make"], decision = "allow")');
     expect(nativeRules(bash("make x", "codex"))?.verdict).toBe("allow");
   });
 
@@ -342,7 +353,7 @@ describe("the native rules layer in the session", () => {
     expect(runs()).toBe(0);
   });
 
-  test("an allow rule answers for a hard item, except a force push and an agent approving itself", async () => {
+  test("an allow rule answers for a hard item, except credentials, harness settings, force push and self-approval", async () => {
     claudeSettings({
       allow: [
         "Bash(git push *)",
@@ -351,13 +362,32 @@ describe("the native rules layer in the session", () => {
         "Bash(policy-manager *)",
         "Bash(cat *)",
         "Bash(git clean *)",
+        "Write",
+        "Edit",
       ],
     });
     const { s, runs } = session("claude");
     // Hard items an allow rule may answer for.
-    expect((await s.decide(bash("cat ~/.aws/credentials"), "PreToolUse")).decision).toBe("approve");
     expect((await s.decide(bash("git clean -fd"), "PreToolUse")).decision).toBe("approve");
-    // A force push, however it is written, is always asked; the harness prompts.
+    // Never: credential reads, writes to what the harness allows, a force push in any form.
+    const write = (path: string): Request => ({
+      sessionId: "s1",
+      harness: "claude",
+      cwd: worktree,
+      tool: "Write",
+      input: { file_path: path, content: "{}" },
+    });
+    for (const request of [
+      bash("cat ~/.aws/credentials"),
+      write(join(worktree, ".claude", "settings.json")),
+      write(join(worktree, ".claude", "settings.local.json")),
+      write(join(claudeHome, "settings.json")),
+      write(join(worktree, ".claude", "hooks", "x.sh")),
+      write(join(codexHome, "config.toml")),
+    ]) {
+      const d = await s.decide(request, "PreToolUse");
+      expect(d.decision, JSON.stringify(request.input)).toBe("human");
+    }
     for (const command of [
       "git push --force origin x",
       "git push -f origin x",
@@ -378,6 +408,27 @@ describe("the native rules layer in the session", () => {
       "human",
     );
     expect(runs()).toBe(0);
+  });
+
+  test("a checkout's Bash(*) approves nothing", async () => {
+    claudeSettings({ allow: ["Bash(*)"] }, join(worktree, ".claude", "settings.json"));
+    const { s } = session("claude");
+    for (const command of [
+      "cat ~/.aws/credentials",
+      "git clean -fdx",
+      "az group delete -n x --yes",
+    ])
+      expect((await s.decide(bash(command), "PreToolUse")).decision, command).toBe("human");
+  });
+
+  test("wrappers Claude Code does not strip stay the program for an allow rule", () => {
+    claudeSettings({ allow: ["Bash(git status:*)", "Bash(cat *)"] });
+    for (const command of ["sudo git status", "env git status", "exec git status", "doas cat x"])
+      expect(nativeRules(bash(command)), command).toBeUndefined();
+    expect(nativeRules(bash("timeout 5 git status"))?.verdict).toBe("allow");
+    // A deny still reaches through any wrapper.
+    claudeSettings({ deny: ["Bash(git push *)"] });
+    expect(nativeRules(bash("sudo git push origin x"))?.verdict).toBe("deny");
   });
 
   test("Codex: allow approves (PermissionRequest), prompt and forbidden leave it to Codex", async () => {

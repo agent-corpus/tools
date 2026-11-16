@@ -82,7 +82,7 @@ describe("single-quoted literals", () => {
 });
 
 describe("session scope for shell redirect writes", () => {
-  test("a redirect write is session-grantable and covers later writes under the same root", () => {
+  test("a redirect write is session-grantable for that exact file only", () => {
     const { s } = session();
     const first = s.review(
       shell("printf test >> .agent-config/README.md"),
@@ -91,14 +91,17 @@ describe("session scope for shell redirect writes", () => {
     );
     expect(first.decision).toBe("human");
     expect(first.sessionGrantable).toBe(true);
-    expect(first.sessionScopeLabel).toMatch(/^writes under .*\.agent-config$/);
+    expect(first.sessionScopeLabel).toMatch(/^writes to .*\.agent-config[\\/]README\.md$/);
     s.grant(first.requestHash, true, true);
+    expect(
+      s.review(shell("printf other >> .agent-config/README.md"), undefined, "PreToolUse").decision,
+    ).toBe("approve");
     for (const later of [
       shell("printf x > .agent-config/agents/a.md"),
       shell("tee -a .agent-config/skills/b.md"),
       patch(join(worktree, ".agent-config", "c.md")),
     ])
-      expect(s.review(later, undefined, "PreToolUse").decision).toBe("approve");
+      expect(s.review(later, undefined, "PreToolUse").decision).toBe("human");
   });
   test.each([
     "printf x >> AGENTS.md",

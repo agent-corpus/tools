@@ -1,6 +1,6 @@
-import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonical, git } from "./evidence.js";
 import { SHELL_TOOLS } from "./policy.js";
 import { parseShell } from "./shell.js";
@@ -119,6 +119,21 @@ interface ClaudeFile {
   rules: ClaudeRules;
   /** Where `/path` rules are relative to. */
   base: string;
+  /** Allow rules count only from the user's own and managed settings, never from a checkout. */
+  allows: boolean;
+}
+
+/** Claude Code's managed settings file for this platform. */
+function managedSettings(): string {
+  if (process.platform === "darwin")
+    return "/Library/Application Support/ClaudeCode/managed-settings.json";
+  if (process.platform === "win32")
+    return join(
+      process.env.ProgramData ?? "C:\\ProgramData",
+      "ClaudeCode",
+      "managed-settings.json",
+    );
+  return "/etc/claude-code/managed-settings.json";
 }
 
 function claudeRules(text: string): ClaudeRules {
@@ -148,15 +163,18 @@ function claudeFiles(request: Request): ClaudeFile[] {
   if (top) projects.add(top);
   else if (request.cwd && isAbsolute(request.cwd)) projects.add(resolve(request.cwd));
   const files: ClaudeFile[] = [];
-  const add = (path: string, base: string) => {
+  const add = (path: string, base: string, allows: boolean) => {
     const rules = readCached(path, claudeRules);
-    if (rules) files.push({ path, rules, base });
+    if (rules) files.push({ path, rules, base, allows });
   };
   const first = [...projects][0] ?? request.cwd;
-  add(join(user, "settings.json"), first);
+  add(managedSettings(), first, true);
+  add(join(user, "settings.json"), first, true);
+  // A checkout's settings can only make a request stricter: their deny and ask rules count, their
+  // allow rules do not (the checkout can be anyone's branch).
   for (const project of projects) {
-    add(join(project, ".claude", "settings.json"), project);
-    add(join(project, ".claude", "settings.local.json"), project);
+    add(join(project, ".claude", "settings.json"), project, false);
+    add(join(project, ".claude", "settings.local.json"), project, false);
   }
   return files;
 }
@@ -227,8 +245,17 @@ export function bashRuleMatches(content: string, text: string): boolean {
 }
 
 interface Subcommand {
-  /** The words after wrappers (and, for deny and ask, assignments) are stripped. */
+  /**
+   * For deny and ask: the words after every wrapper the hard-rule scanner knows (`sudo`, `env`,
+   * `exec`...) and assignments are stripped, so a deny reaches the inner command.
+   */
   text: string;
+  /**
+   * For allow: the words as written, with only Claude Code's documented wrappers stripped. `sudo`,
+   * `env`, `exec` and the like stay the program, so `Bash(git status:*)` does not allow
+   * `sudo git status`.
+   */
+  allowText: string;
   /** Leading assignments were present. */
   assigned: boolean;
   /** Every word is literal and every redirect harmless, so an allow rule may cover it. */
@@ -244,13 +271,16 @@ function subcommands(script: string): { parts: Subcommand[]; complete: boolean }
     if (!cmd.program) continue;
     const words = [cmd.program, ...cmd.args];
     const stripped = stripWrappers(words.map((word) => word.text));
+    const raw = segment.filter((word) => !word.redirect);
+    const written = stripWrappers(raw.map((word) => word.text));
     const harmless = (word: Word) =>
       word.literal && (word.text === "/dev/null" || /^\d$/.test(word.text));
     parts.push({
       text: stripped.join(" "),
+      allowText: written.join(" "),
       assigned: cmd.assignments.length > 0,
-      plain: words.every((word) => word.literal) && cmd.redirects.every(harmless),
-      prompts: alwaysPrompts(stripped),
+      plain: raw.every((word) => word.literal) && cmd.redirects.every(harmless),
+      prompts: alwaysPrompts(written) || alwaysPrompts(stripped),
     });
   }
   return { parts, complete };
@@ -261,7 +291,10 @@ const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 /** A Read or Edit path rule as an absolute glob, per the documented prefixes. */
 function pathPattern(content: string, cwd: string, base: string): string {
   if (content.startsWith("//")) return content.slice(1);
-  if (content.startsWith("~/")) return join(homedir(), content.slice(2)).replace(/\\/g, "/");
+  if (content.startsWith("~/"))
+    return join(homedir(), content.slice(2))
+      .replace(/\\/g, "/")
+      .replace(/^[A-Za-z]:(?=\/)/, "");
   if (content.startsWith("/")) return `${base.replace(/\\/g, "/")}${content}`;
   const relative = content.startsWith("./") ? content.slice(2) : content;
   // Gitignore style: a pattern with no `/` matches at any depth (`Read(.env)` is `Read(**/.env)`).
@@ -291,8 +324,9 @@ function claudeRuleMatches(rule: string, request: Request, base: string): boolea
     // Deny and ask rules apply to any subcommand, past any leading assignment. (Allow rules for
     // shell commands are matched per subcommand in `allowedScript`.)
     return (
-      parts.some((part) => bashRuleMatches(content, part.text)) ||
-      bashRuleMatches(content, script.trim())
+      parts.some(
+        (part) => bashRuleMatches(content, part.text) || bashRuleMatches(content, part.allowText),
+      ) || bashRuleMatches(content, script.trim())
     );
   }
   const edit = tool === "Edit" && EDIT_TOOLS.has(request.tool);
@@ -303,9 +337,38 @@ function claudeRuleMatches(rule: string, request: Request, base: string): boolea
   if (!edit && !read) return false;
   const file = request.input.file_path ?? request.input.notebook_path ?? request.input.path;
   if (typeof file !== "string" || !request.cwd) return false;
-  const target = resolve(request.cwd, file).replace(/\\/g, "/");
-  const pattern = pathPattern(content, request.cwd, base);
-  return pathGlob(pattern, target) || pathGlob(`${pattern}/**`, target);
+  const windows = process.platform === "win32";
+  // Every spelling of a path: as written and resolved (Windows 8.3 short names and symlinks
+  // expanded), with `/` separators, lower-cased on Windows, and without its drive letter so that
+  // a `//abs` rule (written from the filesystem root) matches `C:/abs`.
+  const spellings = (path: string): string[] => {
+    const forms = new Set([path]);
+    try {
+      forms.add(realpathSync.native(path));
+    } catch {
+      try {
+        forms.add(join(realpathSync.native(dirname(path)), basename(path)));
+      } catch {
+        /* missing: as written */
+      }
+    }
+    const out = new Set<string>();
+    for (const form of forms) {
+      const slashed = form.replace(/\\/g, "/");
+      const cased = windows ? slashed.toLowerCase() : slashed;
+      out.add(cased);
+      if (windows) out.add(cased.replace(/^[a-z]:(?=\/)/, ""));
+    }
+    return [...out];
+  };
+  const targets = spellings(resolve(request.cwd, file));
+  for (const cwd of spellings(request.cwd))
+    for (const root of spellings(base)) {
+      const pattern = pathPattern(content, cwd, root);
+      const patterns = [pattern, `${pattern}/**`].map((p) => (windows ? p.toLowerCase() : p));
+      if (targets.some((target) => patterns.some((p) => pathGlob(p, target)))) return true;
+    }
+  return false;
 }
 
 /** Allow rules covering every subcommand of a script, each part by any allow rule. */
@@ -317,10 +380,10 @@ function allowedScript(script: string, files: ClaudeFile[]): NativeMatch | undef
     if (!part.plain || part.assigned || part.prompts) return undefined;
     let found: NativeMatch | undefined;
     for (const file of files) {
-      for (const rule of file.rules.allow) {
+      for (const rule of file.allows ? file.rules.allow : []) {
         const parsed = parseRule(rule.trim());
         if (parsed?.tool !== "Bash") continue;
-        if (parsed.content === undefined || bashRuleMatches(parsed.content, part.text)) {
+        if (parsed.content === undefined || bashRuleMatches(parsed.content, part.allowText)) {
           found = { verdict: "allow", rule, source: file.path };
           break;
         }
@@ -352,13 +415,13 @@ function claudeVerdict(request: Request): NativeMatch | undefined {
   if (SHELL_TOOLS.has(request.tool) && typeof script === "string") {
     // `Bash` or `Bash(*)` allows everything; otherwise every part needs a rule.
     for (const file of files)
-      for (const rule of file.rules.allow)
+      for (const rule of file.allows ? file.rules.allow : [])
         if (/^Bash(?:\(\s*\*?\s*\))?$/.test(rule.trim()))
           return { verdict: "allow", rule, source: file.path };
     return allowedScript(script, files);
   }
   for (const file of files)
-    for (const rule of file.rules.allow)
+    for (const rule of file.allows ? file.rules.allow : [])
       if (claudeRuleMatches(rule, request, file.base))
         return { verdict: "allow", rule, source: file.path };
   return undefined;
@@ -512,41 +575,17 @@ export function parseCodexRules(text: string): PrefixRule[] {
   return rules;
 }
 
-/** Whether the Codex config marks `project` trusted. Only the documented table form is read. */
-function codexTrusted(config: string, project: string): boolean {
-  let section: string | undefined;
-  for (const raw of config.split("\n")) {
-    const line = raw.replace(/#.*$/, "").trim();
-    const header = /^\[projects\.(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\]$/.exec(line);
-    if (header) {
-      section = (header[1] ?? header[2] ?? "").replace(/\\(.)/g, "$1");
-      continue;
-    }
-    if (line.startsWith("[")) {
-      section = undefined;
-      continue;
-    }
-    if (section !== undefined && /^trust_level\s*=\s*["']trusted["']$/.test(line)) {
-      try {
-        if (canonical(section) === project) return true;
-      } catch {
-        /* a missing path trusts nothing */
-      }
-    }
-  }
-  return false;
-}
-
-function codexFiles(request: Request): Array<{ path: string; rules: PrefixRule[] }> {
+function codexFiles(
+  request: Request,
+): Array<{ path: string; rules: PrefixRule[]; allows: boolean }> {
   const home = process.env.CODEX_HOME || join(homedir(), ".codex");
-  const dirs = [join(home, "rules")];
+  // Allow rules count only from CODEX_HOME. A checkout's `.codex/rules` can only make a request
+  // stricter: its prompt and forbidden rules count, trusted or not, and its allow rules do not.
+  const dirs: Array<[string, boolean]> = [[join(home, "rules"), true]];
   const top = topLevel(request.cwd);
-  if (top) {
-    const config = readCached(join(home, "config.toml"), (text) => text);
-    if (config && codexTrusted(config, top)) dirs.push(join(top, ".codex", "rules"));
-  }
-  const files: Array<{ path: string; rules: PrefixRule[] }> = [];
-  for (const dir of dirs) {
+  if (top) dirs.push([join(top, ".codex", "rules"), false]);
+  const files: Array<{ path: string; rules: PrefixRule[]; allows: boolean }> = [];
+  for (const [dir, allows] of dirs) {
     let names: string[];
     try {
       if (!lstatSync(dir).isDirectory()) continue;
@@ -559,7 +598,7 @@ function codexFiles(request: Request): Array<{ path: string; rules: PrefixRule[]
     for (const name of names.slice(0, 64)) {
       const path = join(dir, name);
       const rules = readCached(path, parseCodexRules);
-      if (rules) files.push({ path, rules });
+      if (rules) files.push({ path, rules, allows });
     }
   }
   return files;
@@ -604,6 +643,7 @@ function codexVerdict(request: Request): NativeMatch | undefined {
     let best: (NativeMatch & { level: number }) | undefined;
     for (const file of files)
       for (const rule of file.rules) {
+        if (rule.decision === "allow" && !file.allows) continue;
         if (rule.pattern.length > argv.length) continue;
         if (!rule.pattern.every((options, k) => options.includes(argv[k] as string))) continue;
         // When several rules match, the most restrictive decision applies.

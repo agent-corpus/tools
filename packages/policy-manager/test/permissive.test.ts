@@ -472,7 +472,17 @@ describe("merged-branch deletion", () => {
   test("local branch deletion follows the same evidence", () => {
     expect(decide("git branch -D squash", repo).decision).toBe("approve");
     expect(decide("git branch -d ff", repo).decision).toBe("approve");
-    expect(decide("git branch -D wip", repo).decision).toBe("human");
+    // Unmerged, but its tip is on origin: nothing is lost.
+    expect(decide("git branch -D wip", repo).decision).toBe("approve");
+    // A commit that exists only locally is lost.
+    const current = execFileSync("git", ["-C", repo, "branch", "--show-current"], {
+      encoding: "utf8",
+    }).trim();
+    git(repo, ["checkout", "-q", "-b", "local-only", "wip"]);
+    commit(repo, "local-only.txt", "only here");
+    git(repo, ["checkout", "-q", current]);
+    expect(decide("git branch -D local-only", repo).decision).toBe("human");
+    expect(decide("git branch -D wip local-only", repo).decision).toBe("human");
   });
 });
 
