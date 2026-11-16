@@ -470,3 +470,10 @@ describe("more of the floor", () => {
     ).toEqual([]);
   });
 });
+
+test('an unquoted here-document body with `"` and `\\"` keeps its substitutions apart', () => {
+  const base = { ...evaluate(shell("ls"), undefined, permissive), decision: "human" as const };
+  const body = 'say "hi" and \\" then $(git push --force origin x) "';
+  expect(hardRules(shell(`cat <<EOF\n${body}\nEOF`), base)).toContain("force-push");
+  expect(hardRules(shell(`cat <<EOF\nsay "hi" and \\" only text\nEOF`), base)).toEqual([]);
+});

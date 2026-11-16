@@ -236,7 +236,11 @@ export function scan(script: string): Scan {
         // With an unquoted delimiter the shell expands `$(...)`, backticks and `${...}` in the
         // body, as in a double-quoted string: those substitutions run, so they are commands here.
         if (!doc.quoted && /[$`]/.test(body)) {
-          const inner = scan(`"${body.replace(/"/g, '\\"')}"`);
+          // In the body a `"` and a backslash before it are literal; in a double-quoted string
+          // they must be escaped (`"` as `\"`, that backslash as `\\`). Other backslashes mean the
+          // same in both (they escape `$`, a backtick, `\` and a newline, and are otherwise kept).
+          const quoted = body.replace(/\\(?=")|"/g, (match) => (match === '"' ? '\\"' : "\\\\"));
+          const inner = scan(`"${quoted}"`);
           if (!inner.complete) unterminated = true;
           // The last segment is the body itself as one word; the others are its substitutions.
           segments.push(...inner.segments.slice(0, -1));

@@ -1,5 +1,9 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  test: { setupFiles: ["./test/isolation.ts"] },
+  // Windows runners are slower at the many short git processes these tests start.
+  test: {
+    setupFiles: ["./test/isolation.ts"],
+    testTimeout: process.platform === "win32" ? 30_000 : 5_000,
+  },
 });
