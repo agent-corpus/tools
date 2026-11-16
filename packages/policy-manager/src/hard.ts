@@ -6,6 +6,7 @@ import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { defaultProfilePath } from "./profile.js";
 import { readOnly } from "./reads.js";
 import { type Command, command, innerScript, scan, type Word } from "./shellscan.js";
+import { codeTouchesState, findReachesState, namesState, stateText } from "./statepaths.js";
 import type { Decision, Request } from "./types.js";
 
 /**
@@ -263,18 +264,20 @@ const PUBLISHERS: Record<string, RegExp> = {
   podman: /^push$/,
 };
 const GH_DELETE: Record<string, RegExp> = {
-  repo: /^(?:create|fork|delete|archive|unarchive|rename|edit)$/,
+  repo: /^(?:create|fork|delete|archive|unarchive|rename|edit|sync)$/,
   release: /^(?:create|edit|upload|delete|delete-asset)$/,
   secret: /^(?:delete|remove|set)$/,
   variable: /^(?:delete|set)$/,
-  gist: /^(?:create|new|edit|delete)$/,
+  gist: /^(?:create|new|edit|rename|delete)$/,
   // What gh itself runs and with which credentials: extensions, aliases, settings and auth.
-  extension: /^(?:install|upgrade)$/,
-  extensions: /^(?:install|upgrade)$/,
-  ext: /^(?:install|upgrade)$/,
-  alias: /^(?:set|import)$/,
+  extension: /^(?:install|upgrade|exec|remove)$/,
+  extensions: /^(?:install|upgrade|exec|remove)$/,
+  ext: /^(?:install|upgrade|exec|remove)$/,
+  alias: /^(?:set|import|delete)$/,
   config: /^set$/,
-  auth: /^(?:refresh|login|logout|setup-git|token)$/,
+  auth: /^(?:refresh|login|logout|setup-git|token|switch)$/,
+  cache: /^delete$/,
+  label: /^delete$/,
   issue: /^(?:delete|transfer)$/,
   "ssh-key": /^(?:add|delete)$/,
   "gpg-key": /^(?:add|delete)$/,
@@ -283,7 +286,7 @@ const GH_DELETE: Record<string, RegExp> = {
   // Merging and workflow or deploy triggers cannot be taken back. (`gh ruleset` only reads.)
   pr: /^merge$/,
   workflow: /^(?:run|enable|disable)$/,
-  run: /^rerun$/,
+  run: /^(?:rerun|delete|cancel)$/,
 };
 
 /**
@@ -620,6 +623,9 @@ function floorRules(name: string, cmd: Command, context: Context, rules: Set<Har
     const deletes =
       texts.includes("-delete") ||
       (exec >= 0 && /^(?:.*\/)?(?:rm|rmdir|unlink|shred)$/.test(texts[exec + 1] ?? ""));
+    // Any action that deletes or runs something, wherever find could reach the state.
+    if ((exec >= 0 || texts.includes("-delete")) && findReachesState(texts, context.cwds))
+      rules.add("policy-state");
     if (deletes) {
       const start = cmd.args.findIndex((word) => /^[-!(]/.test(word.text));
       const roots = cmd.args.slice(0, start < 0 ? cmd.args.length : start);
@@ -699,6 +705,8 @@ interface Context {
   scratchRoots: string[];
 }
 
+/** Programs that delete or move their operands: a directory above the state counts for them. */
+const REMOVERS = new Set(["rm", "rmdir", "unlink", "shred", "mv", "trash", "srm", "rsync"]);
 const SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "source", "."]);
 /** Programs that run text they are given (inline code, a here-document, standard input). */
 const INTERPRETERS = new Set([
@@ -804,6 +812,36 @@ function analyzeCommand(
   const programName = cmd.program?.text.split(/[\\/]/).pop() ?? "";
   const reading =
     !!cmd.program?.literal && readOnly([programName, ...cmd.args.map((word) => word.text)]);
+  const removes = !cmd.program?.literal || REMOVERS.has(programName);
+  // `xargs <writer>` takes its targets from input nobody can read here; it fails closed when it
+  // could reach the state: it runs where the state lies, or the script names `acp` or a path that
+  // could name the state.
+  const programAt = cmd.program ? segment.indexOf(cmd.program) : -1;
+  const viaXargs = segment.some(
+    (word, k) => k < programAt && word.literal && /(?:^|\/)xargs$/.test(word.text),
+  );
+  if (
+    viaXargs &&
+    !reading &&
+    (namesState(".", context.cwds, true) ||
+      context.words.some(
+        (word) =>
+          /acp/i.test(word) ||
+          (/^[/~$]/.test(word) && namesState(stateText(word, false), context.cwds, true)),
+      ))
+  )
+    rules.add("policy-state");
+  // Inline interpreter code (`python3 -c`, `perl -e`, `node -e`, a here-document) that could
+  // delete, move or write the state.
+  if (cmd.program?.literal && INTERPRETERS.has(programName)) {
+    const code = [
+      ...cmd.args.filter((_, k) =>
+        /^(?:-c|-e|-E|-p|-r|--eval|--print)$/.test(cmd.args[k - 1]?.text ?? ""),
+      ),
+      ...segment.filter((word) => word.heredoc),
+    ].map((word) => word.text);
+    if (code.some((text) => codeTouchesState(text, context.cwds))) rules.add("policy-state");
+  }
   for (const word of segment) {
     if (word.heredoc) continue;
     if (!word.redirect && !context.runsText && /\s/.test(word.text)) continue;
@@ -812,7 +850,18 @@ function analyzeCommand(
     pathRules(text, rules, true);
     const resolved = resolutions(text, context.cwds);
     for (const path of resolved) pathRules(path, rules, true);
-    if ((word.writes || (!word.redirect && !reading)) && [text, ...resolved].some(policyStatePath))
+    // A target is matched as the shell would expand it (a glob, a variable read as `*`), and for a
+    // delete or move a directory above the state counts too.
+    // A word that is only an expansion (`"$Q"`) counts for a delete, a move or a redirection.
+    const target = stateText(text, word.literal);
+    const opaque = !word.literal && !/[^*/]/.test(target);
+    if (
+      (word.writes || (!word.redirect && !reading)) &&
+      word !== cmd.program &&
+      ([text, ...resolved].some(policyStatePath) ||
+        ((!opaque || removes || word.writes) && namesState(target, context.cwds, removes)) ||
+        (context.unknownCwd && !/^[/~]/.test(text) && /acp/i.test(text)))
+    )
       rules.add("policy-state");
     const relative = !text.startsWith("/") && !text.startsWith("~") && !text.startsWith("$");
     if (context.unknownCwd && relative && SETTINGS_NAMES.test(text.split("/").pop() ?? ""))

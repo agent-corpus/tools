@@ -901,3 +901,70 @@ describe("round 6: options before the verb, policy state, gh api options", () =>
     ).not.toContain("repo-delete");
   });
 });
+
+describe("round 7: policy state is matched as the shell expands it", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  const temp = realpathSync(tmpdir()).replace(/\\/g, "/");
+  const uid = String(process.getuid?.() ?? "user");
+  const rulesIn = (command: string, cwd: string) => hardRules(shell(command, cwd), base());
+  test.each([
+    ["rm -rf acp-*", "temp"],
+    ["rm acp-*/audit.jsonl", "temp"],
+    [`rm -rf ${temp}/acp-*`, "repo"],
+    [`rm -rf ${temp}/a*p-${uid}*`, "repo"],
+    [`rm -rf ${temp}/[a]cp-?${uid.slice(1)}-*`, "repo"],
+    ['rm "$TMPDIR"/acp-*/audit.jsonl', "repo"],
+    ['rm -rf "$TMPDIR"', "repo"],
+    [`rm -rf ${temp}`, "repo"],
+    [`mv ${temp}/acp-* /dev/null`, "repo"],
+    [`truncate -s0 ${temp}/acp-*/audit.jsonl`, "repo"],
+    [`echo x > ${temp}/acp-${uid}-abc/token`, "repo"],
+    ["echo x | tee acp-*/audit.jsonl", "temp"],
+    [`find ${temp} -name 'acp-*' -delete`, "repo"],
+    ["find . -path '*acp-*' -delete", "temp"],
+    ["find . -name audit.jsonl -exec rm {} +", "temp"],
+    [`find ${temp} -delete`, "repo"],
+    [`find ${temp} -regex '.*' -delete`, "repo"],
+    ["echo acp-x | xargs rm -rf", "repo"],
+    ["ls | xargs rm -rf", "temp"],
+    [
+      `python3 -c "import glob,os; [os.remove(p) for p in glob.glob('${temp}/acp-*/audit.jsonl')]"`,
+      "repo",
+    ],
+    [`perl -e 'unlink glob("${temp}/acp-*/token")'`, "repo"],
+    ['node -e \'require("fs").rmSync(require("os").tmpdir(), {recursive: true})\'', "repo"],
+  ])("policy-state: %s (cwd %s)", (command, where) => {
+    expect(rulesIn(command, where === "temp" ? temp : worktree)).toContain("policy-state");
+  });
+  test.each([
+    ["rm -rf scratch/out", "temp"],
+    [`rm -rf ${temp}/pm-other-dir-x`, "repo"],
+    [`find ${temp}/pm-other-dir-x -name '*.log' -delete`, "repo"],
+    ["find . -name '*.log' -delete", "repo"],
+    [`cp notes.md ${temp}/`, "repo"],
+    ["echo x | xargs rm -f", "repo"],
+    [`python3 -c "open('${temp}/pm-x/notes.md','w').write('x')"`, "repo"],
+    [`cat ${temp}/acp-${uid}-abc/audit.jsonl`, "repo"],
+    ['gh api graphql -f query="$Q"', "temp"],
+  ])("not policy-state: %s (cwd %s)", (command, where) => {
+    expect(rulesIn(command, where === "temp" ? temp : worktree)).not.toContain("policy-state");
+  });
+  test.each([
+    "gh extension exec x",
+    "gh extension remove x",
+    "gh alias delete co",
+    "gh auth switch",
+    "gh gist rename 1 a b",
+    "gh repo sync",
+    "gh cache delete --all",
+    "gh label delete bug",
+    "gh run delete 1",
+    "gh run cancel 1",
+    "gh api repos/o/r/issues/1/comments -f body=$BODY",
+  ])("floor: %s", (command) => {
+    expect(rulesIn(command, worktree)).toContain("repo-delete");
+  });
+});

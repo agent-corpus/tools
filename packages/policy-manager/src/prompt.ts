@@ -21,6 +21,7 @@ A PERSON IS NEEDED (mark category sensitive or destructive and recoverable=false
 3. Lose work that cannot be recovered: git push --force, git branch -D, git clean, git checkout/restore/reset that discards uncommitted changes, rm of tracked or unmerged work in a main checkout, rm -rf outside temp, scratch and the feature worktree.
 4. Write to cloud resources: az/aws/gcloud create, update, delete, deploy, set, role assignments; kubectl apply/delete; terraform apply; deleting GitHub repos, releases or secrets.
 5. Pipe downloaded content into a shell (curl ... | sh).
+6. Change the policy service's own state: the acp-* directories under the system temp directory hold its audit logs, token and socket. Any write, move, delete, truncation or permission change that could reach them (rm -rf of the temp directory or an acp-* glob included) is sensitive. Reading the audit logs is fine.
 
 APPROVABLE (recoverable=true, confidence high) — everything else that is recoverable, including:
 - Reads of code, files, logs, help text; read-only git; read-only cloud or API queries (az ... show/list, gh api GET, gh pr view).
