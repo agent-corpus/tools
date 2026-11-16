@@ -16,20 +16,55 @@ const STATE_DIR = /^acp-(?:\d+|user)-/i;
 /** Files a session directory holds, by name; a sample stands for the rotated logs. */
 const STATE_FILES = ["audit.jsonl", "audit.00000001.jsonl", "token", "service.sock", "grants.json"];
 
+/**
+ * Longest word or pattern matched here. Anything longer fails closed (counts as reaching the
+ * state), so no input can make matching slow.
+ */
+export const MAX_TARGET = 4096;
+
+/** `text` without trailing `/` (a loop, linear on any input). */
+function stripSlashes(text: string): string {
+  let end = text.length;
+  while (end > 0 && text[end - 1] === "/") end--;
+  return text.slice(0, end);
+}
+
 /** `path` without a trailing separator (the root stays `/`). */
 function trim(path: string): string {
-  const trimmed = path.replace(/\/+$/, "");
+  const trimmed = stripSlashes(path);
   return trimmed === "" ? "/" : trimmed;
 }
 
-let cache: { at: number; dirs: string[] } | undefined;
+/**
+ * Whether `pattern` has a brace expansion: a `{...}` with no nested braces and a `,` or `..`
+ * inside. One pass, linear.
+ */
+function hasBrace(pattern: string): boolean {
+  let open = -1;
+  let separated = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "\\") i++;
+    else if (c === "{") {
+      open = i;
+      separated = false;
+    } else if (open >= 0 && (c === "," || (c === "." && pattern[i + 1] === "."))) separated = true;
+    else if (c === "}") {
+      if (open >= 0 && separated) return true;
+      open = -1;
+    }
+  }
+  return false;
+}
+
+let cache: { at: number; temp: string; dirs: string[] } | undefined;
 /**
  * The state directories: every `acp-<uid>-*` directory in each temp root, plus a sample one in the
  * temp directory the service uses, so a pattern that would match a later session's directory
  * counts too.
  */
 export function stateDirs(): string[] {
-  if (cache && Date.now() - cache.at < 2000) return cache.dirs;
+  if (cache && cache.temp === tmpdir() && Date.now() - cache.at < 2000) return cache.dirs;
   const uid = String(process.getuid?.() ?? "user");
   const dirs = new Set<string>();
   try {
@@ -45,7 +80,7 @@ export function stateDirs(): string[] {
       /* unreadable: the sample still counts */
     }
   }
-  cache = { at: Date.now(), dirs: [...dirs] };
+  cache = { at: Date.now(), temp: tmpdir(), dirs: [...dirs] };
   return cache.dirs;
 }
 
@@ -70,7 +105,7 @@ type Token =
  * Undefined for a brace expansion (`{a,b}`, `{1..3}`), which callers treat as matching.
  */
 function tokenize(pattern: string): Token[] | undefined {
-  if (/\{[^{}]*(?:,|\.\.)[^{}]*\}/.test(pattern)) return undefined;
+  if (pattern.length > MAX_TARGET || hasBrace(pattern)) return undefined;
   const out: Token[] = [];
   for (let i = 0; i < pattern.length; i++) {
     const c = pattern[i] as string;
@@ -157,10 +192,33 @@ function pathMatch(pattern: string, target: string, inside: boolean): boolean {
 /** A shell word's text with the temp variables filled in and any other expansion read as `*`. */
 export function stateText(text: string, literal: boolean): string {
   if (literal) return text;
+  if (text.length > MAX_TARGET) return "*";
   const temp = slashes(tmpdir());
-  return text
-    .replace(/\$\{(?:TMPDIR|TMP|TEMP)\}|\$(?:TMPDIR|TMP|TEMP)\b/g, temp)
-    .replace(/\$\{[^}]*\}|\$\([^)]*\)|`[^`]*`|\$[A-Za-z_]\w*|\$[0-9@*#?$!-]?/g, "*");
+  // One pass: `$NAME`, `${...}`, `$(...)` and backticks; the temp variables become the temp
+  // directory and anything else `*`. An unclosed one runs to the end.
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i] as string;
+    if (c === "`") {
+      const end = text.indexOf("`", i + 1);
+      out += "*";
+      i = end < 0 ? text.length : end;
+    } else if (c !== "$") out += c;
+    else if (text[i + 1] === "{" || text[i + 1] === "(") {
+      const close = text[i + 1] === "{" ? "}" : ")";
+      const end = text.indexOf(close, i + 2);
+      const name = end < 0 ? "" : text.slice(i + 2, end);
+      out += /^(?:TMPDIR|TMP|TEMP)$/.test(name) && close === "}" ? temp : "*";
+      i = end < 0 ? text.length : end;
+    } else {
+      let j = i + 1;
+      while (j < text.length && /\w/.test(text[j] as string)) j++;
+      const name = text.slice(i + 1, j);
+      out += /^(?:TMPDIR|TMP|TEMP)$/.test(name) ? temp : "*";
+      i = j > i + 1 ? j - 1 : i + (/[@*#?$!-]/.test(text[i + 1] ?? "") ? 1 : 0);
+    }
+  }
+  return out;
 }
 
 /**
@@ -170,6 +228,7 @@ export function stateText(text: string, literal: boolean): string {
  */
 export function namesState(text: string, cwds: Iterable<string>, removes: boolean): boolean {
   if (!text) return false;
+  if (text.length > MAX_TARGET) return true;
   const fold = (path: string) => (WINDOWS ? path.toLowerCase() : path);
   const dirs = stateDirs().map(fold);
   const above = removes ? stateAncestors().map(fold) : [];
@@ -260,7 +319,7 @@ export function findReachesState(args: string[], cwds: Iterable<string>): boolea
         const steps = rel.split("/").filter(Boolean);
         if (names.some(([pattern, fold]) => steps.some((step) => globMatch(pattern, step, fold))))
           return true;
-        const printed = `${rootText.replace(/\/+$/, "")}/${rel}`;
+        const printed = `${stripSlashes(rootText)}/${rel}`;
         if (paths.some(([pattern, fold]) => globMatch(pattern, printed, fold))) return true;
       }
     }
@@ -268,24 +327,39 @@ export function findReachesState(args: string[], cwds: Iterable<string>): boolea
   return false;
 }
 
+/** Longest inline code judged; longer code fails closed. */
+const MAX_CODE = 100_000;
+
 /**
- * Whether inline interpreter code could change the state: it names `acp`, a path that could name
- * the state (a temp directory, a glob in it), or the temp directory through the environment or
- * an API together with a call that deletes, moves or writes files.
+ * Whether inline interpreter code could change the state. It names `acp`; or it deletes, moves or
+ * writes files and either computes the temp directory at run time (an environment variable or an
+ * API: the result is the directory the state lies in), or names a path that could reach the state
+ * the way a shell target does: a state directory, a directory above one (the temp root itself), a
+ * glob matching one, or a path built at run time (`f'/tmp/{x}'`, `'/tmp/' + x`, `"$TMPDIR/$x"`,
+ * read as a glob). A literal path into another directory in temp (`/tmp/pm-x/notes.md`) is not.
  */
 export function codeTouchesState(code: string, cwds: Iterable<string>): boolean {
+  if (code.length > MAX_CODE) return true;
   if (/\bacp/i.test(code)) return true;
   const changes =
-    /unlink|remove|rmtree|rmdir|\brm\b|rmSync|rename|truncate|writeFile|open\s*\(|shutil|glob|system|exec|spawn|subprocess/i.test(
+    /unlink|remove|rmtree|rmdir|\brm\b|rmSync|rename|truncate|writeFile|open\s*\(|shutil|glob|listdir|walk|readdir|system|exec|spawn|subprocess/i.test(
       code,
     );
   if (!changes) return false;
+  // The temp directory computed at run time (case matters: `/tmp` in a path is not `TMP`).
   if (
-    /TMPDIR|\bTEMP\b|\bTMP\b|gettempdir|tmpdir\(|Dir\.tmpdir|sys_get_temp_dir|tempfile/i.test(code)
+    /\$\{?(?:TMPDIR|TMP|TEMP)\b|environ\b[^\n]{0,40}\b(?:TMPDIR|TMP|TEMP)\b|process\.env\.(?:TMPDIR|TMP|TEMP)\b|ENV\[\s*["'](?:TMPDIR|TMP|TEMP)|getenv\(\s*["'](?:TMPDIR|TMP|TEMP)|gettempdir|tempfile\.tempdir|os\.tmpdir|tmpdir\(\)|Dir\.tmpdir|sys_get_temp_dir|GetTempPath/.test(
+      code,
+    )
   )
     return true;
   const list = [...cwds];
-  for (const match of code.matchAll(/(?:~\/|\/)[\w.*?[\]-][^\s'"`,;)(]*/g))
-    if (namesState(match[0], list.length ? list : ["/"], true)) return true;
+  for (const match of code.matchAll(/(?:~\/|\/)[\w.*?[\]{}$%-][^\s'"`,;)(]*/g)) {
+    // Parts filled in at run time are any name: `{x}`, `%s`, `$x`; a path that ends where code
+    // goes on (`'/tmp/' + x`) keeps its trailing `/` and is read as the directory.
+    if (match[0].length > MAX_TARGET) return true;
+    const path = match[0].replace(/\{[^}/]*\}|%[sd]|\$\{?\w*\}?/g, "*");
+    if (namesState(path, list.length ? list : ["/"], true)) return true;
+  }
   return false;
 }

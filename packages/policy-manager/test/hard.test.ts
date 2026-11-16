@@ -4,10 +4,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { hookResponse } from "../src/adapters.js";
-import { hardRule, hardRules } from "../src/hard.js";
+import { hardRule, hardRules, scriptRules } from "../src/hard.js";
 import { evaluate } from "../src/policy.js";
 import { parseProfile, strictProfile } from "../src/profile.js";
-import { PolicySession } from "../src/session.js";
+import { PolicySession, TOO_LONG_REASON } from "../src/session.js";
 import type { Request } from "../src/types.js";
 
 // Hard human items: credentials, protected configuration, unrecoverable loss and humanPatterns.
@@ -966,5 +966,103 @@ describe("round 7: policy state is matched as the shell expands it", () => {
     "gh api repos/o/r/issues/1/comments -f body=$BODY",
   ])("floor: %s", (command) => {
     expect(rulesIn(command, worktree)).toContain("repo-delete");
+  });
+});
+
+describe("round 9: linear matching, Linux temp, archives and recursive changes", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  const rulesIn = (command: string, cwd = worktree) => hardRules(shell(command, cwd), base());
+  const limit = process.platform === "win32" ? 500 : 100;
+  test.each([
+    ["find with a 40,000-comma name", `find . -name '{{${",".repeat(40_000)}' -delete`],
+    ["find with a 100,000-comma name", `find . -name '{{${",".repeat(100_000)}' -delete`],
+    ["rm with a 40,000-comma word", `rm -rf {{${",".repeat(40_000)}`],
+    ["a 40,000-slash word", `rm -rf ${"/".repeat(40_000)}x`],
+    ["40,000 unclosed ${", `rm -rf ${"${".repeat(20_000)}`],
+    ["python code with 40,000 braces", `python3 -c "open('/tmp/${"{".repeat(40_000)}','w')"`],
+  ])("%s finishes fast", (_name, command) => {
+    const start = performance.now();
+    scriptRules(command, worktree);
+    expect(performance.now() - start).toBeLessThan(limit);
+  });
+  test("a command over 100,000 characters is asked at once", async () => {
+    const { s, runs } = session();
+    const d = await s.decide(shell(`echo ${"x".repeat(100_001)}`), "PreToolUse");
+    expect(d.decision).toBe("human");
+    expect(d.reason).toBe(TOO_LONG_REASON);
+    expect(runs()).toBe(0);
+  });
+
+  describe("with the temp directory at /tmp, as on Linux", () => {
+    const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+    beforeAll(() => {
+      process.env.TMPDIR = "/tmp";
+      process.env.TMP = "/tmp";
+      process.env.TEMP = "/tmp";
+    });
+    afterAll(() => {
+      for (const [key, value] of Object.entries(saved))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    });
+    test
+      .skipIf(process.platform === "win32")
+      .each([
+        `python3 -c "open('/tmp/pm-x/notes.md','w').write('x')"`,
+        `python3 -c "import shutil; shutil.copy('a', '/tmp/pm-x/b')"`,
+        `node -e "require('fs').writeFileSync('/tmp/pm-x/out.json', '{}')"`,
+        "rm -rf /tmp/pm-x",
+        "tar -xzf a.tgz -C /tmp/pm-x",
+      ])("not policy-state: %s", (command) => {
+      expect(rulesIn(command)).not.toContain("policy-state");
+    });
+    test
+      .skipIf(process.platform === "win32")
+      .each([
+        `python3 -c "import shutil; shutil.rmtree('/tmp')"`,
+        `python3 -c "import os; [os.remove('/tmp/' + f) for f in os.listdir('/tmp')]"`,
+        `python3 -c "import os; os.remove(f'/tmp/{name}/token')"`,
+        `python3 -c "import os; os.remove(os.environ['TMPDIR'] + '/x')"`,
+        `python3 -c "import glob, os; [os.remove(p) for p in glob.glob('/tmp/*/audit.jsonl')]"`,
+        `perl -e 'unlink glob("/tmp/*/token")'`,
+        "rm -rf /tmp/*",
+        "rm -rf /tmp",
+        "tar -xzf a.tgz -C /tmp",
+        "unzip a.zip -d /tmp",
+        "chmod -R 777 /tmp",
+      ])("policy-state: %s", (command) => {
+      expect(rulesIn(command)).toContain("policy-state");
+    });
+  });
+
+  const temp = realpathSync(tmpdir()).replace(/\\/g, "/");
+  test.each([
+    `chmod -R 777 ${temp}`,
+    `chown -R nobody ${temp}`,
+    `tar -xf a.tar -C ${temp}`,
+    `tar --extract -f a.tar --directory=${temp}`,
+    `unzip a.zip -d ${temp}`,
+  ])("policy-state: %s", (command) => {
+    expect(rulesIn(command)).toContain("policy-state");
+  });
+  test.each([
+    `chmod 644 ${temp}/pm-x`,
+    "tar -xf a.tar -C src",
+    "unzip a.zip -d vendor",
+    "tar -czf x.tgz src",
+  ])("not policy-state: %s", (command) => {
+    expect(rulesIn(command)).not.toContain("policy-state");
+  });
+  test.each([
+    "awk 'BEGIN{system(\"rm -rf x\")}' f",
+    "awk '{print > \"out\"}' f",
+    "awk '{print | \"sh\"}' f",
+  ])("awk that runs or writes is not a plain read: %s", (command) => {
+    expect(evaluate(shell(`${command} && ls`), undefined, strictProfile).decision).not.toBe(
+      "approve",
+    );
   });
 });

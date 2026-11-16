@@ -812,7 +812,42 @@ function analyzeCommand(
   const programName = cmd.program?.text.split(/[\\/]/).pop() ?? "";
   const reading =
     !!cmd.program?.literal && readOnly([programName, ...cmd.args.map((word) => word.text)]);
-  const removes = !cmd.program?.literal || REMOVERS.has(programName);
+  const argTexts = cmd.args.map((word) => word.text);
+  // A recursive permission or owner change reaches everything below its operand, so a directory
+  // above the state counts as for a delete.
+  const recursive =
+    /^(?:chmod|chown|chgrp)$/.test(programName) &&
+    argTexts.some((text) => /^-[a-zA-Z]*R|^--recursive$/.test(text));
+  const removes = !cmd.program?.literal || REMOVERS.has(programName) || recursive;
+  // An archive extracted into a directory the state lies in can overwrite it: `tar -x [-C dir]`,
+  // `unzip [-d dir]`, `cpio -i` (into the working directory).
+  if (cmd.program?.literal) {
+    const optionValue = (flags: RegExp) => {
+      const at = argTexts.findIndex((text) => flags.test(text));
+      if (at < 0) return undefined;
+      const text = argTexts[at] as string;
+      const eq = text.indexOf("=");
+      return eq > 0 ? text.slice(eq + 1) : (argTexts[at + 1] ?? "");
+    };
+    let into: string | undefined;
+    if (
+      programName === "tar" &&
+      argTexts.some(
+        (text, k) =>
+          ((k === 0 || text.startsWith("-")) && /^-?[a-zA-Z]*x[a-zA-Z]*$/.test(text)) ||
+          /^--(?:extract|get)$/.test(text),
+      )
+    )
+      into = optionValue(/^(?:-C|--directory)(?:=|$)/) ?? ".";
+    else if (programName === "unzip") into = optionValue(/^-d$/) ?? ".";
+    else if (
+      programName === "cpio" &&
+      argTexts.some((text) => /^-[a-zA-Z]*i|^--extract$/.test(text))
+    )
+      into = optionValue(/^(?:-D|--directory)(?:=|$)/) ?? ".";
+    if (into !== undefined && namesState(stateText(into, true), context.cwds, true))
+      rules.add("policy-state");
+  }
   // `xargs <writer>` takes its targets from input nobody can read here; it fails closed when it
   // could reach the state: it runs where the state lies, or the script names `acp` or a path that
   // could name the state.

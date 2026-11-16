@@ -44,6 +44,9 @@ const NO_ALLOW = new Set([
   "policy-state",
   "force-push",
 ]);
+/** Longest shell command checked at all; a longer one is asked at once, with no parsing. */
+export const MAX_HOOK_COMMAND = 100_000;
+export const TOO_LONG_REASON = "Command is too long to check";
 /** How long after a human decision the user may still approve that exact request once. */
 export const GRANT_WINDOW_MS = 15 * 60_000;
 /** How long a harness prompt may stay open and still have its answer remembered. */
@@ -577,6 +580,14 @@ export class PolicySession {
     /** The harness's permission mode (Claude Code's `permission_mode`), when it reports one. */
     permissionMode?: string,
   ): Promise<Decision> {
+    // A command too long to check is asked at once, before any parsing.
+    const command = request.input.command ?? request.input.cmd;
+    if (typeof command === "string" && command.length > MAX_HOOK_COMMAND)
+      return this.conclude(request, {
+        ...result(request, "unknown", TOO_LONG_REASON),
+        needsClassification: false,
+        fallbackReason: "too-long",
+      });
     let decision = this.judge(request, undefined, phase);
     const native =
       decision.decision === "approve" || decision.decision === "human"
