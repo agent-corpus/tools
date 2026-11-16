@@ -253,10 +253,18 @@ const PUBLISHERS: Record<string, RegExp> = {
   podman: /^push$/,
 };
 const GH_DELETE: Record<string, RegExp> = {
-  repo: /^(?:delete|archive|rename|edit)$/,
-  release: /^(?:delete|delete-asset)$/,
+  repo: /^(?:create|fork|delete|archive|unarchive|rename|edit)$/,
+  release: /^(?:create|edit|upload|delete|delete-asset)$/,
   secret: /^(?:delete|remove|set)$/,
   variable: /^(?:delete|set)$/,
+  gist: /^(?:create|new|edit|delete)$/,
+  // What gh itself runs and with which credentials: extensions, aliases, settings and auth.
+  extension: /^(?:install|upgrade)$/,
+  extensions: /^(?:install|upgrade)$/,
+  ext: /^(?:install|upgrade)$/,
+  alias: /^(?:set|import)$/,
+  config: /^set$/,
+  auth: /^(?:refresh|login|logout|setup-git|token)$/,
   // Merging and workflow or deploy triggers cannot be taken back. (`gh ruleset` only reads.)
   pr: /^merge$/,
   workflow: /^(?:run|enable|disable)$/,
@@ -378,7 +386,11 @@ function ghApiFloor(texts: string[]): boolean {
   // A call with no method and no fields is a GET, whatever the endpoint; a write to an endpoint
   // that cannot be read is a floor item.
   if (endpoint === undefined) return true;
-  if (/\$/.test(endpoint)) return !["GET", "HEAD"].includes(effective);
+  if (/\$/.test(endpoint))
+    return (
+      !["GET", "HEAD"].includes(effective) &&
+      !(effective === "POST" && fields && variableReply(endpoint))
+    );
   if (endpoint === "graphql") {
     // A query read from a file cannot be judged; one without a mutation reads.
     if (values.some((value) => value === "@" || /^query=@/.test(value))) return true;
@@ -398,6 +410,27 @@ function ghApiFloor(texts: string[]): boolean {
   // Editing a pull request is recoverable; closing, reopening or merging state is not its job here.
   if (/^pulls\/\d+$/.test(path) && values.some((value) => /^state=/.test(value))) return true;
   return false;
+}
+
+/** A comment POST shape whose only numeric ids may come from a variable. */
+const GH_VARIABLE_REPLY =
+  /^(?:issues\/#\/comments|pulls\/#\/comments(?:\/#\/replies)?|pulls\/comments\/#\/replies)$/;
+/**
+ * Whether a POST to an endpoint with a variable is a comment or reply whose only variable parts
+ * are numeric-id segments (`$id`, `${id}`, `$1`): `reply(){ gh api repos/o/r/pulls/7/comments/$1/
+ * replies -f body="$2"; }`. Owner and repository must be literal. The caller has made sure it is a
+ * POST, a write that goes to the classifier rather than the floor.
+ */
+function variableReply(endpoint: string): boolean {
+  const match = /^\/?repos\/([^/$]+)\/([^/$]+)\/([^?#]*?)\/?$/.exec(endpoint);
+  if (!match) return false;
+  const segments = (match[3] as string).split("/").map((segment) => {
+    if (/^\d+$/.test(segment) || /^\$(?:\w+|\{\w+\})$/.test(segment)) return "#";
+    return segment;
+  });
+  return (
+    !segments.some((segment) => segment.includes("$")) && GH_VARIABLE_REPLY.test(segments.join("/"))
+  );
 }
 
 /** The floor rules for one literal program. */

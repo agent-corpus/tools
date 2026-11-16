@@ -125,12 +125,30 @@ const TRACKED_SECRET =
 const SECRET_NAME =
   /^(?:\.?credentials?(?:\..*)?|auth\.json|\.claude\.json|settings(?:\.local)?\.json|config\.toml|config\.json|hooks\.json|permissions-config\.json|policy\.json|\.netrc|.*\.(?:sqlite3?|db|keychain(?:-db)?))$/i;
 
+/**
+ * The policy service's audit logs (`acp-*\/audit.jsonl`, rotated `audit.N.jsonl`) and its session
+ * directory itself, which a read may name: they hold decisions, not secrets. Its token and socket
+ * stay secret. A glob may appear only in the `acp-*` segment.
+ */
+const AUDIT_LOG = /(?:^|\/)acp-[^/]*(?:\/audit(?:\.\d+)?\.jsonl)?\/?$/i;
+export function auditLog(path: string): boolean {
+  const slashed = path.replace(/\\/g, "/");
+  if (!AUDIT_LOG.test(slashed)) return false;
+  const outside = slashed.replace(/(?:^|\/)acp-[^/]*(?=\/|$)/, "/acp");
+  return !/[*?[\]{}]/.test(outside);
+}
+
+/** Whether any word the shell may expand into file names is not an audit-log pattern. */
+export function unsafeGlob(argv: readonly string[], glob: readonly boolean[] | undefined): boolean {
+  return (glob ?? []).some((expands, i) => expands && !auditLog(argv[i] ?? ""));
+}
+
 /** Whether a path, as written or resolved, is a credential or secret-bearing file. */
 export function secretPath(path: string): boolean {
   const slashed = path.replace(/\\/g, "/");
   return (
     sensitive(slashed) ||
-    policyState(slashed) ||
+    (policyState(slashed) && !auditLog(slashed)) ||
     slashed === defaultProfilePath().replace(/\\/g, "/") ||
     slashed.split("/").some((part) => SECRET_NAME.test(part))
   );
@@ -385,7 +403,7 @@ export function plainRead(request: Request, roots: readonly string[] = []): bool
       const program = cmd.argv[0] ?? "";
       const gitGrep = program === "git" && cmd.argv[1] === "grep";
       // `git grep` pathspecs (`'**/*.md'`, `':(glob)src/**'`) are Git's, not files to expand.
-      if (cmd.loose?.some(Boolean) || (!gitGrep && cmd.glob?.some(Boolean))) return false;
+      if (cmd.loose?.some(Boolean) || (!gitGrep && unsafeGlob(cmd.argv, cmd.glob))) return false;
       if (program === "cd" && pipeline.length === 1) {
         const target = cmd.argv[1];
         if (cmd.argv.length !== 2 || !target || target.startsWith("-") || cmd.redirects.length)

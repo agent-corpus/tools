@@ -19,7 +19,7 @@ const WRITE_TOOLS = new Set([
 import { onRemote } from "./merged.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
-import { enterable, plainRead, readOnly } from "./reads.js";
+import { enterable, plainRead, readOnly, unsafeGlob } from "./reads.js";
 import { redactText } from "./redact.js";
 import { parseShell } from "./shell.js";
 import { defaultAllowed } from "./tools.js";
@@ -289,7 +289,7 @@ function chainApproved(request: Request, profile: Profile): boolean {
     const last = index === pipelines.length - 1;
     for (const cmd of pipeline) {
       if (cmd.env.length || cmd.subs.length || cmd.stdin !== undefined) return false;
-      if (cmd.loose?.some(Boolean) || cmd.glob?.some(Boolean)) return false;
+      if (cmd.loose?.some(Boolean) || unsafeGlob(cmd.argv, cmd.glob)) return false;
     }
     if (pipeline.length > 1 && !pipeline.every((cmd) => readOnly(cmd.argv))) return false;
     const [cmd] = pipeline;
