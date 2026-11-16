@@ -5,5 +5,6 @@ export default defineConfig({
   test: {
     setupFiles: ["./test/isolation.ts"],
     testTimeout: process.platform === "win32" ? 30_000 : 5_000,
+    hookTimeout: process.platform === "win32" ? 60_000 : 10_000,
   },
 });
