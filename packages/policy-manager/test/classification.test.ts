@@ -11,7 +11,7 @@ import { parseProfile } from "../src/profile.js";
 import { redactText } from "../src/redact.js";
 import { replayTranscripts } from "../src/replay.js";
 import { formatReview, reviewClassifications } from "../src/review.js";
-import { MAX_AI_APPROVALS, PolicySession } from "../src/session.js";
+import { PolicySession } from "../src/session.js";
 import type { Classification, Request } from "../src/types.js";
 
 const permissive = parseProfile(
@@ -139,22 +139,13 @@ describe("classification inside the hook", () => {
     expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
   });
 
-  test("a session cap on AI approvals sends the rest to a human", () => {
+  test("there is no session cap on AI approvals (the old cap was 50)", { timeout: 30000 }, () => {
     const { session: s } = session();
-    let last = s.review(ambiguous(), undefined);
-    let limited = ambiguous();
-    for (let i = 0; i <= MAX_AI_APPROVALS; i++) {
+    for (let i = 0; i < 55; i++) {
       const r = ambiguous();
-      limited = r;
       s.review(r, undefined, "PreToolUse");
-      last = s.classify(verdict(r));
+      expect(s.classify(verdict(r)).decision).toBe("approve");
     }
-    expect(last.decision).toBe("human");
-    expect(last.fallbackReason).toBe("limit");
-    // The limit is part of the remembered outcome: the retry must not run without a person.
-    const retried = s.review(limited, undefined, "PreToolUse");
-    expect(retried.decision).toBe("human");
-    expect(retried.fallbackReason).toBe("limit");
   });
 
   test("a verdict is final: a refusal cannot be reclassified, and an approval cannot be replaced", () => {

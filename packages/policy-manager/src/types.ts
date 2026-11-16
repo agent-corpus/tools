@@ -48,7 +48,6 @@ export interface Decision {
   fallbackReason?:
     | "unavailable"
     | "invalid-result"
-    | "limit"
     | "disabled"
     | "too-long"
     | "missing"

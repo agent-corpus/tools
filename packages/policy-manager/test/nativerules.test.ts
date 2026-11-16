@@ -320,12 +320,12 @@ describe("the native rules layer in the session", () => {
     return { s, directory, runs: () => runs };
   }
 
-  test("Claude: an allow rule is the person's answer, after the classifier said no", async () => {
+  test("Claude: an allow rule is the person's answer, checked before the classifier", async () => {
     claudeSettings({ allow: ["Bash(rm -rf /opt/*)"] });
     const { s, directory, runs } = session("claude");
     const d = await s.decide(bash("rm -rf /opt/frob"), "PreToolUse");
     expect(d).toMatchObject({ decision: "approve", userAllowRule: "Bash(rm -rf /opt/*)" });
-    expect(runs()).toBe(1);
+    expect(runs()).toBe(0);
     const records = (await new AuditLog(directory).query({ limit: 100 })).records;
     expect(records.find((r) => r.eventName === "decision")?.attributes.userAllowRule).toBe(
       "Bash(rm -rf /opt/*)",
@@ -342,12 +342,38 @@ describe("the native rules layer in the session", () => {
     expect(runs()).toBe(0);
   });
 
-  test("an allow rule also answers for a hard item, but never for an agent approving itself", async () => {
-    claudeSettings({ allow: ["Bash(git push *)", "Bash(policy-manager *)"] });
+  test("an allow rule answers for a hard item, except a force push and an agent approving itself", async () => {
+    claudeSettings({
+      allow: [
+        "Bash(git push *)",
+        "Bash(git push --force *)",
+        "Bash(git:*)",
+        "Bash(policy-manager *)",
+        "Bash(cat *)",
+        "Bash(git clean *)",
+      ],
+    });
     const { s, runs } = session("claude");
-    expect((await s.decide(bash("git push --force origin x"), "PreToolUse")).decision).toBe(
-      "approve",
-    );
+    // Hard items an allow rule may answer for.
+    expect((await s.decide(bash("cat ~/.aws/credentials"), "PreToolUse")).decision).toBe("approve");
+    expect((await s.decide(bash("git clean -fd"), "PreToolUse")).decision).toBe("approve");
+    // A force push, however it is written, is always asked; the harness prompts.
+    for (const command of [
+      "git push --force origin x",
+      "git push -f origin x",
+      "git push -uf origin x",
+      "git push --force-with-lease origin x",
+      "git push --force-if-includes origin x",
+      "git push origin +x",
+      "git push origin +refs/heads/x:refs/heads/x",
+      "git push --mirror origin",
+      "git push --for origin x",
+    ]) {
+      const d = await s.decide(bash(command), "PreToolUse");
+      expect(d.decision, command).toBe("human");
+      expect(JSON.stringify(hookResponse("claude", "PreToolUse", d)), command).toContain('"ask"');
+    }
+    expect((await s.decide(bash("git push origin x"), "PreToolUse")).decision).toBe("approve");
     expect((await s.decide(bash("policy-manager approve --last"), "PreToolUse")).decision).toBe(
       "human",
     );

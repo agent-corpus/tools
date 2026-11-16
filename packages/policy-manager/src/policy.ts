@@ -5,6 +5,7 @@ import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence
 import { hardRule } from "./hard.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
+import { plainRead } from "./reads.js";
 import { redactText } from "./redact.js";
 import { defaultAllowed } from "./tools.js";
 import {
@@ -193,6 +194,8 @@ export function result(
 }
 /** Self-reported confidence needed for the AI to approve an ambiguous request. */
 export const AMBIGUOUS_CONFIDENCE = 0.95;
+/** The reason a plain read of non-secret files is approved, protected configuration included. */
+export const PLAIN_READ = "Plain read of non-secret files";
 /**
  * Escalations the classifier is never asked about because the request itself cannot be judged
  * from what it is shown: an incomplete or malformed request, a working directory other than the
@@ -253,7 +256,15 @@ export function evaluate(
   ai?: Classification,
   profile: Profile = strictProfile,
 ): Decision {
-  const decision = markAmbiguous(request, evaluateCore(request, profile));
+  const core = evaluateCore(request, profile);
+  // A plain read of non-secret files, protected configuration included, changes nothing.
+  if (
+    core.decision === "human" &&
+    !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
+    plainRead(request)
+  )
+    return result(request, "code-read", PLAIN_READ, true);
+  const decision = markAmbiguous(request, core);
   // A hard human item is a person's: no classification, however confident, approves it.
   if (decision.hard) return decision;
   if (ai) {

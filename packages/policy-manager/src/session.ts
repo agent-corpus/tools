@@ -13,7 +13,7 @@ import {
   withCreated,
 } from "./created.js";
 import { grantScope, scopeLabel } from "./grants.js";
-import { APPROVE_GUARD } from "./hard.js";
+import { APPROVE_GUARD, hardRules } from "./hard.js";
 import { type NativeMatch, nativeRules } from "./nativerules.js";
 import { evaluate, hash, requestHash as requestHashOf, result, SHELL_TOOLS } from "./policy.js";
 import { type Profile, strictProfile } from "./profile.js";
@@ -29,8 +29,6 @@ import {
 
 /** How long a classification verdict for one exact request is remembered: the session. */
 const CLASSIFICATION_TTL_MS = 24 * 60 * 60_000;
-/** AI approvals per session; beyond this, ambiguous requests go to a human. */
-export const MAX_AI_APPROVALS = 50;
 /** How long after its approval an execution report may still record the files a tool created. */
 const CREATION_REPORT_MS = 15 * 60_000;
 
@@ -63,8 +61,6 @@ interface ClassificationState {
   /** The classifier failed for this request; a person decides it without another run. */
   fallback: boolean;
   fallbackReason?: Decision["fallbackReason"];
-  /** The session cap on AI approvals was reached when this request was classified. */
-  limited: boolean;
   ai?: Classification;
 }
 
@@ -110,8 +106,6 @@ export class PolicySession {
   private cache = new Map<string, { expires: number; ai?: Classification }>();
   private pending = new Map<string, Request>();
   private states = new Map<string, ClassificationState>();
-  /** Requests the AI approved, counted once each however often they are retried. */
-  private approvedByAi = new Set<string>();
   /** Files this session created, and the paths each approved request may create. */
   private created: CreatedFiles = new Map();
   private creating = new Map<string, { targets: Target[]; approvedAt: number }>();
@@ -309,7 +303,6 @@ export class PolicySession {
     this.states.set(requestHash, {
       invalid: false,
       fallback: false,
-      limited: false,
       ...this.states.get(requestHash),
       ...change,
       expires: Date.now() + CLASSIFICATION_TTL_MS,
@@ -370,37 +363,16 @@ export class PolicySession {
       withCreated(this.created, () => evaluate(request, ai ?? cachedAi ?? known?.ai, this.profile));
     if (decision.tier === "ambiguous") {
       if (ai && !decision.classification) this.remember(requestHash, { invalid: true });
-      else if (ai) {
-        // The cap is checked when the approval is first given and stored with the outcome, so a
-        // retry cannot turn a limited request into an approval.
-        if (
-          decision.classification === "approved" &&
-          !this.approvedByAi.has(requestHash) &&
-          this.approvedByAi.size >= MAX_AI_APPROVALS
-        ) {
-          decision = {
-            ...decision,
-            decision: "human",
-            classification: "fallback",
-            fallbackReason: "limit",
-            reason: "Session limit on AI approvals reached; a human decides",
-          };
-          this.remember(requestHash, { limited: true });
-        } else {
-          if (decision.classification === "approved") this.approvedByAi.add(requestHash);
-          this.remember(requestHash, { ai });
-        }
-      } else if (known?.limited || known?.fallback || known?.invalid) {
+      else if (ai) this.remember(requestHash, { ai });
+      else if (known?.fallback || known?.invalid) {
         // Classified before without an answer that counts: a person decides, without a new run.
         decision = {
           ...decision,
           needsClassification: false,
           classification: "fallback",
-          fallbackReason: known.limited
-            ? "limit"
-            : known.invalid
-              ? "invalid-result"
-              : (known.fallbackReason ?? "unavailable"),
+          fallbackReason: known.invalid
+            ? "invalid-result"
+            : (known.fallbackReason ?? "unavailable"),
         };
       }
     }
@@ -605,6 +577,33 @@ export class PolicySession {
         userRule: native.rule,
         reason: `The user's own ${native.verdict} rule applies`,
       });
+    // An allow rule is the person's answer, checked before the classifier so an allowed command
+    // never waits on a run. Never for the built-in guards on the policy manager's own approvals,
+    // and never for a force push: the one place this is stricter than the user's allow rule.
+    const guarded =
+      decision.reason === APPROVE_GUARD ||
+      decision.hard === "self-approve" ||
+      decision.hard === "foreign-classification-record";
+    if (decision.decision === "human" && native?.verdict === "allow" && !guarded) {
+      if (hardRules(request, decision).includes("force-push")) {
+        audit(this.directory, {
+          event: "user-rule-overridden",
+          requestHash: decision.requestHash,
+          rule: "force-push",
+        });
+      } else {
+        audit(this.directory, {
+          event: "human-response",
+          requestHash: decision.requestHash,
+          response: "approved",
+          summary: "Allowed by the user's own permission rule",
+        });
+        return this.conclude(request, {
+          ...result(request, decision.category, "Allowed by the user's own permission rule", true),
+          userAllowRule: native.rule,
+        });
+      }
+    }
     if (decision.decision === "human" && decision.needsClassification && !decision.ai) {
       this.noteRequested(request, decision);
       const outcome = await this.runClassifier(request, decision);
@@ -629,23 +628,6 @@ export class PolicySession {
           fallbackReason: outcome.reason,
         };
       }
-    }
-    // The built-in guards on the policy manager's own approvals are never a rule's to allow.
-    const guarded =
-      decision.reason === APPROVE_GUARD ||
-      decision.hard === "self-approve" ||
-      decision.hard === "foreign-classification-record";
-    if (decision.decision === "human" && native?.verdict === "allow" && !guarded) {
-      audit(this.directory, {
-        event: "human-response",
-        requestHash: decision.requestHash,
-        response: "approved",
-        summary: "Allowed by the user's own permission rule",
-      });
-      decision = {
-        ...result(request, decision.category, "Allowed by the user's own permission rule", true),
-        userAllowRule: native.rule,
-      };
     }
     decision = this.conclude(request, decision);
     if (decision.decision === "human" && phase === "PreToolUse")

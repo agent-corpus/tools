@@ -86,9 +86,9 @@ Categories are `code-read`, `worktree-write`, `temp-write` (a recoverable write 
 
 1. **The deterministic engine** approves what it can prove safe (see **Policy** and **Policy profiles**). Unchanged.
 2. **The AI classifier, in the hook.** Anything else the engine escalates is classified synchronously, inside the hook, by the harness's own CLI (below). The request is approved when the answer is `recoverable` with `confidence >= 0.95` and a category other than `sensitive` or `unknown`. Hard human items skip this step.
-3. **The person.** Otherwise the person is asked and the harness waits. Before asking, the user's own harness permission rules are applied (below). Claude Code and Copilot ask in their own prompt; a "yes" is remembered for the rest of the session with the same scope as `approve --session`, so the same kind of request is not asked again. Codex cannot ask: it gets a deny with `pm approve --last` and stops (see **Approving from the terminal**).
+3. **The person.** Otherwise the person is asked and the harness waits. Claude Code and Copilot ask in their own prompt; a "yes" is remembered for the rest of the session with the same scope as `approve --session`, so the same kind of request is not asked again. Codex cannot ask: it gets a deny with `pm approve --last` and stops (see **Approving from the terminal**).
 
-The user's own deny or ask rules beat every approval here: when one matches, the hook makes no decision and the harness applies the rule. An allow rule counts as the person's answer.
+The user's own harness permission rules (below) are checked right after the engine, before the classifier, so an allowed command never waits on a classifier run. A deny or ask rule beats every approval here: when one matches, the hook makes no decision and the harness applies the rule. An allow rule counts as the person's answer and approves, hard human items included, with one exception: no allow rule approves a force push (`-f`, `--force`, `--force-with-lease`, `--force-if-includes`, `--mirror`, a `+` refspec, combined short flags such as `-uf`), however the rule is written, even `Bash(git push --force *)`. That is the one place the policy manager is stricter than the user's allow rule: the person is asked (under Codex, a deny with `pm approve --last`).
 
 ### Hard human items
 
@@ -100,13 +100,15 @@ These go straight to step 3. They are never sent to the classifier, and no class
 - commands matching the profile's `humanPatterns`;
 - an agent running `approve` itself, or a classification record for another session.
 
+Plain reads are not hard items, protected configuration included. `cat`, `ls`, `grep`, `rg`, `head`, `tail`, `find` (without `-exec`, `-delete` or `-fprint`) and `git grep`, alone, joined by `&&`, `||`, `;` or piped into one another, with an optional `cd <dir>`, and the Read tool, are approved under `.claude`, `.codex`, `.agent-config`, `.github`, `AGENTS.md` and `CLAUDE.md` as anywhere in a checkout. The read must be tight: no command substitution, variables, assignments, globs, here-documents, or redirections other than `2>/dev/null`, `2>&1` and `<` from a file, and no `rg --pre` or `git grep -O`. Every named path must be in a checkout or a protected directory, and none may be a secret: credential files (`.env`, keys, `.git`, `credentials`, `auth.json`), harness settings that can hold tokens (`settings*.json`, `.claude.json`, `config.toml`, `config.json`, `hooks.json`, `permissions-config.json`) or the policy profile. Those still go to the person. Claude Code's Glob and Grep tools are not routed to the hooks at all.
+
 The check reads the command the way the shell runs it: quotes and backslashes removed, `eval`, `sh -c` and `$(…)` bodies read as commands, wrappers (`env`, `sudo`, `timeout`, `xargs`, …) skipped, `cd` targets followed for relative paths, and Git aliases resolved with a read-only `git config --get alias.<name>`. It is unioned with a plain-text reading of the command, so a script piped into a shell, `bash <(…)`, `find -exec` or inline interpreter code still counts. A false match asks rather than approves. Requests the classifier cannot judge from what it is shown (an incomplete request, another working directory, an unreadable patch, a custom environment) also go to a person.
 
 ### The classifier
 
 | Harness     | Command (no shell, from a private empty directory)                                                                                                                                                                                                                                                                                 | Timeout |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| Claude Code | `claude -p --model <model> --tools "" --setting-sources "" --settings '{"disableAllHooks":true,"autoMemoryEnabled":false}' --no-session-persistence --strict-mcp-config --disable-slash-commands --permission-mode dontAsk --max-turns 2 --output-format json --json-schema <schema> <prompt>`; the answer is `.structured_output` | 15 s    |
+| Claude Code | `claude -p --model <model> --tools "" --setting-sources "" --settings '{"disableAllHooks":true,"autoMemoryEnabled":false}' --no-session-persistence --strict-mcp-config --disable-slash-commands --permission-mode dontAsk --max-turns 5 --output-format json --json-schema <schema> <prompt>`; the answer is `.structured_output` | 15 s    |
 | Codex       | `codex exec --ephemeral --ignore-user-config --ignore-rules --disable hooks --skip-git-repo-check -s read-only -c approval_policy="never" -c model_reasoning_effort="low" -m <model> -C <empty dir> --output-schema <schema.json> -o <out.json> <prompt>`, standard input closed                                                   | 15 s    |
 | Copilot     | `copilot -p <prompt> --model <model> --available-tools "" --no-custom-instructions --disable-builtin-mcps --no-ask-user --no-auto-update --disable-client-telemetry --output-format json`, with `COPILOT_HOME` set to a private scratch directory whose `settings.json` is `{"disableAllHooks":true}`                              | 20 s    |
 
@@ -114,7 +116,7 @@ Copilot still authenticates in that scratch home: its stored login lives in the 
 
 The prompt gives the command (at most 6000 characters; a longer one goes to the person), the working directory, Git facts (repository root, branch, default branch, main checkout or linked worktree), each path the command names with whether it is in the linked feature worktree, the main checkout, the temp directory or a session scratch directory, and whether this session created it, and the engine's reason. Deleting scratch files, screenshots, temp directories or files the session created is approvable.
 
-Verdicts are cached for the session by request hash, and concurrent hooks for one request share one run. Any failure (the CLI is not installed or not logged in, a nonzero exit, a timeout, output that is not JSON or not the schema) asks the person; it never approves. A missing CLI is not tried again in that session. After 50 AI approvals in a session, further requests go to the person.
+Verdicts are cached for the session by request hash, and concurrent hooks for one request share one run. Any failure (the CLI is not installed or not logged in, a nonzero exit, a timeout, output that is not JSON or not the schema) asks the person; it never approves. A missing CLI is not tried again in that session. There is no limit on AI approvals per session. `--max-turns` is 5 because the schema answer is itself a tool call: at 2, a model that first reached for a tool it does not have sometimes stopped at the turn limit.
 
 Configure it in the profile:
 
@@ -136,13 +138,13 @@ Each harness uses its own CLI; the models above are the defaults. `"enabled": fa
 
 ### The user's own permission rules
 
-Read, never written, before asking:
+Read, never written, right after the engine:
 
 - **Claude Code** ([permissions](https://code.claude.com/docs/en/permissions)): `permissions.allow`, `ask` and `deny` in `settings.json` under `CLAUDE_CONFIG_DIR` (default `~/.claude`) and the project's `.claude/settings.json` and `.claude/settings.local.json`. Deny, then ask, then allow; the first match decides. `Bash(cmd)` is exact, `Bash(cmd *)` and `Bash(cmd:*)` are prefixes, and `*` matches any text. A compound command (`&&`, `||`, `;`, `|`, `|&`, `&`, newlines) is allowed only when every subcommand is; deny and ask rules match any subcommand, including `$(…)` bodies. `timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`, `builtin`, `noglob` and bare `xargs` are stripped; `watch`, `setsid`, `ionice`, `flock` and `find -exec`/`-delete` are never allowed by a rule. `Read(...)` and `Edit(...)` path rules use the documented `//`, `~/`, `/` and relative forms, and `Edit` rules cover `Write`.
 - **Codex** ([rules](https://developers.openai.com/codex/rules), [configuration](https://developers.openai.com/codex/config-reference)): `prefix_rule(pattern=[...], decision="allow"|"prompt"|"forbidden")` in `*.rules` under `CODEX_HOME/rules` (default `~/.codex/rules`), and in the project's `.codex/rules` when `config.toml` marks the project trusted. A linear chain of plain commands is checked per command and the strictest decision wins; anything else is one `bash -lc` invocation. Codex documents no other command allowlist in `config.toml`.
 - **Copilot** ([allowing tools](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools)): none. Its allow and deny lists are the `--allow-tool` and `--deny-tool` flags, which apply to one session and are not saved; the format of saved per-location approvals is not documented, and trusted folders gate file access, not commands.
 
-An allow rule approves, audited with `userAllowRule`. It never approves an agent running `approve` itself.
+An allow rule approves, audited with `userAllowRule`. It never approves a force push or an agent running `approve` itself.
 
 ### Remembering an answer
 

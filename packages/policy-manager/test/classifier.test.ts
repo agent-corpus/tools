@@ -104,7 +104,7 @@ describe("each CLI is run as specified", () => {
       autoMemoryEnabled: false,
     });
     expect(at("--permission-mode")).toBe("dontAsk");
-    expect(at("--max-turns")).toBe("2");
+    expect(at("--max-turns")).toBe("5");
     expect(at("--output-format")).toBe("json");
     expect(JSON.parse(at("--json-schema") ?? "").required).toEqual([
       "category",

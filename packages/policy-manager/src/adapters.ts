@@ -154,7 +154,6 @@ const FALLBACK_TEXT: Partial<Record<NonNullable<Decision["fallbackReason"]>, str
   timeout: "the classifier timed out",
   "bad-json": "the classifier's answer was not JSON",
   schema: "the classifier's answer did not match the schema",
-  limit: "this session reached its limit on AI approvals",
 };
 
 /** Why the classifier did not settle a request, or undefined. */

@@ -235,8 +235,10 @@ function invocation(
         "--disable-slash-commands",
         "--permission-mode",
         "dontAsk",
+        // The schema answer is itself a tool call; a model that first reaches for a tool it does
+        // not have needs a few turns to return it (at 2, some runs stopped at the turn limit).
         "--max-turns",
-        "2",
+        "5",
         "--output-format",
         "json",
         "--json-schema",
