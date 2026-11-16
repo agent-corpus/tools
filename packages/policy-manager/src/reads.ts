@@ -1,13 +1,14 @@
 import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join, relative } from "node:path";
 import {
   canonical,
   git,
   inside,
   policyState,
-  protectedPath,
   resolveWord,
   sensitive,
+  tempRoots,
 } from "./evidence.js";
 import { wildcard } from "./nativerules.js";
 import { defaultProfilePath } from "./profile.js";
@@ -15,16 +16,17 @@ import { parseShell } from "./shell.js";
 import type { Request } from "./types.js";
 
 /**
- * Plain reads are approved under protected paths (`.claude`, `.codex`, `.agent-config`, `.github`,
- * `AGENTS.md`, `CLAUDE.md`, ...) as anywhere else in a checkout: reading configuration changes
- * nothing. Writes, and reads of credential and secret files, still go to a person.
+ * Plain reads are approved under a checkout's protected paths (`.claude`, `.codex`,
+ * `.agent-config`, `.github`, `AGENTS.md`, `CLAUDE.md`, ...) as anywhere else in it: reading
+ * configuration changes nothing. Writes, and reads of credential and secret files, still go to a
+ * person.
  *
  * A plain read is tight on purpose: one of a few reading programs (or the Read tool), joined only by
  * `&&`, `||`, `;` and pipes into another reading program, with an optional `cd <dir>`; no command
  * substitution, variables, assignments, here-documents or redirections other than `2>/dev/null`,
  * `2>&1` and `<` from a file. Options are allow-listed per program: any option not listed below is
- * not a plain read. Every named path must be inside a Git checkout or under a protected directory,
- * none may be a secret, and a recursive search may not reach one.
+ * not a plain read. Every named path must pass `readable` (a checkout, temp, a scratch root or
+ * Claude Code's auto-memory), none may be a secret, and a recursive search may not reach one.
  */
 interface Options {
   /** Short flags that may be combined (`-rn`). */
@@ -153,8 +155,29 @@ function resolveSafe(cwd: string, word: string): string | undefined {
   }
 }
 
-/** A path word a plain read may name: inside a checkout or a protected directory, and no secret. */
-function readable(cwd: string, word: string): boolean {
+/**
+ * Claude Code's auto-memory directories (`<config>/projects/<project>/memory/`), the only part of
+ * the user's agent state a plain read may name. Transcripts and history next to them may not.
+ */
+function autoMemory(path: string): boolean {
+  try {
+    const config = canonical(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"));
+    if (!inside(config, path)) return false;
+    const parts = relative(config, path).split(/[\\/]/);
+    return parts.length >= 3 && parts[0] === "projects" && parts[2] === "memory";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The one test of whether a read may name a path, shared by plain reads and read-only chain
+ * prefixes: no secret, and inside a Git checkout (its own `.claude`, `.agent-config`, `AGENTS.md`
+ * included), the system temp directory, a profile scratch root, or Claude Code's auto-memory.
+ * Elsewhere under the home directory (agent transcripts and history, `.config`, `.local`, shell
+ * history) it may not.
+ */
+export function readable(cwd: string, word: string, roots: readonly string[] = []): boolean {
   if (secretPath(word)) return false;
   const lexical = resolveSafe(cwd, word);
   if (lexical === undefined) return false;
@@ -165,7 +188,30 @@ function readable(cwd: string, word: string): boolean {
     /* judged as written */
   }
   if (secretPath(lexical) || secretPath(real)) return false;
-  return inCheckout(real) || protectedPath(real) || protectedPath(lexical);
+  const under = (root: string) => {
+    try {
+      const base = canonical(root);
+      return real !== base ? inside(base, real) : true;
+    } catch {
+      return false;
+    }
+  };
+  return inCheckout(real) || tempRoots().some(under) || roots.some(under) || autoMemory(real);
+}
+
+/**
+ * Whether a word given to a read-only program may be read if it names a file: a word that names an
+ * existing path must be `readable`, one that cannot be resolved is refused, and none may name a
+ * secret. The value of `--opt=value` is judged the same way.
+ */
+export function operandReadable(cwd: string, word: string, roots: readonly string[] = []): boolean {
+  const value = word.startsWith("-") ? /^-[^=]*=(.+)$/.exec(word)?.[1] : word;
+  if (value === undefined) return true;
+  const revisionPath = /^[^:\s]*:(.+)$/.exec(value)?.[1];
+  if (secretPath(value) || (revisionPath && secretPath(revisionPath))) return false;
+  const path = resolveSafe(cwd, value);
+  if (path === undefined) return false;
+  return !existsSync(path) || readable(cwd, value, roots);
 }
 
 const WALK_LIMIT = 5000;
@@ -234,7 +280,8 @@ function parse(program: string, args: string[]): Parsed | undefined {
       const arg = args[i] as string;
       if (arg in FIND) {
         predicates = true;
-        if (FIND[arg]) i++;
+        // A name pattern is not read, but one that names a secret is not taken on trust.
+        if (FIND[arg] && secretPath(args[++i] ?? "")) return undefined;
       } else if (arg.startsWith("-") || predicates) return undefined;
       else parsed.paths.push(arg);
     }
@@ -297,13 +344,13 @@ function parse(program: string, args: string[]): Parsed | undefined {
 }
 
 /** Whether a request is a plain read of non-secret paths in a checkout or protected directory. */
-export function plainRead(request: Request): boolean {
+export function plainRead(request: Request, roots: readonly string[] = []): boolean {
   const input = request.input;
   if (input.env !== undefined || input.shell !== undefined || input.stdin !== undefined)
     return false;
   if (["Read", "view", "read_file"].includes(request.tool)) {
     const file = input.file_path ?? input.path;
-    return typeof file === "string" && readable(request.cwd, file);
+    return typeof file === "string" && readable(request.cwd, file, roots);
   }
   const command = input.command ?? input.cmd;
   if (!["Bash", "bash", "exec_command", "shell"].includes(request.tool)) return false;
@@ -338,23 +385,17 @@ export function plainRead(request: Request): boolean {
         // only allow-listed options; a word that names an existing file must be a readable,
         // non-secret path, and no word (a script, a pattern, `rev:path`) may name a secret.
         if (!readOnly(cmd.argv)) return false;
-        for (const word of cmd.argv.slice(1)) {
-          if (word.startsWith("-")) continue;
-          const revisionPath = /^[^:\s]*:(.+)$/.exec(word)?.[1];
-          if (secretPath(word) || (revisionPath && secretPath(revisionPath))) return false;
-          for (const cwd of cwds) {
-            const path = resolveSafe(cwd, word);
-            if (path && existsSync(path) && (++checked > 32 || !readable(cwd, word))) return false;
-          }
-        }
+        for (const word of cmd.argv.slice(1))
+          for (const cwd of cwds)
+            if (++checked > 64 || !operandReadable(cwd, word, roots)) return false;
         for (const redirect of cmd.redirects) {
           if (redirect.op === ">&" && redirect.target === "1" && redirect.fd === "2") continue;
           if (redirect.op === ">" && redirect.fd === "2" && redirect.target === "/dev/null")
             continue;
-          if (redirect.op === "<" && readable(request.cwd, redirect.target)) continue;
+          if (redirect.op === "<" && readable(request.cwd, redirect.target, roots)) continue;
           return false;
         }
-        for (const cwd of cwds) if (!readable(cwd, ".")) return false;
+        for (const cwd of cwds) if (!readable(cwd, ".", roots)) return false;
         continue;
       }
       const parsed = parse(gitGrep ? "git-grep" : program, cmd.argv.slice(gitGrep ? 2 : 1));
@@ -370,7 +411,7 @@ export function plainRead(request: Request): boolean {
       }
       for (const cwd of cwds) {
         // A reader with no path searches or lists the directory it runs in.
-        if (!readable(cwd, ".")) return false;
+        if (!readable(cwd, ".", roots)) return false;
         if (gitGrep) {
           // Git reads tracked files only: none of them may be a secret.
           if (parsed.paths.some((word) => secretPath(word))) return false;
@@ -385,7 +426,8 @@ export function plainRead(request: Request): boolean {
           continue;
         }
         const targets = parsed.paths.length ? parsed.paths : ["."];
-        for (const word of parsed.paths) if (++checked > 32 || !readable(cwd, word)) return false;
+        for (const word of parsed.paths)
+          if (++checked > 32 || !readable(cwd, word, roots)) return false;
         if (parsed.recursive)
           for (const word of targets) {
             const path = resolveSafe(cwd, word);

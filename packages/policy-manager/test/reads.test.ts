@@ -1,11 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { evaluate, PLAIN_READ } from "../src/policy.js";
 import { parseProfile, strictProfile } from "../src/profile.js";
-import { plainRead } from "../src/reads.js";
+import { plainRead, readable } from "../src/reads.js";
 import type { Request } from "../src/types.js";
 
 let root: string, repo: string, outside: string;
@@ -116,8 +116,11 @@ describe("anything else is not a plain read", () => {
     "git grep -O vim foo",
     "X=1 cat AGENTS.md",
     "cat AGENTS.md &",
-    // Outside a checkout and any protected directory.
-    "cat ../outside/notes.txt",
+    // Outside a checkout, temp and scratch roots: the user's agent history and home config.
+    "cat ~/.claude/history.jsonl",
+    "cat ~/.claude/projects/x/s.jsonl",
+    "head ~/.codex/sessions/2026/x.jsonl",
+    "cat ~/.local/share/x/data",
     // Options that run a program, abbreviations, and any option not on the allow-list.
     "rg --hostname-bin ./x.sh --hyperlink-format=file foo",
     "rg --hostname-bin=./x.sh foo",
@@ -142,7 +145,7 @@ describe("anything else is not a plain read", () => {
   });
 
   test("a read run from outside a checkout", () => {
-    expect(plainRead(bash("ls", outside))).toBe(false);
+    expect(plainRead(bash("ls", homedir()))).toBe(false);
     expect(plainRead(read(join(repo, ".claude", "settings.json")))).toBe(false);
     expect(plainRead(read(join(repo, ".env")))).toBe(false);
   });
@@ -230,4 +233,61 @@ describe("read-only prefixes take only listed options", () => {
   ])("%s is approved", (command) => {
     expect(evaluate(bash(command), undefined, strictProfile).decision, command).toBe("approve");
   });
+});
+
+describe("one path rule for plain reads and read-only prefixes", () => {
+  // The node binary exists everywhere and is outside any checkout, temp and scratch root.
+  const elsewhere = process.execPath.replace(/\\/g, "/");
+  test.each([
+    "~/.claude/history.jsonl",
+    "~/.claude/projects/x/s.jsonl",
+    "~/.claude/shell-snapshots/x.sh",
+    "~/.codex/sessions/2026/x.jsonl",
+    "~/.codex/history.jsonl",
+    "~/.copilot/session-state/x.json",
+    "~/.config/github-copilot/apps.json",
+    "~/.local/state/x",
+    "~/.zsh_history",
+  ])("%s is not readable, by the Read tool or cat", (path) => {
+    const full = join(homedir(), path.slice(2));
+    expect(readable(repo, full)).toBe(false);
+    expect(plainRead(read(full))).toBe(false);
+    expect(plainRead(bash(`cat ${path}`))).toBe(false);
+  });
+  test("Claude Code's auto-memory is readable, CLAUDE_CONFIG_DIR included", () => {
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      delete process.env.CLAUDE_CONFIG_DIR;
+      expect(
+        readable(repo, join(homedir(), ".claude", "projects", "x", "memory", "MEMORY.md")),
+      ).toBe(true);
+      process.env.CLAUDE_CONFIG_DIR = join(homedir(), ".claude-alt");
+      expect(
+        readable(repo, join(homedir(), ".claude-alt", "projects", "x", "memory", "a.md")),
+      ).toBe(true);
+      expect(readable(repo, join(homedir(), ".claude-alt", "projects", "x", "s.jsonl"))).toBe(
+        false,
+      );
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = saved;
+    }
+  });
+  test("a checkout, temp and a scratch root are readable", () => {
+    expect(readable(repo, ".claude/agents/a.md")).toBe(true);
+    expect(readable(repo, join(outside, "notes.txt"))).toBe(true);
+    expect(readable(homedir(), "/srv/scratch/x", ["/srv/scratch"])).toBe(true);
+    expect(readable(homedir(), "/srv/other/x", ["/srv/scratch"])).toBe(false);
+  });
+  test.each(["jq .", "cut -c1-200", "wc -l", "sort", "nl", "diff AGENTS.md"])(
+    "a read-only prefix `%s` names only readable files",
+    (program) => {
+      expect(
+        evaluate(bash(`${program} ${elsewhere} && ls`), undefined, strictProfile).decision,
+      ).not.toBe("approve");
+      expect(evaluate(bash(`${program} AGENTS.md && ls`), undefined, strictProfile).decision).toBe(
+        "approve",
+      );
+    },
+  );
 });

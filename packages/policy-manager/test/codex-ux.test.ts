@@ -70,9 +70,11 @@ describe("single-quoted literals", () => {
     expect(decide("gh api graphql -f b='Fixed in `abc`'").decision).toBe("approve");
   });
   test('a variable holding a single-quoted literal with $ is usable as "$Q"', () => {
-    expect(decide("Q='mutation($t:ID!){x}'; gh api graphql -f query=\"$Q\" -f t=1").decision).toBe(
-      "approve",
-    );
+    expect(
+      decide(
+        "Q='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{id}}}'; gh api graphql -f query=\"$Q\" -f t=1",
+      ).decision,
+    ).toBe("approve");
   });
   test("the same variable unquoted, or run as a script, keeps its checks", () => {
     expect(decide("Q='rm -rf ~/x'; $Q").decision).toBe("human");

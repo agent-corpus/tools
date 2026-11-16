@@ -257,7 +257,145 @@ const GH_DELETE: Record<string, RegExp> = {
   release: /^(?:delete|delete-asset)$/,
   secret: /^(?:delete|remove|set)$/,
   variable: /^(?:delete|set)$/,
+  // Merging and workflow or deploy triggers cannot be taken back. (`gh ruleset` only reads.)
+  pr: /^merge$/,
+  workflow: /^(?:run|enable|disable)$/,
+  run: /^rerun$/,
 };
+
+/**
+ * The only REST writes through `gh api` that reach the classifier: recoverable PR and issue
+ * conversation. Each entry is a method set and an endpoint under `repos/<owner>/<repo>/`. Every
+ * other write is a floor item (merging, dispatching workflows, deployments, rulesets, transfers,
+ * memberships, secrets, variables, settings, refs, releases, ...).
+ */
+const GH_API_WRITES: [RegExp, RegExp][] = [
+  // Issue and PR comments: create, edit.
+  [/^POST$/, /^issues\/\d+\/comments$/],
+  [/^PATCH$/, /^issues\/comments\/\d+$/],
+  // Review comments and replies: create, edit.
+  [/^POST$/, /^pulls\/\d+\/comments(?:\/\d+\/replies)?$/],
+  [/^PATCH$/, /^pulls\/comments\/\d+$/],
+  // Reviews: create, update the body, submit.
+  [/^POST$/, /^pulls\/\d+\/reviews$/],
+  [/^PUT$/, /^pulls\/\d+\/reviews\/\d+$/],
+  [/^POST$/, /^pulls\/\d+\/reviews\/\d+\/events$/],
+  // Labels and assignees.
+  [/^(?:POST|PUT)$/, /^issues\/\d+\/labels$/],
+  [/^DELETE$/, /^issues\/\d+\/labels(?:\/[^/]+)?$/],
+  [/^(?:POST|DELETE)$/, /^issues\/\d+\/assignees$/],
+  // PR create, and edit of title, body, base or draft (not its state).
+  [/^POST$/, /^pulls$/],
+  [/^PATCH$/, /^pulls\/\d+$/],
+];
+/** GraphQL mutations that reach the classifier: the same recoverable conversation edits. */
+const GH_MUTATIONS = new Set([
+  "addComment",
+  "updateIssueComment",
+  "addPullRequestReview",
+  "addPullRequestReviewComment",
+  "addPullRequestReviewThreadReply",
+  "updatePullRequestReviewComment",
+  "submitPullRequestReview",
+  "resolveReviewThread",
+  "unresolveReviewThread",
+  "createPullRequest",
+  "updatePullRequest",
+  "addLabelsToLabelable",
+  "removeLabelsFromLabelable",
+  "addAssigneesToAssignable",
+  "removeAssigneesFromAssignable",
+]);
+
+/**
+ * The top-level field names of every mutation in a GraphQL document, or undefined if it has no
+ * mutation. Strings are skipped; an alias (`a: addComment(...)`) counts as its field. A document
+ * it cannot follow (block strings, unbalanced brackets) yields no fields, which fails closed.
+ */
+function mutationFields(text: string): string[] | undefined {
+  if (!/\bmutation\b/.test(text)) return undefined;
+  if (text.includes('"""')) return [];
+  const fields: string[] = [];
+  let depth = 0;
+  let parens = 0;
+  let inMutation = false;
+  let found = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i] as string;
+    if (c === '"') {
+      for (i++; i < text.length && text[i] !== '"'; i++) if (text[i] === "\\") i++;
+      continue;
+    }
+    if (c === "(") parens++;
+    else if (c === ")") parens--;
+    else if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) inMutation = false;
+    } else if (depth === 0 && parens === 0 && /[A-Za-z_]/.test(c)) {
+      const word = /^[A-Za-z_]\w*/.exec(text.slice(i))?.[0] ?? "";
+      if (word === "mutation") inMutation = found = true;
+      i += word.length - 1;
+    } else if (inMutation && depth === 1 && parens === 0 && /[A-Za-z_]/.test(c)) {
+      const word = /^[A-Za-z_]\w*/.exec(text.slice(i))?.[0] ?? "";
+      i += word.length - 1;
+      if (!/^\s*:/.test(text.slice(i + 1))) fields.push(word);
+    }
+  }
+  if (depth !== 0 || parens !== 0) return [];
+  return found ? fields : undefined;
+}
+
+/**
+ * Whether a `gh api` call is a floor item: any write (a non-GET method, or fields, which make it a
+ * POST) outside GH_API_WRITES, any GraphQL mutation outside GH_MUTATIONS (or a pull request state
+ * change), and any call whose endpoint or query cannot be read.
+ */
+function ghApiFloor(texts: string[]): boolean {
+  let endpoint: string | undefined;
+  let method: string | undefined;
+  let fields = false;
+  const values: string[] = [];
+  for (let k = texts.indexOf("api") + 1; k < texts.length; k++) {
+    const text = texts[k] as string;
+    const attached = /^(?:-X|--method=)(.+)$/.exec(text);
+    if (text === "-X" || text === "--method") method = texts[++k];
+    else if (attached) method = attached[1];
+    else if (/^(?:-[fF]|--field|--raw-field)$/.test(text)) {
+      fields = true;
+      values.push(texts[++k] ?? "");
+    } else if (/^(?:--field|--raw-field)=|^-[fF]./.test(text)) {
+      fields = true;
+      values.push(text.replace(/^(?:--field=|--raw-field=|-[fF])/, ""));
+    } else if (text === "--input" || text.startsWith("--input=")) {
+      fields = true;
+      if (text === "--input") k++;
+      values.push("@");
+    } else if (/^-[Htqp]$|^--(?:header|jq|template|hostname|cache|preview)$/.test(text)) k++;
+    else if (!text.startsWith("-") && endpoint === undefined) endpoint = text;
+  }
+  if (endpoint === undefined || /\$/.test(endpoint)) return true;
+  const effective = (method ?? (fields ? "POST" : "GET")).toUpperCase();
+  if (endpoint === "graphql") {
+    // A query read from a file cannot be judged; one without a mutation reads.
+    if (values.some((value) => value === "@" || /^query=@/.test(value))) return true;
+    for (const value of values) {
+      const mutations = mutationFields(value);
+      if (mutations === undefined) continue;
+      if (!mutations.length || mutations.some((field) => !GH_MUTATIONS.has(field))) return true;
+      if (mutations.includes("updatePullRequest") && /\bstate\s*:/.test(value)) return true;
+    }
+    return false;
+  }
+  if (["GET", "HEAD"].includes(effective)) return false;
+  const path = /^\/?repos\/[^/]+\/[^/]+\/([^?#]*)$/.exec(endpoint)?.[1]?.replace(/\/$/, "");
+  if (path === undefined) return true;
+  if (!GH_API_WRITES.some(([methods, shape]) => methods.test(effective) && shape.test(path)))
+    return true;
+  // Editing a pull request is recoverable; closing, reopening or merging state is not its job here.
+  if (/^pulls\/\d+$/.test(path) && values.some((value) => /^state=/.test(value))) return true;
+  return false;
+}
 
 /** The floor rules for one literal program. */
 function floorRules(name: string, cmd: Command, context: Context, rules: Set<HardRule>): void {
@@ -269,58 +407,7 @@ function floorRules(name: string, cmd: Command, context: Context, rules: Set<Har
   else if (PUBLISHERS[name]?.test(first)) rules.add("publish");
   if (name === "gh") {
     if (GH_DELETE[first]?.test(positional[1]?.text ?? "")) rules.add("repo-delete");
-    const method = cmd.args.findIndex((word) => /^(?:-X|--method)$/.test(word.text));
-    const value =
-      method >= 0
-        ? cmd.args[method + 1]?.text
-        : cmd.args
-            .find((word) => /^(?:-X|--method=)/.test(word.text))
-            ?.text.replace(/^(?:-X|--method=)/, "");
-    if (first === "api" && /^delete$/i.test(value ?? "")) rules.add("repo-delete");
-    if (first === "api") {
-      // The endpoint: the first word after `api` that is not an option or an option's value.
-      const texts = cmd.args.map((word) => word.text);
-      let endpoint: string | undefined;
-      for (let k = texts.indexOf("api") + 1; k < texts.length; k++) {
-        const text = texts[k] as string;
-        if (
-          /^-[XfFHtqp]$|^--(?:method|field|raw-field|header|jq|template|input|hostname|cache)$/.test(
-            text,
-          )
-        )
-          k++;
-        else if (!text.startsWith("-")) {
-          endpoint = text;
-          break;
-        }
-      }
-      const fields = texts.some((text) =>
-        /^(?:-[fF]|--(?:field|raw-field|input)(?:=|$))/.test(text),
-      );
-      const effective = (value ?? (fields ? "POST" : "GET")).toUpperCase();
-      // An outward write that can be undone (a comment, a review reply, an issue edit) is the
-      // classifier's; one that changes the repository itself, its releases, refs, secrets, hooks,
-      // keys, collaborators or branch protection is not provably recoverable. An endpoint that
-      // cannot be read is treated as one of those.
-      const repositoryLevel =
-        endpoint === undefined ||
-        /\$/.test(endpoint) ||
-        /^\/?repos\/[^/]+\/[^/]+\/?(?:$|[?#])|\/(?:releases|git\/refs|actions\/(?:secrets|variables)|hooks|keys|collaborators|branches\/[^/]+\/protection|environments)(?:\/|$|[?#])/.test(
-          endpoint,
-        );
-      if (endpoint !== "graphql" && !["GET", "HEAD"].includes(effective) && repositoryLevel)
-        rules.add("repo-delete");
-      if (
-        endpoint === "graphql" &&
-        texts.some(
-          (text) =>
-            /\b(?:delete|archive|transfer|unarchive)\w*|updateRepository|updateBranchProtectionRule/i.test(
-              text,
-            ) && /\bmutation\b/.test(text),
-        )
-      )
-        rules.add("repo-delete");
-    }
+    if (first === "api" && ghApiFloor(cmd.args.map((word) => word.text))) rules.add("repo-delete");
   }
   if (
     httpWrite(

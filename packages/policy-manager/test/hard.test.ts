@@ -468,7 +468,6 @@ describe("more of the floor", () => {
     "curl -X DELETE http://127.0.0.1:8080/x",
     "gh api repos/o/r/pulls",
     "gh api -X GET repos/o/r -f per_page=100",
-    "gh api repos/o/r/issues -f title=x",
     "gh api repos/o/r/pulls/1/comments -f body=ok",
     "gh api graphql -f query='mutation{addPullRequestReviewThreadReply(input:{}){comment{id}}}'",
     'gh api graphql -f query=\'{repository(owner:"o",name:"r"){id}}\'',
@@ -551,6 +550,65 @@ describe("unquoted here-document bodies are read with the shell's rules", () => 
     expect(hardRules(shell("cat <<EOF\nnot run: \\$(az group delete -n x)\nEOF"), base())).toEqual(
       expect.not.arrayContaining(["force-push"]),
     );
+  });
+});
+
+describe("gh writes reach the classifier only in recoverable shapes", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  test.each([
+    "gh api repos/o/r/pulls/1/merge -X PUT",
+    "gh api repos/o/r/actions/workflows/deploy.yml/dispatches -f ref=main",
+    "gh api repos/o/r/dispatches -f event_type=x",
+    "gh api repos/o/r/deployments -f ref=main",
+    "gh api repos/o/r/rulesets -X POST --input f",
+    "gh api repos/o/r/transfer -f new_owner=x",
+    "gh api orgs/o/memberships/x -X PUT",
+    "gh api repos/o/r/actions/variables -f name=X -f value=1",
+    "gh api repos/o/r -X PATCH -f has_wiki=false",
+    "gh api repos/o/r/issues -f title=x",
+    "gh api -X PATCH repos/o/r/pulls/3 -f state=closed",
+    "gh api -X DELETE repos/o/r/issues/comments/9",
+    "gh api repos/$R/pulls/1/comments -f body=x",
+    "gh api graphql -f query='mutation{mergePullRequest(input:{pullRequestId:\"x\"}){clientMutationId}}'",
+    "gh api graphql -f query='mutation{updatePullRequest(input:{pullRequestId:\"x\",state:CLOSED}){clientMutationId}}'",
+    'gh api graphql -f query=\'mutation{a: addComment(input:{subjectId:"x",body:"y"}){clientMutationId} b: deleteRepository(input:{}){clientMutationId}}\'',
+    'gh api graphql -f query=\'mutation{addComment(input:{body:"""x"""}){clientMutationId}}\'',
+    "gh api graphql -F query=@mutation.graphql",
+    "gh pr merge 3",
+    "gh workflow run deploy.yml",
+    "gh run rerun 12",
+    "gh secret set X",
+    "gh variable set X",
+    "gh repo edit --visibility public",
+  ])("floor: %s", (command) => {
+    expect(hardRules(shell(command), base())).toContain("repo-delete");
+  });
+  test.each([
+    "gh api repos/o/r/issues/1/comments -f body=x",
+    "gh api -X PATCH repos/o/r/issues/comments/9 -f body=x",
+    "gh api repos/o/r/pulls/1/comments -f body=x",
+    "gh api repos/o/r/pulls/1/comments/5/replies -f body=x",
+    "gh api -X PATCH repos/o/r/pulls/comments/5 -f body=x",
+    "gh api repos/o/r/pulls/7/reviews --input review.json",
+    "gh api repos/o/r/pulls/7/reviews/3/events -f event=COMMENT",
+    "gh api repos/o/r/issues/3/labels -f 'labels[]=bug'",
+    "gh api -X DELETE repos/o/r/issues/3/labels/bug",
+    "gh api repos/o/r/issues/3/assignees -f 'assignees[]=a'",
+    "gh api repos/o/r/pulls -f title=x -f head=a -f base=main",
+    "gh api -X PATCH repos/o/r/pulls/3 -f title=x -f base=main",
+    "gh api graphql -f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{id}}}' -f t=x",
+    "gh api graphql -f query='mutation{unresolveReviewThread(input:{threadId:\"x\"}){thread{id}}}'",
+    'gh api graphql -f query=\'mutation{addComment(input:{subjectId:"x",body:"no deleteRepository here"}){clientMutationId}}\'',
+    'gh api graphql -f query=\'mutation{updatePullRequest(input:{pullRequestId:"x",title:"t"}){clientMutationId}}\'',
+    "gh api graphql -f query='query{viewer{login}}' ",
+    "gh ruleset list",
+    "gh ruleset view 1",
+    "gh pr view 3",
+  ])("classifier or engine: %s", (command) => {
+    expect(hardRules(shell(command), base())).not.toContain("repo-delete");
   });
 });
 

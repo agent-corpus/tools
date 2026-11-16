@@ -327,24 +327,15 @@ function chainApproved(request: Request, profile: Profile): boolean {
         (r) => (r.op === ">&" && r.target === "1") || (r.op === ">" && r.target === "/dev/null"),
       );
       if (!quiet) return false;
-      // Only reads, and none of a secret: the prefix's output reaches the agent too.
+      // Only reads, and only of what a plain read may name (`readable`): the prefix's output
+      // reaches the agent too. Every stage gets the full plain-read check, file readers and
+      // filters (`jq`, `cut`, `wc`, `diff`, `sort`) alike.
       for (const stage of pipeline) {
         if (!readOnly(stage.argv)) return false;
-        // A file reader (recursive searches included) gets the full plain-read check.
-        const [program = "", sub] = stage.argv;
-        if (
-          ["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail", "find"].includes(program) ||
-          (program === "git" && sub === "grep")
-        ) {
-          const text = stage.argv.map(quote).join(" ");
-          for (const cwd of cwds)
-            if (!plainRead({ ...request, cwd, input: { command: text } })) return false;
-          continue;
-        }
-        for (const arg of stage.argv.slice(1))
-          for (const cwd of cwds)
-            if (secretPath(arg) || secretPath(resolve(cwd, arg.replace(/^[^:=]*[:=]/, ""))))
-              return false;
+        const text = stage.argv.map(quote).join(" ");
+        for (const cwd of cwds)
+          if (!plainRead({ ...request, cwd, input: { command: text } }, profile.scratchRoots))
+            return false;
       }
       continue;
     }
@@ -402,7 +393,7 @@ function evaluateSteps(
   if (
     core.decision === "human" &&
     !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
-    plainRead(request)
+    plainRead(request, profile.scratchRoots)
   )
     return result(request, "code-read", PLAIN_READ, true);
   if (
