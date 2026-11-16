@@ -276,8 +276,10 @@ describe("one path rule for plain reads and read-only prefixes", () => {
   test("a checkout, temp and a scratch root are readable", () => {
     expect(readable(repo, ".claude/agents/a.md")).toBe(true);
     expect(readable(repo, join(outside, "notes.txt"))).toBe(true);
-    expect(readable(homedir(), "/srv/scratch/x", ["/srv/scratch"])).toBe(true);
-    expect(readable(homedir(), "/srv/other/x", ["/srv/scratch"])).toBe(false);
+    // Built from the home directory so the drive matches on Windows.
+    const scratch = join(homedir(), "pm-scratch-root");
+    expect(readable(homedir(), join(scratch, "x"), [scratch])).toBe(true);
+    expect(readable(homedir(), join(homedir(), "pm-other-root", "x"), [scratch])).toBe(false);
   });
   test.each(["jq .", "cut -c1-200", "wc -l", "sort", "nl", "diff AGENTS.md"])(
     "a read-only prefix `%s` names only readable files",
