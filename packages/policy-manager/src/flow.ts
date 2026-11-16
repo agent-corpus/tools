@@ -57,6 +57,11 @@ interface State {
    */
   failed?: string[];
   /**
+   * The last `cd` cannot fail (the script's first command, into an absolute directory that exists
+   * and can be entered): `failed` is kept only for `||` and `!`, which run exactly when it fails.
+   */
+  sure?: boolean;
+  /**
    * Variables the script assigned: their known values, or null when the value is unknown (it came
    * from a command, a glob or a loop). A name that is absent was never assigned here, so it is an
    * environment variable of unknown content.
@@ -81,6 +86,8 @@ interface Ctx {
     last?: Decision;
     calls: number;
     first?: PipelineNode;
+    /** The pipeline being run now, so a `cd` knows whether it is the script's first command. */
+    current?: unknown;
     /** Directories that earlier commands create, so a later `cd` into one is not unknown. */
     created?: Set<string>;
     /** Whether a symlink may exist that the hook could not see (see `Fill`). */
@@ -93,19 +100,28 @@ interface Ctx {
 const copy = (state: State): State => ({
   cwds: [...state.cwds],
   ...(state.failed ? { failed: [...state.failed] } : {}),
+  ...(state.sure ? { sure: true } : {}),
   vars: new Map(state.vars),
   funcs: new Map(state.funcs),
 });
 
 /** The last `cd` may have failed: every directory it could have left the shell in is possible. */
-function settle(state: State): void {
-  if (state.failed) state.cwds = [...new Set([...state.cwds, ...state.failed])];
+function settle(state: State, failure = false): void {
+  // After `;`, a newline or `&`, a `cd` that cannot fail did not; after `||` or `!` it did.
+  if (state.failed && (failure || !state.sure))
+    state.cwds = [...new Set([...state.cwds, ...state.failed])];
   delete state.failed;
+  delete state.sure;
 }
 
 /** Every directory either state could be in; neither input is changed. */
 function merge(a: State, b: State): State {
-  const cwds = [...a.cwds, ...(a.failed ?? []), ...b.cwds, ...(b.failed ?? [])];
+  const cwds = [
+    ...a.cwds,
+    ...(a.sure ? [] : (a.failed ?? [])),
+    ...b.cwds,
+    ...(b.sure ? [] : (b.failed ?? [])),
+  ];
   const vars = new Map<string, string[] | null>();
   for (const [name, left] of a.vars) {
     if (!b.vars.has(name)) continue; // assigned on one path only: an environment value is possible
@@ -125,6 +141,8 @@ function replace(target: State, source: State): void {
   target.cwds = source.cwds;
   if (source.failed) target.failed = source.failed;
   else delete target.failed;
+  if (source.sure) target.sure = true;
+  else delete target.sure;
   target.vars = source.vars;
   target.funcs = source.funcs;
 }
@@ -983,6 +1001,7 @@ function changeDirectory(
     );
   settle(state);
   let cwds: string[] = [];
+  let absolute = true;
   for (const env of envs) {
     const target = build(env)
       .argv.slice(1)
@@ -990,6 +1009,7 @@ function changeDirectory(
     // A bare `cd` and `~` or `~/x` go to the home directory; `~user` and `-` stay with a human.
     const raw = target.length === 0 ? "~" : target[0];
     const word = raw === "~" || raw?.startsWith("~/") ? join(homedir(), raw.slice(1)) : raw;
+    if (!word || !isAbsolute(word)) absolute = false;
     if (
       target.length > 1 ||
       !word ||
@@ -1032,8 +1052,24 @@ function changeDirectory(
   }
   if (!cwds.length || cwds.length + state.cwds.length > MAX_DIRECTORIES)
     return human(request, "unknown", "Too many directory changes to verify");
-  // `cd` can fail, so the directory it started from stays possible unless `&&` follows.
+  // `cd` can fail, so the directory it started from stays possible unless `&&` follows. As the
+  // script's first command (nothing earlier could remove it), into an absolute directory that
+  // exists and that this user may enter, it does not fail: the next command runs there whatever
+  // joins it (`cd /x && a; b`, or a newline after a here-document).
+  const certain =
+    ctx.depth === 0 &&
+    ctx.box.current === ctx.box.first &&
+    absolute &&
+    cwds.every((dir) => {
+      try {
+        return isDirectory(dir) && (accessSync(dir, constants.X_OK), true);
+      } catch {
+        return false;
+      }
+    });
   state.failed = state.cwds;
+  if (certain) state.sure = true;
+  else delete state.sure;
   state.cwds = cwds;
   ctx.box.last = result(request, "code-read", "Directory change", true);
   return undefined;
@@ -1534,6 +1570,7 @@ function runIf(
     // that ends the condition did change directory. Earlier clauses are already merged in.
     const taken = copy(outcome.success ?? current);
     delete taken.failed;
+    delete taken.sure;
     const body = runList(ctx, clause.body, taken);
     if (body) return body;
     branches.push(taken);
@@ -1666,10 +1703,13 @@ function runList(
     for (const [step, next] of rest.entries()) {
       running = copy(running);
       onlyAnd &&= next.op === "&&";
-      if (onlyAnd) delete running.failed;
-      else {
-        settle(running);
-        running.cwds = [...new Set([...running.cwds, ...possible.cwds])];
+      if (onlyAnd) {
+        delete running.failed;
+        delete running.sure;
+      } else {
+        settle(running, true);
+        // An `||` runs when something before it failed, a `cd` that cannot otherwise fail included.
+        running.cwds = [...new Set([...running.cwds, ...possible.cwds, ...(target.failed ?? [])])];
       }
       const skipped = runPipeline(ctx, next.node, running);
       if (skipped) return skipped;
@@ -1696,9 +1736,10 @@ function runPipeline(
   state: State,
 ): Decision | undefined {
   if (node.stages.length === 1) {
+    ctx.box.current = node;
     const refusal = runCommand(ctx, node.stages[0] as Command, state, 0, false);
     // `! cd x` succeeds exactly when the `cd` failed.
-    if (node.negated) settle(state);
+    if (node.negated) settle(state, true);
     return refusal;
   }
   const changed = new Set<string>();

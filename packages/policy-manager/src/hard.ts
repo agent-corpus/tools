@@ -277,12 +277,50 @@ function floorRules(name: string, cmd: Command, context: Context, rules: Set<Har
             .find((word) => /^(?:-X|--method=)/.test(word.text))
             ?.text.replace(/^(?:-X|--method=)/, "");
     if (first === "api" && /^delete$/i.test(value ?? "")) rules.add("repo-delete");
-    // Any other method than GET, or a field (which makes gh send a POST), writes.
-    const fields = cmd.args.some((word) =>
-      /^(?:-[fF]|--(?:field|raw-field|input)(?:=|$))/.test(word.text),
-    );
-    if (first === "api" && (value !== undefined ? !/^(?:get|head)$/i.test(value) : fields))
-      rules.add("cloud-write");
+    if (first === "api") {
+      // The endpoint: the first word after `api` that is not an option or an option's value.
+      const texts = cmd.args.map((word) => word.text);
+      let endpoint: string | undefined;
+      for (let k = texts.indexOf("api") + 1; k < texts.length; k++) {
+        const text = texts[k] as string;
+        if (
+          /^-[XfFHtqp]$|^--(?:method|field|raw-field|header|jq|template|input|hostname|cache)$/.test(
+            text,
+          )
+        )
+          k++;
+        else if (!text.startsWith("-")) {
+          endpoint = text;
+          break;
+        }
+      }
+      const fields = texts.some((text) =>
+        /^(?:-[fF]|--(?:field|raw-field|input)(?:=|$))/.test(text),
+      );
+      const effective = (value ?? (fields ? "POST" : "GET")).toUpperCase();
+      // An outward write that can be undone (a comment, a review reply, an issue edit) is the
+      // classifier's; one that changes the repository itself, its releases, refs, secrets, hooks,
+      // keys, collaborators or branch protection is not provably recoverable. An endpoint that
+      // cannot be read is treated as one of those.
+      const repositoryLevel =
+        endpoint === undefined ||
+        /\$/.test(endpoint) ||
+        /^\/?repos\/[^/]+\/[^/]+\/?(?:$|[?#])|\/(?:releases|git\/refs|actions\/(?:secrets|variables)|hooks|keys|collaborators|branches\/[^/]+\/protection|environments)(?:\/|$|[?#])/.test(
+          endpoint,
+        );
+      if (endpoint !== "graphql" && !["GET", "HEAD"].includes(effective) && repositoryLevel)
+        rules.add("repo-delete");
+      if (
+        endpoint === "graphql" &&
+        texts.some(
+          (text) =>
+            /\b(?:delete|archive|transfer|unarchive)\w*|updateRepository|updateBranchProtectionRule/i.test(
+              text,
+            ) && /\bmutation\b/.test(text),
+        )
+      )
+        rules.add("repo-delete");
+    }
   }
   if (
     httpWrite(
@@ -327,7 +365,10 @@ function disposableTarget(word: Word, context: Context): boolean {
   }
   if (context.unknownCwd && !base.startsWith("/") && !base.startsWith("~")) return false;
   const roots = [...tempRoots(), ...context.scratchRoots];
-  for (const path of resolutions(base || ".", context.cwds)) {
+  const found = resolutions(base || ".", context.cwds);
+  // A target that cannot be resolved (`~user/x`, an unknown directory) is not disposable.
+  if (!found.length) return false;
+  for (const path of found) {
     let real = path;
     try {
       real = canonical(path);
@@ -442,11 +483,24 @@ function analyzeScript(
   for (const segment of segments) {
     analyzeCommand(command(segment), segment, context, rules, depth);
     // A here-document fed to a shell, or in a script that runs text (`cat <<EOF | sh`), is code.
-    for (const doc of segment.filter((word) => word.heredoc))
-      if (runs && depth < 4) {
+    for (const doc of segment.filter((word) => word.heredoc)) {
+      if (depth >= 4) continue;
+      if (runs) {
         analyzeScript(doc.text, context, rules, depth + 1);
         textRules(doc.text, [...context.cwds][0] ?? "", rules);
       }
+      if (doc.quoted) continue;
+      // Fail closed on an unquoted body: besides its substitutions as the scanner reads them, read
+      // what follows every `$(` and backtick as a script, so text the scanner might mis-read
+      // around them (a stray quote, a backslash, a backtick taken literally) cannot hide a
+      // command that will run.
+      let openers = 0;
+      for (const match of doc.text.matchAll(/\$\(|`/g)) {
+        if (++openers > 32) break;
+        const rest = doc.text.slice((match.index ?? 0) + match[0].length);
+        analyzeScript(rest, context, rules, depth + 1);
+      }
+    }
   }
 }
 
@@ -692,11 +746,26 @@ function cloudGet(args: string[]): boolean {
 
 const LOOPBACK = /^(?:localhost|127(?:\.\d+){3}|\[?::1\]?|0\.0\.0\.0)(?::\d+)?$/i;
 /** The hosts of the URLs among `args`, and whether any is not loopback. */
-function remoteUrl(args: string[]): boolean {
-  return args.some((arg) => {
-    const match = /^(?:https?:\/\/)([^/?#\s]+)/i.exec(arg);
-    return !!match && !LOOPBACK.test((match[1] ?? "").replace(/^[^@]*@/, ""));
-  });
+/**
+ * Whether the request goes only to an explicit loopback host: at least one target names
+ * `localhost`, `127.x.x.x` or `::1`, and nothing else looks like a target. A bare host, a
+ * variable, or no recognizable URL at all is not loopback, so a write to it is a floor item.
+ */
+function loopbackOnly(args: string[]): boolean {
+  const targets = args.filter(
+    (arg) => !arg.startsWith("-") && /^(?:https?:\/\/)?[\w.[\]:-]+(?::\d+)?(?:[/?#]|$)/i.test(arg),
+  );
+  const hosts = targets.map(
+    (arg) => /^(?:https?:\/\/)?([^/?#\s]+)/i.exec(arg)?.[1]?.replace(/^[^@]*@/, "") ?? "",
+  );
+  const loopback = hosts.filter((host) => LOOPBACK.test(host));
+  const urls = args.filter((arg) => /^[a-z][\w+.-]*:\/\//i.test(arg) || /\$/.test(arg));
+  return (
+    loopback.length > 0 &&
+    urls.every((url) =>
+      LOOPBACK.test(/^[a-z][\w+.-]*:\/\/([^/?#\s]+)/i.exec(url)?.[1]?.replace(/^[^@]*@/, "") ?? ""),
+    )
+  );
 }
 /**
  * An HTTP client sending anything but GET or HEAD to a host that is not loopback: curl (`-X`,
@@ -746,5 +815,5 @@ function httpWrite(name: string, args: string[]): boolean {
     }
   } else return false;
   const effective = (method ?? (body ? "POST" : "GET")).toUpperCase();
-  return !["GET", "HEAD", "OPTIONS"].includes(effective) && remoteUrl(args);
+  return !["GET", "HEAD", "OPTIONS"].includes(effective) && !loopbackOnly(args);
 }

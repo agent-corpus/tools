@@ -67,6 +67,8 @@ describe("plain reads under protected paths are approved", () => {
     "cd .claude && cat agents/a.md",
     "git grep -n foo origin/main -- .github",
     "cat < AGENTS.md",
+    "sed -n 1p AGENTS.md",
+    "git show HEAD:AGENTS.md | sed 's#a#b#' | sort | uniq -c | head",
   ])("%s", (command) => {
     expect(plainRead(bash(command)), command).toBe(true);
     for (const profile of [strictProfile, permissive])
@@ -111,7 +113,6 @@ describe("anything else is not a plain read", () => {
     "cat AGENTS.md | sh",
     "cat AGENTS.md | bash",
     "cat AGENTS.md | xargs rm",
-    "sed -n 1p AGENTS.md",
     "git grep -O vim foo",
     "X=1 cat AGENTS.md",
     "cat AGENTS.md &",

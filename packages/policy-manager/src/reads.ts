@@ -118,6 +118,8 @@ const FIND: Record<string, boolean> = {
  * File names that hold or may hold credentials: harness settings (they can carry tokens in `env`),
  * login stores, the policy profile, and the credential names `sensitive` already knows.
  */
+const TRACKED_SECRET =
+  /(?:^|\/)(?:\.env(?:\.(?!example$|sample$|template$|dist$)[^/]*)?|\.git-credentials|\.netrc|\.pgpass|\.vault-token|credentials?(?:\.\w+)?|secrets?(?:\.\w+)?|id_(?:rsa|ed25519|ecdsa)|kubeconfig|terraform\.tfstate(?:\.\w+)?|[^/]*\.(?:pem|key|pfx|p12))$/i;
 const SECRET_NAME =
   /^(?:\.?credentials?(?:\..*)?|auth\.json|\.claude\.json|settings(?:\.local)?\.json|config\.toml|config\.json|hooks\.json|permissions-config\.json|policy\.json|\.netrc|.*\.(?:sqlite3?|db|keychain(?:-db)?))$/i;
 
@@ -331,6 +333,30 @@ export function plainRead(request: Request): boolean {
         if (cwds.size > 4) return false;
         continue;
       }
+      if (!(program in OPTIONS) && program !== "find" && !gitGrep) {
+        // A read-only filter or git read (`git show rev:path | sed -n 1,9p | sort | uniq -c`):
+        // only allow-listed options; a word that names an existing file must be a readable,
+        // non-secret path, and no word (a script, a pattern, `rev:path`) may name a secret.
+        if (!readOnly(cmd.argv)) return false;
+        for (const word of cmd.argv.slice(1)) {
+          if (word.startsWith("-")) continue;
+          const revisionPath = /^[^:\s]*:(.+)$/.exec(word)?.[1];
+          if (secretPath(word) || (revisionPath && secretPath(revisionPath))) return false;
+          for (const cwd of cwds) {
+            const path = resolveSafe(cwd, word);
+            if (path && existsSync(path) && (++checked > 32 || !readable(cwd, word))) return false;
+          }
+        }
+        for (const redirect of cmd.redirects) {
+          if (redirect.op === ">&" && redirect.target === "1" && redirect.fd === "2") continue;
+          if (redirect.op === ">" && redirect.fd === "2" && redirect.target === "/dev/null")
+            continue;
+          if (redirect.op === "<" && readable(request.cwd, redirect.target)) continue;
+          return false;
+        }
+        for (const cwd of cwds) if (!readable(cwd, ".")) return false;
+        continue;
+      }
       const parsed = parse(gitGrep ? "git-grep" : program, cmd.argv.slice(gitGrep ? 2 : 1));
       if (!parsed) return false;
       for (const redirect of cmd.redirects) {
@@ -350,7 +376,9 @@ export function plainRead(request: Request): boolean {
           if (parsed.paths.some((word) => secretPath(word))) return false;
           try {
             const tracked = git(cwd, ["ls-files", "-z"]).split("\0");
-            if (tracked.some((file) => file && secretPath(file))) return false;
+            // Tracked files that would hold a credential (a committed `.npmrc` or `.env.example`
+            // is configuration already in history; a committed `.env`, key or state file is not).
+            if (tracked.some((file) => TRACKED_SECRET.test(file))) return false;
           } catch {
             return false;
           }
@@ -378,4 +406,300 @@ export function plainRead(request: Request): boolean {
       }
     }
   return true;
+}
+/**
+ * Programs and git subcommands that change nothing a later command could see, each with the only
+ * options it may take: an option that writes a file (`--output`, `-o`) or runs a program
+ * (`--ext-diff`, `--compress-program`) is never listed, and an unlisted option is not read-only.
+ * `flags` matches a whole option word; `valued` options take the next word as their value.
+ */
+interface ReadOnlySpec {
+  flags?: RegExp;
+  valued?: string[];
+  /** Operands are allowed (files, revisions, patterns). */
+  operands?: boolean;
+  /** Extra check on the operands. */
+  check?: (operands: string[]) => boolean;
+}
+
+const READ_ONLY: Record<string, ReadOnlySpec> = {
+  pwd: { flags: /^-[LP]$/ },
+  true: {},
+  echo: { flags: /^-[neE]+$/, operands: true },
+  printf: { operands: true },
+  stat: { flags: /^-[LtFlsx]+$/, valued: ["-f", "-c"], operands: true },
+  file: { flags: /^-[bLhiz]+$/, operands: true },
+  which: { flags: /^-a$/, operands: true },
+  basename: { flags: /^-[az]$/, valued: ["-s"], operands: true },
+  dirname: { operands: true },
+  realpath: { flags: /^-[esmqz]+$/, operands: true },
+  date: { flags: /^(?:-[uRI]|-I\w+|\+.*)$/, operands: false },
+  wc: { flags: /^-[lwcmL]+$/, operands: true },
+  cut: { valued: ["-d", "-f", "-c", "-b"], flags: /^-(?:[dfcb].+|s|n)$/, operands: true },
+  tr: { flags: /^-[dsc]+$/, operands: true },
+  nl: { flags: /^-[bnv]\w*$/, operands: true },
+  column: { flags: /^-[tx]+$/, valued: ["-s"], operands: true },
+  jq: { flags: /^-[rcesnjaS]+$/, valued: ["--arg", "--argjson"], operands: true },
+  diff: {
+    flags: /^(?:-[uqNwBbiyU0-9]+|--brief|--unified(?:=\d+)?|--color(?:=\w+)?)$/,
+    operands: true,
+  },
+  cmp: { flags: /^-[bls]+$/, operands: true },
+  comm: { flags: /^-[123]+$/, operands: true },
+  sort: { flags: /^-[nrufbdhVMs]+$/, valued: ["-k", "-t"], operands: true },
+  // uniq writes its second operand: standard input only.
+  uniq: { flags: /^-[cdui]+$/, valued: ["-f", "-s"], operands: false },
+  find: {
+    flags:
+      /^(?:-(?:name|iname|path|ipath|type|maxdepth|mindepth|newer|mtime|mmin|size|regex|iregex|perm|user|group|print|print0|o|or|a|and|not|prune|empty|true|false|depth|xdev)|!|\(|\))$/,
+    operands: true,
+  },
+};
+const GIT_READ_ONLY: Record<string, ReadOnlySpec> = {
+  status: {
+    flags:
+      /^(?:-[sbz]+|--short|--branch|--porcelain(?:=v[12])?|-u\w*|--untracked-files(?:=\w+)?|--ignored)$/,
+    operands: true,
+  },
+  log: {
+    flags:
+      /^(?:-\d+|-[pz]|--oneline|--graph|--decorate(?:=\w+)?|--stat|--shortstat|--name-only|--name-status|--no-merges|--merges|--first-parent|--reverse|--all|--abbrev-commit|--no-color|--color(?:=\w+)?|--(?:format|pretty|since|until|after|before|author|grep|date|max-count|skip)=.*|--)$/,
+    valued: ["-n"],
+    operands: true,
+  },
+  diff: {
+    flags:
+      /^(?:--stat(?:=\d+)?|--shortstat|--numstat|--name-only|--name-status|--cached|--staged|-U\d+|--unified=\d+|--no-color|--color(?:=\w+)?|-w|--ignore-space-change|--ignore-all-space|--exit-code|--quiet|-M|-R|--)$/,
+    operands: true,
+  },
+  show: {
+    flags:
+      /^(?:--stat|--name-only|--name-status|--oneline|-s|--no-patch|--no-color|--color(?:=\w+)?|-U\d+|--(?:format|pretty)=.*|--)$/,
+    operands: true,
+  },
+  "rev-parse": {
+    flags:
+      /^(?:--abbrev-ref|--short(?:=\d+)?|--verify|--quiet|-q|--show-toplevel|--git-dir|--git-common-dir|--absolute-git-dir|--path-format=\w+|--symbolic-full-name|--is-inside-work-tree)$/,
+    operands: true,
+  },
+  "ls-files": {
+    flags: /^(?:-[zcmdoti]+|--others|--cached|--modified|--deleted|--exclude-standard|--)$/,
+    operands: true,
+  },
+  "for-each-ref": {
+    flags: /^(?:--(?:format|count|sort|contains|merged|no-merged|points-at)(?:=.*)?)$/,
+    operands: true,
+  },
+  "merge-base": { flags: /^(?:--is-ancestor|--all|--fork-point)$/, operands: true },
+  "cat-file": { flags: /^-[tspe]$/, operands: true },
+  describe: { flags: /^(?:--tags|--always|--long|--abbrev=\d+|--exact-match)$/, operands: true },
+  "rev-list": {
+    flags:
+      /^(?:--count|--all|--max-count=\d+|--left-right|--not|--first-parent|--no-merges|-n\d*)$/,
+    operands: true,
+  },
+  shortlog: { flags: /^-[sne]+$|^--(?:summary|numbered|email)$/, operands: true },
+  blame: {
+    flags: /^(?:-[wsef]+|-L.+|--porcelain|--line-porcelain)$/,
+    valued: ["-L"],
+    operands: true,
+  },
+  // A refspec with a destination (`+pull/1/head:refs/heads/x`) can overwrite a local branch.
+  fetch: {
+    flags: /^(?:-q|--quiet|--tags|--no-tags)$/,
+    operands: true,
+    // Only from `origin`: a fetch from another repository changes the refs the engine trusts.
+    check: (operands) =>
+      (operands[0] === undefined || operands[0] === "origin") &&
+      operands.every((operand) => !operand.includes(":")),
+  },
+};
+function allowed(spec: ReadOnlySpec, args: string[]): boolean {
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg.startsWith("-") && arg !== "-") {
+      if (spec.valued?.includes(arg)) {
+        if (args[++i] === undefined) return false;
+        continue;
+      }
+      if (!spec.flags?.test(arg)) return false;
+      continue;
+    }
+    if (arg === "!" || arg === "(" || arg === ")") {
+      if (!spec.flags?.test(arg)) return false;
+      continue;
+    }
+    // `find -name x`: the value of a find predicate.
+    operands.push(arg);
+  }
+  if (operands.length && !spec.operands) return false;
+  return spec.check ? spec.check(operands) : true;
+}
+export function readOnly(argv: string[]): boolean {
+  const [program = "", ...args] = argv;
+  if (program === "git") {
+    let index = 0;
+    while (args[index] === "-C" || args[index] === "--no-pager")
+      index += args[index] === "-C" ? 2 : 1;
+    if (args[index] === "grep") return true; // the full plain-read check follows
+    const spec = GIT_READ_ONLY[args[index] ?? ""];
+    return !!spec && allowed(spec, args.slice(index + 1));
+  }
+  // The readers (cat, ls, grep, rg, head, tail, git grep) get the full plain-read check instead.
+  if (["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail"].includes(program)) return true;
+  if (program === "sed") return sedReadOnly(args);
+  if (["awk", "gawk", "mawk", "nawk"].includes(program)) return awkReadOnly(args);
+  const spec = READ_ONLY[program];
+  return !!spec && allowed(spec, args);
+}
+
+/**
+ * sed that only prints: no `-i`, no script file, and every script free of the commands that write
+ * a file or run one (`w`, `W`, `r`, `R`, `e`, an `s///` with the `w` or `e` flag). An unknown
+ * command is not read-only.
+ */
+function sedReadOnly(args: string[]): boolean {
+  const scripts: string[] = [];
+  let given = false;
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === "-e" || arg === "--expression") {
+      const value = args[++i];
+      if (value === undefined) return false;
+      scripts.push(value);
+      given = true;
+    } else if (arg.startsWith("--expression=")) {
+      scripts.push(arg.slice(13));
+      given = true;
+    } else if (/^-e./.test(arg)) {
+      scripts.push(arg.slice(2));
+      given = true;
+    } else if (
+      /^-[nErsuz]+$/.test(arg) ||
+      /^--(?:quiet|silent|regexp-extended|separate|null-data)$/.test(arg)
+    )
+      continue;
+    else if (arg.startsWith("-")) return false;
+    else operands.push(arg);
+  }
+  if (!given) {
+    const script = operands.shift();
+    if (script === undefined) return false;
+    scripts.push(script);
+  }
+  return scripts.every(sedScriptReadOnly);
+}
+
+/**
+ * awk that only reads and prints to standard output: no script file, and a program without
+ * `system`, `getline`, a pipe or a `>` (a redirection, or a comparison it cannot tell apart).
+ */
+function awkReadOnly(args: string[]): boolean {
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === "-F" || arg === "-v") {
+      if (args[++i] === undefined) return false;
+    } else if (/^-[Fv]./.test(arg)) continue;
+    else if (arg.startsWith("-")) return false;
+    else operands.push(arg);
+  }
+  const program = operands[0];
+  return program !== undefined && !/system|getline|\||>|close\s*\(|fflush|print\s*>/.test(program);
+}
+
+/** Whether a sed script only prints: no file it reads or writes and no command it runs. */
+function sedScriptReadOnly(script: string): boolean {
+  const scanned = sedScript(script);
+  return !!scanned && !scanned.runs && !scanned.files.length;
+}
+
+/**
+ * The files a sed script reads or writes (`r`, `R`, `w`, `W`, an `s///w` flag) and whether it runs
+ * a command (`e`, an `s///e` flag), read the way sed parses it: text in `s` and `y` patterns and
+ * replacements, and after `a`, `i` and `c`, is data. Undefined when the script cannot be read.
+ */
+export function sedScript(script: string): { files: string[]; runs: boolean } | undefined {
+  const files: string[] = [];
+  let runs = false;
+  let i = 0;
+  const n = script.length;
+  /** Reads up to an unescaped `delimiter`, past it. */
+  const until = (delimiter: string): boolean => {
+    while (i < n) {
+      const c = script[i++];
+      if (c === "\\") i++;
+      else if (c === delimiter) return true;
+    }
+    return false;
+  };
+  /** The rest of the line: a file name. */
+  const restOfLine = (): string => {
+    const start = i;
+    while (i < n && script[i] !== "\n") i++;
+    return script.slice(start, i).trim();
+  };
+  while (i < n) {
+    while (i < n && /[\s;]/.test(script[i] as string)) i++;
+    if (i >= n) break;
+    // Addresses: line numbers, `$`, `/re/`, `\cREc`, ranges, steps and negation.
+    for (;;) {
+      const c = script[i];
+      if (c !== undefined && /[\d$,!~+]/.test(c)) i++;
+      else if (c === "/") {
+        i++;
+        if (!until("/")) return undefined;
+      } else if (c === "\\" && script[i + 1] !== undefined) {
+        const delimiter = script[i + 1] as string;
+        i += 2;
+        if (!until(delimiter)) return undefined;
+      } else break;
+    }
+    while (i < n && /[ \t]/.test(script[i] as string)) i++;
+    const command = script[i++];
+    if (command === undefined) break;
+    if (command === "{" || command === "}") continue;
+    if (command === "s" || command === "y") {
+      const delimiter = script[i++];
+      if (delimiter === undefined || delimiter === "\\" || delimiter === "\n") return undefined;
+      if (!until(delimiter) || !until(delimiter)) return undefined;
+      if (command === "s") {
+        while (i < n && /[gpIiMm0-9eE]/.test(script[i] as string)) {
+          if (/[eE]/.test(script[i] as string)) runs = true;
+          i++;
+        }
+        if (script[i] === "w" || script[i] === "W") {
+          i++;
+          files.push(restOfLine());
+        }
+      }
+      continue;
+    }
+    if ("aic".includes(command)) {
+      // Text to print: to the end of the line, and on past every line that ends in a backslash.
+      while (i < n && !(script[i] === "\n" && script[i - 1] !== "\\")) i++;
+      continue;
+    }
+    if ("rRwW".includes(command)) {
+      files.push(restOfLine());
+      continue;
+    }
+    if (command === "e") {
+      runs = true;
+      restOfLine();
+      continue;
+    }
+    if (":btT".includes(command)) {
+      while (i < n && !/[;\n]/.test(script[i] as string)) i++;
+      continue;
+    }
+    if ("pPdDnNgGhHxlq=QzF".includes(command)) {
+      while (i < n && /\d/.test(script[i] as string)) i++;
+      continue;
+    }
+    return undefined;
+  }
+  return { files, runs };
 }

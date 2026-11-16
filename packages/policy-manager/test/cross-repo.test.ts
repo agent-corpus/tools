@@ -80,6 +80,12 @@ describe("writes after `cd` into another repository's linked worktree", () => {
     // A `cd` later in an unbroken `&&` chain is trusted the same as the first one.
     `true && cd ${posix(wt)} && echo x > a.txt`,
     `cd ${posix(repo)} && cd .worktrees/feat && echo x > a.txt`,
+    // The script's first command, `cd` into an absolute directory that exists and can be
+    // entered, does not fail: what follows runs there, whatever joins it.
+    `cd ${posix(wt)}; echo x > a.txt`,
+    `cd ${posix(wt)}\necho x > a.txt`,
+    `cd ${posix(wt)} && echo ok > a.txt; echo x > s.txt`,
+    `cd ${posix(wt)} && ls; cat <<'EOF' > s.txt\nx\nEOF`,
     `cd ${posix(wt)} && git add -A && git commit -m x && git push -u origin HEAD && gh pr create --fill`,
   ];
   test.each(HARNESSES)("%s approves them", (harness) => {
@@ -90,12 +96,9 @@ describe("writes after `cd` into another repository's linked worktree", () => {
   // Adversarial: every form where the write can run in the session's main checkout, or in the
   // other repository's main checkout.
   const refused = () => [
-    `cd ${posix(wt)}; echo x > a.txt`,
-    `cd ${posix(wt)}\necho x > a.txt`,
     `cd ${posix(wt)} || echo x > a.txt`,
     `cd ${posix(wt)} && ls || echo x > a.txt`,
     `cd ${posix(wt)} || cd ${posix(wt)} && echo x > a.txt`,
-    `cd ${posix(wt)} && echo ok > a.txt; echo x > s.txt`,
     `cd ${posix(wt)} & echo x > a.txt`,
     `! cd ${posix(wt)} && echo x > a.txt`,
     `{ cd ${posix(wt)}; true; } && echo x > a.txt`,
@@ -106,7 +109,6 @@ describe("writes after `cd` into another repository's linked worktree", () => {
     `cd ${posix(repo)} && echo x > a.txt`,
     `cd ${posix(wt)} && cd ../.. && echo x > a.txt`,
     `{ cd ${posix(wt)} && ls; } > s.txt`,
-    `cd ${posix(wt)} && ls; cat <<'EOF' > s.txt\nx\nEOF`,
   ];
   test.each(HARNESSES)("%s sends the unsafe forms to a human", (harness) => {
     for (const command of refused())

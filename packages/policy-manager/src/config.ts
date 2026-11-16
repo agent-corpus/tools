@@ -9,7 +9,7 @@ export function hookConfig(harness: Request["harness"], cliPath: string): Record
   if (!["claude", "codex", "copilot"].includes(harness)) throw new Error("Unknown harness");
   const hooks: Record<string, unknown> = {};
   const matcher =
-    "Bash|Read|Edit|Write|apply_patch|bash|powershell|view|read_file|write_file|edit|create|exec_command|shell";
+    "Bash|Read|Edit|Write|MultiEdit|NotebookEdit|apply_patch|bash|powershell|view|read_file|write_file|edit|create|exec_command|shell";
   // Copilot documents no MCP tool name format for hooks, so only Claude and Codex see MCP calls.
   const preMatcher = harness === "copilot" ? matcher : `${matcher}|mcp__.*`;
   const phases = [

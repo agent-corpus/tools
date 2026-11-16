@@ -227,7 +227,9 @@ describe("cd into a worktree", SLOW, () => {
   test.skipIf(!links)("`cd <worktree> && rm` is judged only in the worktree", () => {
     expect(decide(`cd ${wt} && rm a.txt`, repo)).toBe("approve");
     expect(decide(`cd ${wt} && rm -r dir && rm a.txt`, repo)).toBe("approve");
-    expect(decide(`cd ${wt}; rm a.txt`, repo)).toBe("human"); // runs in the main clone if cd fails
+    // The first command, a `cd` into an existing absolute directory, does not fail.
+    expect(decide(`cd ${wt}; rm a.txt`, repo)).toBe("approve");
+    expect(decide(`ls; cd ${wt}; rm a.txt`, repo)).toBe("human"); // not first: it may fail
     expect(decide(`cd ${wt} && ls || rm a.txt`, repo)).toBe("human");
     expect(decide(`cd ${wt} || rm a.txt`, repo)).toBe("human");
   });

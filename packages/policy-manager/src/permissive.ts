@@ -23,6 +23,7 @@ import { helperMatch } from "./helpers.js";
 import { mergedEvidence, onRemote, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result, words as shellWords } from "./policy.js";
 import type { Profile } from "./profile.js";
+import { sedScript } from "./reads.js";
 import {
   deletesProtected,
   deletionScriptCwd,
@@ -366,6 +367,10 @@ const LONG_FLAGS: Record<string, Set<string>> = {
  * Over-matching only sends more to a human.
  */
 function sedScriptPaths(script: string): string[] {
+  // Parsed the way sed reads it, a replacement's text (`s/x/see .claude/`) is data, not a path;
+  // only an `r`, `w` or `e` command or flag names one. Unreadable scripts keep the wide reading.
+  const scanned = sedScript(script);
+  if (scanned && !scanned.runs) return scanned.files;
   const paths: string[] = [];
   for (const match of script.matchAll(/(?:^|[^A-Za-z\\])[eErRwW]\s*([^\n]*)/g))
     paths.push(...(match[1] ?? "").split(/[\s;]+/).filter(Boolean));

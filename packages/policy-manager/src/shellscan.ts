@@ -34,16 +34,23 @@ interface Frame {
   literal: boolean;
   bare: boolean;
   closer: ")" | "`";
-  /** The substitution opened inside double quotes, which resume after it. */
-  quoted: boolean;
+  /** The quoting the substitution was opened in, which resumes after it. */
+  resume: "" | '"' | "h";
 }
 
-export function scan(script: string): Scan {
+/**
+ * Scans a script. With `heredoc`, `script` is the body of a here-document with an unquoted
+ * delimiter, read with the shell's rules for one: everything is literal text except that a
+ * backslash escapes only `$`, a backtick, a backslash and a newline, and `$(...)`, backticks and
+ * `${...}` expand; the substitutions are read as commands.
+ */
+export function scan(script: string, heredoc = false): Scan {
   const segments: Word[][] = [];
   const stack: Frame[] = [];
   let segment: Word[] = [];
   let text = "";
-  let active = false;
+  // A here-document body is one word of text from its first character.
+  let active = heredoc;
   let literal = true;
   let bare = false;
   let redirectNext = false;
@@ -54,7 +61,7 @@ export function scan(script: string): Scan {
   /** The current word had a quote or a backslash escape in it (a quoted here-document delimiter). */
   let wordQuoted = false;
   let unterminated = false;
-  let quote: "" | "'" | '"' = "";
+  let quote: "" | "'" | '"' | "h" = heredoc ? "h" : "";
   const endWord = () => {
     if (active) {
       segment.push({
@@ -92,9 +99,9 @@ export function scan(script: string): Scan {
       text,
       active: true,
       literal: false,
-      bare: bare || quote !== '"',
+      bare: bare || quote === "",
       closer,
-      quoted: quote === '"',
+      resume: quote === "'" ? "" : quote,
     });
     segment = [];
     text = "";
@@ -111,7 +118,7 @@ export function scan(script: string): Scan {
     active = frame.active;
     literal = frame.literal;
     bare = frame.bare;
-    quote = frame.quoted ? '"' : "";
+    quote = frame.resume;
   };
   for (let i = 0; i < script.length; i++) {
     const c = script[i] as string;
@@ -121,10 +128,19 @@ export function scan(script: string): Scan {
       else text += c;
       continue;
     }
-    if (quote === '"') {
-      if (c === '"') quote = "";
-      else if (c === "\\" && next !== undefined && /[$`"\\\n]/.test(next)) text += script[++i];
-      else if (c === "$" && next === "(") {
+    if (quote === '"' || quote === "h") {
+      // In a here-document a `"` is text, and a backslash escapes only `$`, a backtick, `\` and a
+      // newline; inside double quotes it also escapes `"`.
+      if (c === '"' && quote === '"') quote = "";
+      else if (
+        c === "\\" &&
+        next !== undefined &&
+        (quote === '"' ? /[$`"\\\n]/ : /[$`\\\n]/).test(next)
+      ) {
+        if (next === "\n") i++;
+        else text += script[++i];
+        active = true;
+      } else if (c === "$" && next === "(") {
         // The body of "$(...)" runs too; read it as commands and resume the quoted word after it.
         i++;
         open(")");
@@ -236,11 +252,8 @@ export function scan(script: string): Scan {
         // With an unquoted delimiter the shell expands `$(...)`, backticks and `${...}` in the
         // body, as in a double-quoted string: those substitutions run, so they are commands here.
         if (!doc.quoted && /[$`]/.test(body)) {
-          // In the body a `"` and a backslash before it are literal; in a double-quoted string
-          // they must be escaped (`"` as `\"`, that backslash as `\\`). Other backslashes mean the
-          // same in both (they escape `$`, a backtick, `\` and a newline, and are otherwise kept).
-          const quoted = body.replace(/\\(?=")|"/g, (match) => (match === '"' ? '\\"' : "\\\\"));
-          const inner = scan(`"${quoted}"`);
+          // Read with the shell's own rules for a here-document body (see `scan`).
+          const inner = scan(body, true);
           if (!inner.complete) unterminated = true;
           // The last segment is the body itself as one word; the others are its substitutions.
           segments.push(...inner.segments.slice(0, -1));
@@ -260,7 +273,8 @@ export function scan(script: string): Scan {
     text += c;
     active = true;
   }
-  const complete = quote === "" && stack.length === 0 && !unterminated && !pending.length;
+  const complete =
+    quote === (heredoc ? "h" : "") && stack.length === 0 && !unterminated && !pending.length;
   while (stack.length) close();
   endSegment();
   return { segments, complete };

@@ -19,7 +19,7 @@ const WRITE_TOOLS = new Set([
 import { onRemote } from "./merged.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
-import { plainRead, secretPath } from "./reads.js";
+import { plainRead, readOnly, secretPath } from "./reads.js";
 import { redactText } from "./redact.js";
 import { parseShell } from "./shell.js";
 import { defaultAllowed } from "./tools.js";
@@ -271,152 +271,6 @@ export const CHAIN_APPROVED = "A read-only prefix followed by a command approved
 const quote = (word: string) =>
   /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
 /**
- * Programs and git subcommands that change nothing a later command could see, each with the only
- * options it may take: an option that writes a file (`--output`, `-o`) or runs a program
- * (`--ext-diff`, `--compress-program`) is never listed, and an unlisted option is not read-only.
- * `flags` matches a whole option word; `valued` options take the next word as their value.
- */
-interface ReadOnlySpec {
-  flags?: RegExp;
-  valued?: string[];
-  /** Operands are allowed (files, revisions, patterns). */
-  operands?: boolean;
-  /** Extra check on the operands. */
-  check?: (operands: string[]) => boolean;
-}
-const LINE_RANGE = /^(?:\d+|\$)(?:,(?:\d+|\$))?p$/;
-const READ_ONLY: Record<string, ReadOnlySpec> = {
-  pwd: { flags: /^-[LP]$/ },
-  true: {},
-  echo: { flags: /^-[neE]+$/, operands: true },
-  printf: { operands: true },
-  stat: { flags: /^-[LtFlsx]+$/, valued: ["-f", "-c"], operands: true },
-  file: { flags: /^-[bLhiz]+$/, operands: true },
-  which: { flags: /^-a$/, operands: true },
-  basename: { flags: /^-[az]$/, valued: ["-s"], operands: true },
-  dirname: { operands: true },
-  realpath: { flags: /^-[esmqz]+$/, operands: true },
-  date: { flags: /^(?:-[uRI]|-I\w+|\+.*)$/, operands: false },
-  wc: { flags: /^-[lwcmL]+$/, operands: true },
-  cut: { valued: ["-d", "-f", "-c", "-b"], flags: /^-(?:[dfcb].+|s|n)$/, operands: true },
-  tr: { flags: /^-[dsc]+$/, operands: true },
-  nl: { flags: /^-[bnv]\w*$/, operands: true },
-  column: { flags: /^-[tx]+$/, valued: ["-s"], operands: true },
-  jq: { flags: /^-[rcesnjaS]+$/, valued: ["--arg", "--argjson"], operands: true },
-  diff: {
-    flags: /^(?:-[uqNwBbiyU0-9]+|--brief|--unified(?:=\d+)?|--color(?:=\w+)?)$/,
-    operands: true,
-  },
-  cmp: { flags: /^-[bls]+$/, operands: true },
-  comm: { flags: /^-[123]+$/, operands: true },
-  sort: { flags: /^-[nrufbdhVMs]+$/, valued: ["-k", "-t"], operands: true },
-  // uniq writes its second operand: standard input only.
-  uniq: { flags: /^-[cdui]+$/, valued: ["-f", "-s"], operands: false },
-  sed: {
-    flags: /^-[nEr]+$/,
-    operands: true,
-    check: (operands) => LINE_RANGE.test(operands[0] ?? ""),
-  },
-  find: {
-    flags:
-      /^(?:-(?:name|iname|path|ipath|type|maxdepth|mindepth|newer|mtime|mmin|size|regex|iregex|perm|user|group|print|print0|o|or|a|and|not|prune|empty|true|false|depth|xdev)|!|\(|\))$/,
-    operands: true,
-  },
-};
-const GIT_READ_ONLY: Record<string, ReadOnlySpec> = {
-  status: {
-    flags:
-      /^(?:-[sbz]+|--short|--branch|--porcelain(?:=v[12])?|-u\w*|--untracked-files(?:=\w+)?|--ignored)$/,
-    operands: true,
-  },
-  log: {
-    flags:
-      /^(?:-\d+|-[pz]|--oneline|--graph|--decorate(?:=\w+)?|--stat|--shortstat|--name-only|--name-status|--no-merges|--merges|--first-parent|--reverse|--all|--abbrev-commit|--no-color|--color(?:=\w+)?|--(?:format|pretty|since|until|after|before|author|grep|date|max-count|skip)=.*|--)$/,
-    valued: ["-n"],
-    operands: true,
-  },
-  diff: {
-    flags:
-      /^(?:--stat(?:=\d+)?|--shortstat|--numstat|--name-only|--name-status|--cached|--staged|-U\d+|--unified=\d+|--no-color|--color(?:=\w+)?|-w|--ignore-space-change|--ignore-all-space|--exit-code|--quiet|-M|-R|--)$/,
-    operands: true,
-  },
-  show: {
-    flags:
-      /^(?:--stat|--name-only|--name-status|--oneline|-s|--no-patch|--no-color|--color(?:=\w+)?|-U\d+|--(?:format|pretty)=.*|--)$/,
-    operands: true,
-  },
-  "rev-parse": {
-    flags:
-      /^(?:--abbrev-ref|--short(?:=\d+)?|--verify|--quiet|-q|--show-toplevel|--git-dir|--git-common-dir|--absolute-git-dir|--path-format=\w+|--symbolic-full-name|--is-inside-work-tree)$/,
-    operands: true,
-  },
-  "ls-files": {
-    flags: /^(?:-[zcmdoti]+|--others|--cached|--modified|--deleted|--exclude-standard|--)$/,
-    operands: true,
-  },
-  "for-each-ref": {
-    flags: /^(?:--(?:format|count|sort|contains|merged|no-merged|points-at)(?:=.*)?)$/,
-    operands: true,
-  },
-  "merge-base": { flags: /^(?:--is-ancestor|--all|--fork-point)$/, operands: true },
-  "cat-file": { flags: /^-[tspe]$/, operands: true },
-  describe: { flags: /^(?:--tags|--always|--long|--abbrev=\d+|--exact-match)$/, operands: true },
-  "rev-list": {
-    flags:
-      /^(?:--count|--all|--max-count=\d+|--left-right|--not|--first-parent|--no-merges|-n\d*)$/,
-    operands: true,
-  },
-  shortlog: { flags: /^-[sne]+$|^--(?:summary|numbered|email)$/, operands: true },
-  blame: {
-    flags: /^(?:-[wsef]+|-L.+|--porcelain|--line-porcelain)$/,
-    valued: ["-L"],
-    operands: true,
-  },
-  // A refspec with a destination (`+pull/1/head:refs/heads/x`) can overwrite a local branch.
-  fetch: {
-    flags: /^(?:-q|--quiet|-p|--prune|--tags|--no-tags|--all|--depth=\d+|--unshallow)$/,
-    operands: true,
-    check: (operands) => operands.every((operand) => !operand.includes(":")),
-  },
-};
-function allowed(spec: ReadOnlySpec, args: string[]): boolean {
-  const operands: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    if (arg.startsWith("-") && arg !== "-") {
-      if (spec.valued?.includes(arg)) {
-        if (args[++i] === undefined) return false;
-        continue;
-      }
-      if (!spec.flags?.test(arg)) return false;
-      continue;
-    }
-    if (arg === "!" || arg === "(" || arg === ")") {
-      if (!spec.flags?.test(arg)) return false;
-      continue;
-    }
-    // `find -name x`: the value of a find predicate.
-    operands.push(arg);
-  }
-  if (operands.length && !spec.operands) return false;
-  return spec.check ? spec.check(operands) : true;
-}
-function readOnly(argv: string[]): boolean {
-  const [program = "", ...args] = argv;
-  if (program === "git") {
-    let index = 0;
-    while (args[index] === "-C" || args[index] === "--no-pager")
-      index += args[index] === "-C" ? 2 : 1;
-    if (args[index] === "grep") return true; // the full plain-read check follows
-    const spec = GIT_READ_ONLY[args[index] ?? ""];
-    return !!spec && allowed(spec, args.slice(index + 1));
-  }
-  // The readers (cat, ls, grep, rg, head, tail, git grep) get the full plain-read check instead.
-  if (["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail"].includes(program)) return true;
-  const spec = READ_ONLY[program];
-  return !!spec && allowed(spec, args);
-}
-/**
  * A chain (`a && b; c`) whose commands before the last only read (or `cd` into an existing
  * directory), and whose last command the engine approves on its own in every directory the `cd`s
  * could leave it in. Earlier commands change nothing the last one could see, so judging it alone
@@ -514,7 +368,31 @@ function chainApproved(request: Request, profile: Profile): boolean {
   }
   return true;
 }
+/** Hard items no step approves, the engine's included: the deterministic floor. */
+const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside"]);
+export const FLOOR_REASON =
+  "A cloud, repository, publishing or deletion command outside disposable roots needs a person";
+/**
+ * The decision for a request. The floor runs after the engine: a cloud or infrastructure write, a
+ * repository deletion, a publish or a recursive delete outside disposable roots is never approved,
+ * whatever rule approved it, and asks instead.
+ */
 export function evaluate(
+  request: Request,
+  ai?: Classification,
+  profile: Profile = strictProfile,
+): Decision {
+  const decision = evaluateSteps(request, ai, profile);
+  if (decision.decision !== "approve" || !SHELL_TOOLS.has(request.tool)) return decision;
+  const floor = hardRules(request, { ...decision, decision: "human" }, profile.scratchRoots).find(
+    // A profile with `cloudWrites: "allow"` chose to automate non-destructive cloud writes; the
+    // engine still asks for cloud deletion there.
+    (rule) => FLOOR.has(rule) && !(rule === "cloud-write" && profile.cloudWrites === "allow"),
+  );
+  return floor ? { ...result(request, "destructive", FLOOR_REASON), hard: floor } : decision;
+}
+
+function evaluateSteps(
   request: Request,
   ai?: Classification,
   profile: Profile = strictProfile,
@@ -629,7 +507,8 @@ function evaluateCore(request: Request, profile: Profile): Decision {
   const cwd = input.workdir ?? input.cwd ?? request.cwd;
   if (typeof cwd !== "string" || cwd !== request.cwd)
     return result(request, "unknown", "Execution directory differs from the reviewed directory");
-  const file = input.file_path ?? input.path;
+  // Only the target decides a file tool: `content`, `old_string` and `new_string` are data.
+  const file = input.file_path ?? input.notebook_path ?? input.path;
   if (request.tool === "apply_patch" && typeof input.command === "string") {
     const lines = input.command.split("\n");
     if (lines[0] !== "*** Begin Patch" || lines.at(-1)?.trim() !== "*** End Patch")
@@ -656,9 +535,10 @@ function evaluateCore(request: Request, profile: Profile): Decision {
     );
   }
   if (
-    ["Read", "view", "read_file", "Edit", "Write", "edit", "create", "write_file"].includes(
-      request.tool,
-    ) &&
+    [
+      ...["Read", "view", "read_file", "Edit", "Write", "edit", "create", "write_file"],
+      ...["MultiEdit", "NotebookEdit"],
+    ].includes(request.tool) &&
     typeof file === "string"
   ) {
     const write = !["Read", "view", "read_file"].includes(request.tool);

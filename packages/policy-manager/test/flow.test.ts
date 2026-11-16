@@ -969,10 +969,14 @@ describe("functions, positional parameters, parameter operations and read loops"
       ).toBe("human");
       expect(decide(`ls; cd ${wt} && S=src; ls $S`).decision).toBe("human");
       expect(decide(`bash -c 'cd ${wt} && S=src; ls $S'`).decision).toBe("human");
-      // After the chain, the cd is still allowed to have failed when judging where commands run.
+      // As the first command, a `cd` into an existing absolute directory does not fail, so what
+      // follows the chain runs there; later in the script it may fail, and the old directory stays.
+      expect(
+        decide(`ls; cd ${posix(scratch)} && S=1; echo x > n.txt`, join(root, "repo")).decision,
+      ).toBe("human");
       expect(
         decide(`cd ${posix(scratch)} && S=1; echo x > n.txt`, join(root, "repo")).decision,
-      ).toBe("human");
+      ).toBe("approve");
     },
   );
 
