@@ -549,7 +549,12 @@ function analyzeCommand(
   }
   if (program.literal && CLOUD.has(name)) {
     if (args.some((arg) => SECRET_WORD.test(arg))) rules.add("credential-read");
-    else if (!args.some((arg) => CLOUD_READ_VERB.test(arg)) && !cloudGet(args))
+    // `az bicep` compiles, lints and formats local files; it never touches the cloud.
+    else if (
+      !args.some((arg) => CLOUD_READ_VERB.test(arg)) &&
+      !cloudGet(args) &&
+      !(name === "az" && args[0] === "bicep")
+    )
       rules.add("cloud-write");
     return;
   }

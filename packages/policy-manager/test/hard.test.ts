@@ -635,3 +635,13 @@ describe("a file tool is judged by its target, never by the text it writes", () 
     expect(evaluate(r, undefined, permissive).decision).toBe("human");
   });
 });
+
+test("az bicep is local", () => {
+  const base = { ...evaluate(shell("ls"), undefined, permissive), decision: "human" as const };
+  expect(hardRules(shell("az bicep build --file main.bicep --stdout"), base)).not.toContain(
+    "cloud-write",
+  );
+  expect(hardRules(shell("az deployment group create -g x -f main.bicep"), base)).toContain(
+    "cloud-write",
+  );
+});
