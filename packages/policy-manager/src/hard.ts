@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { canonical, git, inside, resolveWord, sensitive, tempRoots } from "./evidence.js";
 import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { defaultProfilePath } from "./profile.js";
+import { readOnly } from "./reads.js";
 import { type Command, command, innerScript, scan, type Word } from "./shellscan.js";
 import type { Decision, Request } from "./types.js";
 
@@ -19,6 +20,11 @@ export const HARD_RULES = [
   "harness-settings",
   /** Writes to the policy profile itself. */
   "policy-profile",
+  /**
+   * Writing, moving, deleting or changing the policy service's own state (`acp-<uid>-*` in the
+   * temp directory: audit logs, token, socket, grants, cache). Reading the audit logs is allowed.
+   */
+  "policy-state",
   /** `git push --force`/`--mirror`, and `+` refspecs: they overwrite remote history. */
   "force-push",
   /** Deleting a local or remote branch whose commits are not verified merged. */
@@ -133,6 +139,10 @@ function configuredSettings(path: string): boolean {
     return target.startsWith(root) && name.test(target.slice(root.length));
   });
 }
+
+/** A policy service state directory (`acp-<uid>-...`, any user's) or a path inside one. */
+const POLICY_STATE = /(?:^|\/)acp-(?:\d+|user)-[^/]*(?:\/|$)/i;
+export const policyStatePath = (path: string) => POLICY_STATE.test(normalize(path));
 
 /** The hard rules a path names. */
 function pathRules(path: string, rules: Set<HardRule>, credentials: boolean): void {
@@ -265,6 +275,11 @@ const GH_DELETE: Record<string, RegExp> = {
   alias: /^(?:set|import)$/,
   config: /^set$/,
   auth: /^(?:refresh|login|logout|setup-git|token)$/,
+  issue: /^(?:delete|transfer)$/,
+  "ssh-key": /^(?:add|delete)$/,
+  "gpg-key": /^(?:add|delete)$/,
+  codespace: /^(?:create|delete|edit|stop|rebuild|cp|ssh|ports)$/,
+  cs: /^(?:create|delete|edit|stop|rebuild|cp|ssh|ports)$/,
   // Merging and workflow or deploy triggers cannot be taken back. (`gh ruleset` only reads.)
   pr: /^merge$/,
   workflow: /^(?:run|enable|disable)$/,
@@ -357,15 +372,27 @@ function mutationFields(text: string): string[] | undefined {
 /**
  * Whether a `gh api` call is a floor item: any write (a non-GET method, or fields, which make it a
  * POST) outside GH_API_WRITES, any GraphQL mutation outside GH_MUTATIONS (or a pull request state
- * change), and any call whose endpoint or query cannot be read.
+ * change), and any call whose endpoint or query cannot be read. Options are read anywhere after
+ * `api`. A header that overrides the method (`X-HTTP-Method-Override`) or is not literal, and an
+ * unquoted expansion other than the endpoint (`$EXTRA`, which can split into `-X DELETE`), fail
+ * closed.
  */
-function ghApiFloor(texts: string[]): boolean {
+function ghApiFloor(words: Word[]): boolean {
+  const texts = words.map((word) => word.text);
   let endpoint: string | undefined;
+  let endpointAt = -1;
   let method: string | undefined;
   let fields = false;
   const values: string[] = [];
-  for (let k = texts.indexOf("api") + 1; k < texts.length; k++) {
+  const start = texts.indexOf("api") + 1;
+  for (let k = start; k < texts.length; k++) {
     const text = texts[k] as string;
+    const header = /^(?:-H|--header)$/.test(text)
+      ? words[k + 1]
+      : /^(?:--header=|-H.)/.test(text)
+        ? { ...(words[k] as Word), text: text.replace(/^(?:--header=|-H)/, "") }
+        : undefined;
+    if (header && (!header.literal || /x-http-method-override/i.test(header.text))) return true;
     const attached = /^(?:-X|--method=)(.+)$/.exec(text);
     if (text === "-X" || text === "--method") method = texts[++k];
     else if (attached) method = attached[1];
@@ -380,8 +407,12 @@ function ghApiFloor(texts: string[]): boolean {
       if (text === "--input") k++;
       values.push("@");
     } else if (/^-[Htqp]$|^--(?:header|jq|template|hostname|cache|preview)$/.test(text)) k++;
-    else if (!text.startsWith("-") && endpoint === undefined) endpoint = text;
+    else if (!text.startsWith("-") && endpoint === undefined) {
+      endpoint = text;
+      endpointAt = k;
+    }
   }
+  if (words.some((word, k) => k >= start && k !== endpointAt && word.bare)) return true;
   const effective = (method ?? (fields ? "POST" : "GET")).toUpperCase();
   // A call with no method and no fields is a GET, whatever the endpoint; a write to an endpoint
   // that cannot be read is a floor item.
@@ -433,17 +464,148 @@ function variableReply(endpoint: string): boolean {
   );
 }
 
+/**
+ * Options a CLI accepts before its command words: `valued` take the next word as their value,
+ * `flags` take none. `--name=value` and a short option with its value attached are read as one.
+ */
+const KUBE_VALUED =
+  /^(?:-n|--namespace|--context|--cluster|--user|-s|--server|--kubeconfig|--token|--as|--as-group|--as-uid|--request-timeout|--certificate-authority|--client-certificate|--client-key|--tls-server-name|--cache-dir|-v|--v|--log-file|--profile|--profile-output|--username|--password)$/;
+const KUBE_FLAGS =
+  /^(?:--insecure-skip-tls-verify|--match-server-version|--warnings-as-errors|-h|--help)$/;
+const GLOBALS: Record<string, { valued: RegExp; flags: RegExp }> = {
+  // `-h` is help in gh, but is treated as unknown so a word after it is never trusted as the verb.
+  gh: { valued: /^(?:-R|--repo|--hostname)$/, flags: /^(?:--help|--version)$/ },
+  kubectl: { valued: KUBE_VALUED, flags: KUBE_FLAGS },
+  oc: { valued: KUBE_VALUED, flags: KUBE_FLAGS },
+  helm: {
+    valued:
+      /^(?:-n|--namespace|--kube-context|--kubeconfig|--kube-apiserver|--kube-token|--kube-as-user|--kube-as-group|--kube-ca-file|--kube-tls-server-name|--registry-config|--repository-config|--repository-cache|--burst-limit|--qps)$/,
+    flags: /^(?:--debug|--kube-insecure-skip-tls-verify|-h|--help)$/,
+  },
+  terraform: { valued: /^$/, flags: /^(?:-help|-version|--help|--version)$/ },
+  tofu: { valued: /^$/, flags: /^(?:-help|-version|--help|--version)$/ },
+  pulumi: {
+    valued: /^(?:-C|--cwd|-s|--stack|--color|-v|--verbose|--tracing|--memprofilerate)$/,
+    flags:
+      /^(?:--non-interactive|--emoji|--logflow|--logtostderr|--disable-integrity-checking|-e|-h|--help)$/,
+  },
+  npm: {
+    valued:
+      /^(?:--prefix|-C|--registry|--workspace|-w|--userconfig|--globalconfig|--cache|--loglevel|--otp|--tag|--access)$/,
+    flags:
+      /^(?:-s|--silent|-q|--quiet|-d|--verbose|-y|--yes|-g|--global|--ws|--workspaces|--dry-run|-h|--help)$/,
+  },
+  pnpm: {
+    valued: /^(?:-C|--dir|--filter|-F|--registry|--loglevel|--reporter)$/,
+    flags: /^(?:-r|--recursive|-w|--workspace-root|-s|--silent|--dry-run)$/,
+  },
+  yarn: { valued: /^(?:--cwd|--registry)$/, flags: /^(?:-s|--silent|--verbose)$/ },
+  cargo: {
+    valued: /^(?:-C|--config|-Z|--color|--manifest-path)$/,
+    flags: /^(?:-v|-vv|-q|--quiet|--frozen|--locked|--offline|--verbose)$/,
+  },
+  docker: {
+    valued: /^(?:-H|--host|-c|--context|--config|-l|--log-level|--tlscacert|--tlscert|--tlskey)$/,
+    flags: /^(?:-D|--debug|--tls|--tlsverify)$/,
+  },
+  podman: {
+    valued: /^(?:--url|-c|--connection|--root|--runroot|--log-level)$/,
+    flags: /^(?:--remote|-r)$/,
+  },
+  poetry: {
+    valued: /^(?:-C|--directory|-P|--project)$/,
+    flags: /^(?:-q|--quiet|-v|-vv|-n|--no-interaction|--ansi|--no-ansi)$/,
+  },
+  dotnet: { valued: /^$/, flags: /^(?:-d|--diagnostics|-h|--help)$/ },
+  az: {
+    valued: /^(?:--subscription|-o|--output|--query)$/,
+    flags: /^(?:--only-show-errors|--debug|--verbose|-h|--help)$/,
+  },
+  aws: {
+    valued:
+      /^(?:--profile|--region|--output|--endpoint-url|--query|--color|--ca-bundle|--cli-read-timeout|--cli-connect-timeout|--cli-binary-format)$/,
+    flags:
+      /^(?:--debug|--no-verify-ssl|--no-paginate|--no-cli-pager|--no-sign-request|--no-cli-auto-prompt)$/,
+  },
+  gcloud: {
+    valued:
+      /^(?:--project|--account|--configuration|--format|--verbosity|--impersonate-service-account|--billing-project|--flags-file|--trace-token)$/,
+    flags: /^(?:-q|--quiet|--no-user-output-enabled|--log-http|-h|--help)$/,
+  },
+};
+
+/**
+ * The first `count` command words of a CLI invocation once its known global options (and their
+ * values) are skipped, and whether an option it does not know came before them: its value could
+ * then be one of the words, or hide the real one, so the caller fails closed.
+ */
+function leading(
+  name: string,
+  args: string[],
+  count: number,
+  /** Stop at the first option after a command word (cloud CLIs take global options only first). */
+  stop = false,
+): { words: string[]; unknown: boolean } {
+  const known = GLOBALS[name];
+  const words: string[] = [];
+  let unknown = false;
+  let options = true;
+  for (let i = 0; i < args.length && words.length < count; i++) {
+    const arg = args[i] as string;
+    if (!options || arg === "-" || !arg.startsWith("-")) {
+      words.push(arg);
+      continue;
+    }
+    if (stop && words.length) break;
+    if (arg === "--") options = false;
+    else if (/^--[^=]+=/.test(arg) && known) continue;
+    else if (known?.valued.test(arg)) i++;
+    else if (known?.flags.test(arg)) continue;
+    else if (known && /^-[a-zA-Z]./.test(arg) && known.valued.test(arg.slice(0, 2))) continue;
+    else unknown = true;
+  }
+  return { words, unknown };
+}
+
+/** Whether a CLI's command word (the first, or with an unknown option any later word) matches. */
+function verbMatches(name: string, args: string[], verb: RegExp | undefined): boolean {
+  if (!verb) return false;
+  const { words, unknown } = leading(name, args, 1);
+  if (unknown) return args.some((arg) => !arg.startsWith("-") && verb.test(arg));
+  return verb.test(words[0] ?? "");
+}
+
+/** Whether `gh` runs a floor subcommand (`gh <group> <verb>`, `gh repo deploy-key add`). */
+function ghFloor(args: string[]): boolean {
+  const { words, unknown } = leading("gh", args, 3);
+  const pair = (group: string, verb: string, third = "") =>
+    GH_DELETE[group]?.test(verb) ||
+    (group === "repo" && verb === "deploy-key" && /^(?:add|delete)$/.test(third));
+  if (!unknown) return !!pair(words[0] ?? "", words[1] ?? "", words[2] ?? "");
+  // An option gh does not know came first: any later pair of words could be the subcommand.
+  const positional = args.filter((arg) => !arg.startsWith("-"));
+  return positional.some((group, k) =>
+    positional.slice(k + 1).some((verb, j) => pair(group, verb, positional[k + j + 2] ?? "")),
+  );
+}
+
 /** The floor rules for one literal program. */
 function floorRules(name: string, cmd: Command, context: Context, rules: Set<HardRule>): void {
-  const positional = cmd.args.filter((word) => !word.text.startsWith("-"));
-  const first = positional[0]?.text ?? "";
-  if (INFRA_WRITE[name]?.test(first)) rules.add("cloud-write");
-  if (name === "dotnet" && first === "nuget" && positional[1]?.text === "push")
-    rules.add("publish");
-  else if (PUBLISHERS[name]?.test(first)) rules.add("publish");
+  const texts = cmd.args.map((word) => word.text);
+  if (verbMatches(name, texts, INFRA_WRITE[name])) rules.add("cloud-write");
+  if (name === "dotnet") {
+    const { words, unknown } = leading(name, texts, 2);
+    if (
+      (words[0] === "nuget" && words[1] === "push") ||
+      (unknown && texts.includes("nuget") && texts.includes("push"))
+    )
+      rules.add("publish");
+  } else if (verbMatches(name, texts, PUBLISHERS[name])) rules.add("publish");
   if (name === "gh") {
-    if (GH_DELETE[first]?.test(positional[1]?.text ?? "")) rules.add("repo-delete");
-    if (first === "api" && ghApiFloor(cmd.args.map((word) => word.text))) rules.add("repo-delete");
+    if (ghFloor(texts)) rules.add("repo-delete");
+    const { words, unknown } = leading("gh", texts, 1);
+    if ((words[0] === "api" || (unknown && texts.includes("api"))) && ghApiFloor(cmd.args))
+      rules.add("repo-delete");
   }
   if (
     httpWrite(
@@ -637,13 +799,21 @@ function analyzeCommand(
   // Every word could name a file: arguments, redirect targets, assignment values. A here-document
   // body, and an argument with whitespace in it (a message, a PR body), is text, not a path,
   // unless the script runs text as code.
+  // The policy service's state may be read by a read-only program; anything else that names it
+  // (a write, a move, a delete, a redirection into it, an unknown program) goes to a person.
+  const programName = cmd.program?.text.split(/[\\/]/).pop() ?? "";
+  const reading =
+    !!cmd.program?.literal && readOnly([programName, ...cmd.args.map((word) => word.text)]);
   for (const word of segment) {
     if (word.heredoc) continue;
     if (!word.redirect && !context.runsText && /\s/.test(word.text)) continue;
     const text = word.text.replace(/^[A-Za-z_]\w*=/, "").replace(/^--?[\w-]+=/, "");
     if (!text) continue;
     pathRules(text, rules, true);
-    for (const path of resolutions(text, context.cwds)) pathRules(path, rules, true);
+    const resolved = resolutions(text, context.cwds);
+    for (const path of resolved) pathRules(path, rules, true);
+    if ((word.writes || (!word.redirect && !reading)) && [text, ...resolved].some(policyStatePath))
+      rules.add("policy-state");
     const relative = !text.startsWith("/") && !text.startsWith("~") && !text.startsWith("$");
     if (context.unknownCwd && relative && SETTINGS_NAMES.test(text.split("/").pop() ?? ""))
       rules.add("harness-settings");
@@ -672,13 +842,26 @@ function analyzeCommand(
   }
   if (program.literal && CLOUD.has(name)) {
     if (args.some((arg) => SECRET_WORD.test(arg))) rules.add("credential-read");
-    // `az bicep` compiles, lints and formats local files; it never touches the cloud.
-    else if (
-      !args.some((arg) => CLOUD_READ_VERB.test(arg)) &&
-      !cloudGet(args) &&
-      !(name === "az" && args[0] === "bicep")
-    )
-      rules.add("cloud-write");
+    else {
+      // The command path: the words before the first option once known global options are
+      // skipped. An option the CLI does not know before it could hide the path, so it fails closed.
+      const { words, unknown } = leading(name, args, 6, true);
+      const path: string[] = [];
+      for (const word of words) {
+        if (!/^[a-z][a-z0-9-]*$/.test(word)) break;
+        path.push(word);
+      }
+      const start = args.indexOf(path[0] ?? "");
+      const tail = start < 0 ? [] : args.slice(start);
+      // `az bicep` compiles, lints and formats local files; it never touches the cloud.
+      if (
+        unknown ||
+        (!path.some((word) => CLOUD_READ_VERB.test(word)) &&
+          !cloudGet(tail) &&
+          !(name === "az" && path[0] === "bicep"))
+      )
+        rules.add("cloud-write");
+    }
     return;
   }
   if (program.literal) floorRules(name, cmd, context, rules);
@@ -801,6 +984,7 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
   const file = (path: string, write: boolean) => {
     for (const target of [path, ...resolutions(path, cwds)]) {
       if (write) pathRules(target, rules, false);
+      if (write && policyStatePath(target)) rules.add("policy-state");
       if (sensitive(slashes(target))) rules.add("credential-read");
     }
   };

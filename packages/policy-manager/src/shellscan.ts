@@ -13,6 +13,8 @@ export interface Word {
   literal: boolean;
   /** The target of a redirection (`>`, `>>`, `<`, `<<<`, ...). */
   redirect?: boolean;
+  /** The target of a redirection that writes (`>`, `>>`, `>|`, `<>`, `&>`). */
+  writes?: boolean;
   /** Holds an unquoted expansion or substitution, which can split into words and options. */
   bare?: boolean;
   /** The body of a here-document fed to this command's standard input (also `redirect`). */
@@ -54,6 +56,7 @@ export function scan(script: string, heredoc = false): Scan {
   let literal = true;
   let bare = false;
   let redirectNext = false;
+  let redirectWrites = false;
   /** The next word is a here-document delimiter (`<<` or `<<-`). */
   let delimiterNext: "" | "<<" | "<<-" = "";
   /** Here-documents whose bodies start after the next newline, with the command they feed. */
@@ -68,9 +71,11 @@ export function scan(script: string, heredoc = false): Scan {
         text,
         literal,
         ...(redirectNext ? { redirect: true } : {}),
+        ...(redirectNext && redirectWrites ? { writes: true } : {}),
         ...(bare ? { bare: true } : {}),
       });
       redirectNext = false;
+      redirectWrites = false;
       if (delimiterNext) {
         pending.push({
           delimiter: text,
@@ -217,8 +222,10 @@ export function scan(script: string, heredoc = false): Scan {
             ? "<<-"
             : "<<"
           : "";
+      const start = i;
       while (/[<>|&-]/.test(script[i + 1] ?? "") && (script[i + 1] !== "-" || heredoc)) i++;
       redirectNext = true;
+      redirectWrites = script.slice(start, i + 1).includes(">");
       if (heredoc) delimiterNext = heredoc;
       continue;
     }

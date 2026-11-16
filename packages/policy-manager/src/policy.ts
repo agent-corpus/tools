@@ -368,7 +368,7 @@ function chainApproved(request: Request, profile: Profile): boolean {
   return true;
 }
 /** Hard items no step approves, the engine's included: the deterministic floor. */
-const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside"]);
+const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside", "policy-state"]);
 export const FLOOR_REASON =
   "A cloud, repository, publishing or deletion command outside disposable roots needs a person";
 /**
@@ -415,7 +415,7 @@ function evaluateSteps(
   // a temp directory, say), a write to them asks.
   if (core.decision === "approve" && WRITE_TOOLS.has(request.tool)) {
     const tamper = hardRules(request, { ...core, decision: "human" }, profile.scratchRoots).find(
-      (rule) => rule === "harness-settings" || rule === "policy-profile",
+      (rule) => rule === "harness-settings" || rule === "policy-profile" || rule === "policy-state",
     );
     if (tamper)
       return {

@@ -105,6 +105,7 @@ const ONCE_ONLY = new Set([
   "credential-read",
   "harness-settings",
   "policy-profile",
+  "policy-state",
   "self-approve",
   "foreign-classification-record",
   "cloud-write",

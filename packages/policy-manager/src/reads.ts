@@ -1,6 +1,6 @@
 import { accessSync, constants, existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import {
   canonical,
   git,
@@ -126,21 +126,31 @@ const SECRET_NAME =
   /^(?:\.?credentials?(?:\..*)?|auth\.json|\.claude\.json|settings(?:\.local)?\.json|config\.toml|config\.json|hooks\.json|permissions-config\.json|policy\.json|\.netrc|.*\.(?:sqlite3?|db|keychain(?:-db)?))$/i;
 
 /**
- * The policy service's audit logs (`acp-*\/audit.jsonl`, rotated `audit.N.jsonl`) and its session
- * directory itself, which a read may name: they hold decisions, not secrets. Its token and socket
- * stay secret. A glob may appear only in the `acp-*` segment.
+ * The policy service's audit logs (`audit.jsonl`, rotated `audit.N.jsonl`) in this user's own
+ * session directories (`<temp>/acp-<uid>-*`), and those directories themselves, which a read may
+ * name: they hold decisions, not secrets. The token and socket stay secret. The path must be
+ * absolute and directly under the real temp directory. A glob may appear only in the `acp-<uid>-`
+ * segment, and a glob naming the directories themselves only for `ls` and `find`, which list names.
  */
-const AUDIT_LOG = /(?:^|\/)acp-[^/]*(?:\/audit(?:\.\d+)?\.jsonl)?\/?$/i;
-export function auditLog(path: string): boolean {
+export function auditLog(path: string, program = "", glob = false): boolean {
   const slashed = path.replace(/\\/g, "/");
-  if (!AUDIT_LOG.test(slashed)) return false;
-  const outside = slashed.replace(/(?:^|\/)acp-[^/]*(?=\/|$)/, "/acp");
-  return !/[*?[\]{}]/.test(outside);
+  const uid = String(process.getuid?.() ?? "user");
+  const match = new RegExp(`^(.+)/acp-${uid}-[^/]*?(/audit(?:\\.\\d+)?\\.jsonl)?/?$`).exec(slashed);
+  if (!match) return false;
+  const [, parent = "", file] = match;
+  if (/[*?[\]{}]/.test(parent) || !isAbsolute(parent)) return false;
+  if (glob && !file && !["ls", "find"].includes(program)) return false;
+  try {
+    const real = canonical(parent);
+    return tempRoots().some((root) => root === real);
+  } catch {
+    return false;
+  }
 }
 
 /** Whether any word the shell may expand into file names is not an audit-log pattern. */
 export function unsafeGlob(argv: readonly string[], glob: readonly boolean[] | undefined): boolean {
-  return (glob ?? []).some((expands, i) => expands && !auditLog(argv[i] ?? ""));
+  return (glob ?? []).some((expands, i) => expands && !auditLog(argv[i] ?? "", argv[0], true));
 }
 
 /** Whether a path, as written or resolved, is a credential or secret-bearing file. */

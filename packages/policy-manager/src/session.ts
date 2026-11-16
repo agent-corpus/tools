@@ -37,7 +37,13 @@ export { APPROVE_GUARD };
 /** Claude Code permission modes in which a hook's ask is shown to a person. */
 const PROMPTING_MODES = new Set(["default", "acceptEdits", "plan"]);
 /** Hard items no allow rule approves, at any level: they always ask the person. */
-const NO_ALLOW = new Set(["credential-read", "harness-settings", "policy-profile", "force-push"]);
+const NO_ALLOW = new Set([
+  "credential-read",
+  "harness-settings",
+  "policy-profile",
+  "policy-state",
+  "force-push",
+]);
 /** How long after a human decision the user may still approve that exact request once. */
 export const GRANT_WINDOW_MS = 15 * 60_000;
 /** How long a harness prompt may stay open and still have its answer remembered. */

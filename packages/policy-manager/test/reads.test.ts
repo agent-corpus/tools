@@ -315,35 +315,45 @@ describe("a first cd that cannot fail leaves only its target", () => {
 });
 
 describe("the policy service's audit logs are plain reads", () => {
-  let acp: string;
+  // A session directory like the service's: directly under the real temp directory, named for
+  // this user.
+  const uid = String(process.getuid?.() ?? "user");
+  let temp: string, acp: string, other: string;
   beforeAll(() => {
-    acp = join(root, "acp-501-test");
-    mkdirSync(acp);
-    for (const file of ["audit.jsonl", "audit.00000001.jsonl", "token"])
-      writeFileSync(join(acp, file), "x");
+    temp = realpathSync(tmpdir()).replace(/\\/g, "/");
+    acp = mkdtempSync(join(temp, `acp-${uid}-pmtest-`)).replace(/\\/g, "/");
+    other = mkdtempSync(join(temp, "acp-99999-pmtest-")).replace(/\\/g, "/");
+    for (const dir of [acp, other])
+      for (const file of ["audit.jsonl", "audit.00000001.jsonl", "token"])
+        writeFileSync(join(dir, file), "x");
   });
-  const at = () => root.replace(/\\/g, "/");
+  afterAll(() => {
+    for (const dir of [acp, other]) rmSync(dir, { recursive: true, force: true });
+  });
+  const decide = (command: string, cwd = repo) =>
+    evaluate(bash(command, cwd), undefined, strictProfile).decision;
   test.each([
-    (r: string) => `cat ${r}/acp-501-test/audit.jsonl | grep -o x | sort | uniq -c`,
-    (r: string) => `grep -h x ${r}/acp-501-*/audit.jsonl | cut -c1-80`,
-    (r: string) => `wc -l ${r}/acp-501-test/audit.00000001.jsonl`,
-    (r: string) => `ls -lt ${r}/acp-501-*/audit.jsonl | head -4`,
-    (r: string) => `ls -dt ${r}/acp-501-* | head -5`,
-    (r: string) => `ls -la ${r}/acp-501-test/`,
+    () => `cat ${acp}/audit.jsonl | grep -o x | sort | uniq -c`,
+    () => `grep -h x ${temp}/acp-${uid}-*/audit.jsonl | cut -c1-80`,
+    () => `wc -l ${acp}/audit.00000001.jsonl`,
+    () => `ls -lt ${temp}/acp-${uid}-*/audit.jsonl | head -4`,
+    () => `ls -dt ${temp}/acp-${uid}-* | head -5`,
+    () => `ls -la ${acp}/`,
   ])("read: %s", (make) => {
-    const command = make(at());
-    expect(evaluate(bash(command), undefined, strictProfile).decision, command).toBe("approve");
+    expect(decide(make())).toBe("approve");
   });
   test.each([
-    (r: string) => `cat ${r}/acp-501-test/token`,
-    (r: string) => `cat ${r}/acp-501-*/token`,
-    (r: string) => `grep -r x ${r}/acp-501-test`,
-    (r: string) => `cat ${r}/acp-501-test/*.jsonl`,
-    (r: string) => `rm ${r}/acp-501-test/audit.jsonl`,
-    (r: string) => `mv ${r}/acp-501-test/audit.jsonl ${r}/x`,
-    (r: string) => `echo x >> ${r}/acp-501-test/audit.jsonl`,
-  ])("not approved: %s", (make) => {
-    const command = make(at());
-    expect(evaluate(bash(command), undefined, strictProfile).decision, command).not.toBe("approve");
+    () => `cat ${acp}/token`,
+    () => `cat ${temp}/acp-${uid}-*/token`,
+    () => `cat ${temp}/acp-${uid}-*`,
+    () => `head ${temp}/acp-${uid}-*`,
+    () => `grep x ${temp}/acp-${uid}-*`,
+    () => `cat ${temp}/acp-?${uid.slice(1)}-*/audit.jsonl`,
+    () => `grep -r x ${acp}`,
+    () => `cat ${acp}/*.jsonl`,
+    () => `cat ${other}/audit.jsonl`,
+    () => `cat ${acp.split("/").pop()}/audit.jsonl`,
+  ])("not a plain read: %s", (make) => {
+    expect(decide(make(), temp)).not.toBe("approve");
   });
 });

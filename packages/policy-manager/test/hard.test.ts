@@ -778,3 +778,126 @@ test("az bicep is local", () => {
     "cloud-write",
   );
 });
+
+describe("round 6: options before the verb, policy state, gh api options", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  const rulesOf = (command: string) => hardRules(shell(command), base());
+  test.each([
+    ["repo-delete", "gh pr -R o/r merge 1"],
+    ["repo-delete", "gh pr --repo o/r merge 1"],
+    ["repo-delete", "gh pr --repo=o/r merge 1"],
+    ["repo-delete", "gh -R o/r pr merge 1"],
+    ["repo-delete", "gh release -R o/r create v1"],
+    ["repo-delete", "gh release --repo o/r delete v1"],
+    ["repo-delete", "gh repo -R o/r delete"],
+    ["repo-delete", "gh workflow -R o/r run x"],
+    ["repo-delete", "gh variable -R o/r set X"],
+    ["repo-delete", "gh run -R o/r rerun 1"],
+    ["repo-delete", "gh --hostname h.example pr merge 1"],
+    ["repo-delete", "gh -h x pr merge 1"],
+    ["repo-delete", "gh pr --unknown x merge 1"],
+    ["repo-delete", "gh repo deploy-key add k.pub"],
+    ["repo-delete", "gh repo -R o/r deploy-key delete 1"],
+    ["repo-delete", "gh ssh-key add k.pub"],
+    ["repo-delete", "gh gpg-key delete 1"],
+    ["repo-delete", "gh issue delete 3"],
+    ["repo-delete", "gh issue -R o/r transfer 3 o/other"],
+    ["repo-delete", "gh codespace delete -c x"],
+    ["repo-delete", "gh cs ssh -c x"],
+    ["cloud-write", "kubectl -n prod delete pod x"],
+    ["cloud-write", "kubectl --context prod --namespace x delete ns y"],
+    ["cloud-write", "kubectl --unknown get delete"],
+    ["cloud-write", "helm -n x uninstall app"],
+    ["cloud-write", "helm --kube-context c upgrade app ./chart"],
+    ["cloud-write", "terraform -chdir=infra destroy"],
+    ["cloud-write", "pulumi -C infra destroy --yes"],
+    ["cloud-write", "az --subscription s group delete -n x --yes"],
+    ["cloud-write", "az group delete -n list --yes"],
+    ["cloud-write", "aws --profile p --region r s3 rm s3://b/x"],
+    ["cloud-write", "aws --unknown list s3 rm s3://b/x"],
+    ["cloud-write", "gcloud --project p compute instances delete x"],
+    ["publish", "npm --registry https://r.example publish"],
+    ["publish", "npm -w pkg publish"],
+    ["publish", "docker -H tcp://h push x/y:1"],
+    ["force-push", "git -C ../other -c x=y push --force"],
+  ])("%s: %s", (rule, command) => {
+    expect(rulesOf(command)).toContain(rule);
+  });
+  test.each([
+    "gh pr -R o/r view 1",
+    "gh release --repo o/r view v1",
+    "gh workflow -R o/r list",
+    "kubectl -n prod get pods",
+    "helm -n x list",
+    "az --subscription s group list",
+    "aws --profile p --region r s3 ls s3://b",
+    "gcloud --project p compute instances list",
+    "npm --registry https://r.example view x",
+  ])("not the floor: %s", (command) => {
+    expect(
+      rulesOf(command).filter((rule) => ["cloud-write", "repo-delete", "publish"].includes(rule)),
+    ).toEqual([]);
+  });
+
+  const state = `${tmpdir().replace(/\\/g, "/")}/acp-501-0123456789abcdef`;
+  test.each([
+    `rm ${state}/audit.jsonl`,
+    `rm -rf ${state}`,
+    `mv ${state}/audit.jsonl x`,
+    `mv x ${state}/audit.jsonl`,
+    `echo x > ${state}/audit.jsonl`,
+    `: > ${state}/audit.jsonl`,
+    `truncate -s0 ${state}/audit.jsonl`,
+    `echo x | tee ${state}/audit.jsonl`,
+    `sed -i 's/a/b/' ${state}/audit.jsonl`,
+    `cat x > ${state}/token`,
+    `sort -o ${state}/audit.jsonl x`,
+    `chmod 644 ${state}/token`,
+    `cd ${state} && rm audit.jsonl`,
+  ])("policy-state: %s", (command) => {
+    expect(rulesOf(command)).toContain("policy-state");
+  });
+  test("a policy-state write never gets a session grant or the classifier", async () => {
+    const { s, runs } = session();
+    const d = await s.decide(shell(`rm ${state}/audit.jsonl`), "PreToolUse");
+    expect(d.decision).toBe("human");
+    expect(runs()).toBe(0);
+  });
+  test.each(["Write", "Edit"])("the %s tool on policy state is a hard item", (tool) => {
+    const request: Request = {
+      sessionId: "s1",
+      harness: "claude",
+      cwd: worktree,
+      tool,
+      input: { file_path: `${state}/token`, content: "x", old_string: "a", new_string: "b" },
+    };
+    expect(hardRules(request, base())).toContain("policy-state");
+  });
+  test.each([
+    `cat ${state}/audit.jsonl`,
+    `grep -c x ${state}/audit.jsonl`,
+    `wc -l < ${state}/audit.jsonl`,
+  ])("reading state is not policy-state: %s", (command) => {
+    expect(rulesOf(command)).not.toContain("policy-state");
+  });
+
+  test.each([
+    "gh api repos/o/r/issues/1/labels -f 'labels[]=x' $EXTRA",
+    "gh api repos/o/r/issues/$A/comments -f body=x $EXTRA",
+    "gh api repos/o/r/issues/1/labels -f 'labels[]=x' -H 'X-HTTP-Method-Override: DELETE'",
+    "gh api repos/o/r/issues/1/comments -f body=x --header=X-HTTP-Method-Override:DELETE",
+    'gh api repos/o/r/issues/1/comments -f body=x -H "$H"',
+    "gh api repos/o/r/issues/1/comments -f body=x -X DELETE",
+    "gh api repos/o/r/issues/1/comments -f body=x --method PUT",
+  ])("gh api option after the endpoint: %s", (command) => {
+    expect(rulesOf(command)).toContain("repo-delete");
+  });
+  test("a header that does not change the method is fine", () => {
+    expect(
+      rulesOf("gh api repos/o/r/issues/1/comments -f body=x -H 'Accept: application/json'"),
+    ).not.toContain("repo-delete");
+  });
+});
