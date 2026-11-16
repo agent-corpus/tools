@@ -750,13 +750,21 @@ function cloudGet(args: string[]): boolean {
 }
 
 const LOOPBACK = /^(?:localhost|127(?:\.\d+){3}|\[?::1\]?|0\.0\.0\.0)(?::\d+)?$/i;
-/** The hosts of the URLs among `args`, and whether any is not loopback. */
 /**
  * Whether the request goes only to an explicit loopback host: at least one target names
  * `localhost`, `127.x.x.x` or `::1`, and nothing else looks like a target. A bare host, a
  * variable, or no recognizable URL at all is not loopback, so a write to it is a floor item.
+ * Neither is a request that reads more targets from a file (curl `-K`/`--config`, wget
+ * `-i`/`--input-file`, `-e`/`--execute`, `--config`).
  */
-function loopbackOnly(args: string[]): boolean {
+function loopbackOnly(name: string, args: string[]): boolean {
+  const fromFile =
+    name === "curl"
+      ? /^--config(?:=|$)|^-[a-zA-Z]*K/
+      : name === "wget"
+        ? /^--(?:input-file|execute|config)(?:=|$)|^-[a-zA-Z]*[ie]/
+        : undefined;
+  if (fromFile && args.some((arg) => fromFile.test(arg))) return false;
   const targets = args.filter(
     (arg) => !arg.startsWith("-") && /^(?:https?:\/\/)?[\w.[\]:-]+(?::\d+)?(?:[/?#]|$)/i.test(arg),
   );
@@ -820,5 +828,5 @@ function httpWrite(name: string, args: string[]): boolean {
     }
   } else return false;
   const effective = (method ?? (body ? "POST" : "GET")).toUpperCase();
-  return !["GET", "HEAD", "OPTIONS"].includes(effective) && !loopbackOnly(args);
+  return !["GET", "HEAD", "OPTIONS"].includes(effective) && !loopbackOnly(name, args);
 }

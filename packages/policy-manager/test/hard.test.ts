@@ -520,6 +520,33 @@ describe("unquoted here-document bodies are read with the shell's rules", () => 
       expect(hardRules(shell(`cat <<EOF\n${body}\nEOF`), base())).toContain("cloud-write");
     },
   );
+  test.each([
+    `\\\\""'$(az group delete -n x --yes)`,
+    `"\\\\"'$(az group delete -n x --yes)`,
+    "$(az group delete -n x --yes) a\\",
+  ])("review probe %s hits the floor", (body) => {
+    expect(hardRules(shell(`cat <<EOF\n${body}\nEOF`), base())).toContain("cloud-write");
+  });
+  test("every short body around a live substitution hits the floor", () => {
+    // Every prefix and suffix up to 4 characters over \ " ' space x. The substitution is live
+    // unless an odd run of backslashes escapes its `$`.
+    const alphabet = ["\\", '"', "'", " ", "x"];
+    const words: string[][] = [[""]];
+    for (let n = 1; n <= 4; n++)
+      words.push((words[n - 1] as string[]).flatMap((w) => alphabet.map((c) => w + c)));
+    const misses: string[] = [];
+    for (let n = 0; n <= 4; n++)
+      for (let a = 0; a <= n; a++)
+        for (const prefix of words[a] as string[]) {
+          if ((/\\*$/.exec(prefix)?.[0].length ?? 0) % 2 === 1) continue;
+          for (const suffix of words[n - a] as string[]) {
+            const body = `${prefix}$(az group delete -n x)${suffix}`;
+            if (!hardRules(shell(`cat <<EOF\n${body}\nEOF`), base()).includes("cloud-write"))
+              misses.push(body);
+          }
+        }
+    expect(misses).toEqual([]);
+  });
   test("an escaped substitution is text, as in the shell", () => {
     expect(hardRules(shell("cat <<EOF\nnot run: \\$(az group delete -n x)\nEOF"), base())).toEqual(
       expect.not.arrayContaining(["force-push"]),
@@ -540,6 +567,16 @@ describe("the floor fails closed when it cannot read the target", () => {
     ["cloud-write", "curl -d x=1 api.internal:8080/v1"],
     ["cloud-write", "wget --post-data=x api.example.com/x"],
     ["cloud-write", "curl -X DELETE http://localhost:3000/x https://api.example.com/y"],
+    ["cloud-write", "curl -X DELETE management.azure.com/subscriptions/x/resourceGroups/y"],
+    ["cloud-write", "curl -X DELETE --url management.azure.com/x"],
+    ["cloud-write", "curl -X DELETE $URL"],
+    ["cloud-write", 'curl -X DELETE "$URL/x"'],
+    ["cloud-write", "curl -X POST -K cfg"],
+    ["cloud-write", "curl -X POST -K cfg http://localhost/x"],
+    ["cloud-write", "curl -sK cfg -X POST http://localhost/x"],
+    ["cloud-write", "wget --method=DELETE evil.example/a"],
+    ["cloud-write", "wget --method=DELETE -i urls.txt http://localhost/x"],
+    ["cloud-write", "curl -X DELETE http://localhost.evil.example/x"],
     ["rm-outside", "rm -rf ~other/x"],
   ])("%s: %s", (rule, command) => {
     expect(hardRules(shell(command), base())).toContain(rule);
@@ -548,6 +585,7 @@ describe("the floor fails closed when it cannot read the target", () => {
     "curl -X POST http://localhost:3000/api",
     "curl -X DELETE 127.0.0.1:8080/x",
     "curl -d x=1 http://[::1]:9000/y",
+    "curl -i -X POST http://localhost:3000/api",
   ])("explicit loopback only is exempt: %s", (command) => {
     expect(hardRules(shell(command), base())).not.toContain("cloud-write");
   });
