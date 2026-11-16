@@ -231,6 +231,7 @@ describe("destructive requests follow recoverability", () => {
     "aws s3 rb s3://bucket --force",
     "gcloud projects delete p",
     "pulumi destroy --yes",
+    "curl -X DELETE https://example.com/x",
     "git clean -fdx {a,b}",
   ])("%s stays with a person even on a confident recoverable verdict", (command) => {
     const r = request(command);
@@ -245,25 +246,26 @@ describe("destructive requests follow recoverability", () => {
   });
 
   // Other destructive requests go to the classifier, which approves only what is recoverable.
-  test.each([
-    "rm -rf build",
-    "git reflog expire --all",
-    "git stash drop",
-    "curl -X DELETE https://example.com/x",
-    "sudo ls",
-  ])("%s follows the classifier's recoverability verdict", (command) => {
-    const r = request(command);
-    const d = evaluate(r, undefined, permissive);
-    expect(d).toMatchObject({ decision: "human", tier: "ambiguous" });
-    const unrecoverable = verdict(r, {
-      category: "destructive",
-      confidence: 0.99,
-      recoverable: false,
-    });
-    expect(evaluate(r, unrecoverable, permissive).decision).toBe("human");
-    const recoverable = verdict(r, { category: "temp-write", confidence: 0.97, recoverable: true });
-    expect(evaluate(r, recoverable, permissive).decision).toBe("approve");
-  });
+  test.each(["rm -rf build", "git reflog expire --all", "git stash drop", "sudo ls"])(
+    "%s follows the classifier's recoverability verdict",
+    (command) => {
+      const r = request(command);
+      const d = evaluate(r, undefined, permissive);
+      expect(d).toMatchObject({ decision: "human", tier: "ambiguous" });
+      const unrecoverable = verdict(r, {
+        category: "destructive",
+        confidence: 0.99,
+        recoverable: false,
+      });
+      expect(evaluate(r, unrecoverable, permissive).decision).toBe("human");
+      const recoverable = verdict(r, {
+        category: "temp-write",
+        confidence: 0.97,
+        recoverable: true,
+      });
+      expect(evaluate(r, recoverable, permissive).decision).toBe("approve");
+    },
+  );
 
   test("an ambiguous request the AI calls destructive but unrecoverable goes to a person", () => {
     const { session: s } = session();

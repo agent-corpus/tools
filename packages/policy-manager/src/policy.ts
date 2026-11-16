@@ -270,45 +270,151 @@ export const CHAIN_APPROVED = "A read-only prefix followed by a command approved
 /** A word as a single-quoted shell word. */
 const quote = (word: string) =>
   /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
-/** Programs that change nothing a later command could see: they only read or print. */
-const READ_ONLY = new Set([
-  ...["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail", "wc", "pwd", "true"],
-  ...["echo", "printf", "stat", "file", "which", "basename", "dirname", "realpath", "date"],
-  ...["wc", "cut", "tr", "nl", "column", "jq", "diff", "cmp", "comm"],
-]);
-/** git subcommands that leave the working tree, index and local branches as they are. */
-const GIT_READ_ONLY = new Set([
-  ...["status", "log", "diff", "show", "grep", "rev-parse", "ls-files", "for-each-ref"],
-  ...["merge-base", "cat-file", "describe", "rev-list", "shortlog", "blame", "fetch"],
-]);
-const GIT_RUNS_PROGRAM = /^(?:-O|--open-files-in-pager|--upload-pack|--exec|--ext-diff|-c)/;
+/**
+ * Programs and git subcommands that change nothing a later command could see, each with the only
+ * options it may take: an option that writes a file (`--output`, `-o`) or runs a program
+ * (`--ext-diff`, `--compress-program`) is never listed, and an unlisted option is not read-only.
+ * `flags` matches a whole option word; `valued` options take the next word as their value.
+ */
+interface ReadOnlySpec {
+  flags?: RegExp;
+  valued?: string[];
+  /** Operands are allowed (files, revisions, patterns). */
+  operands?: boolean;
+  /** Extra check on the operands. */
+  check?: (operands: string[]) => boolean;
+}
+const LINE_RANGE = /^(?:\d+|\$)(?:,(?:\d+|\$))?p$/;
+const READ_ONLY: Record<string, ReadOnlySpec> = {
+  pwd: { flags: /^-[LP]$/ },
+  true: {},
+  echo: { flags: /^-[neE]+$/, operands: true },
+  printf: { operands: true },
+  stat: { flags: /^-[LtFlsx]+$/, valued: ["-f", "-c"], operands: true },
+  file: { flags: /^-[bLhiz]+$/, operands: true },
+  which: { flags: /^-a$/, operands: true },
+  basename: { flags: /^-[az]$/, valued: ["-s"], operands: true },
+  dirname: { operands: true },
+  realpath: { flags: /^-[esmqz]+$/, operands: true },
+  date: { flags: /^(?:-[uRI]|-I\w+|\+.*)$/, operands: false },
+  wc: { flags: /^-[lwcmL]+$/, operands: true },
+  cut: { valued: ["-d", "-f", "-c", "-b"], flags: /^-(?:[dfcb].+|s|n)$/, operands: true },
+  tr: { flags: /^-[dsc]+$/, operands: true },
+  nl: { flags: /^-[bnv]\w*$/, operands: true },
+  column: { flags: /^-[tx]+$/, valued: ["-s"], operands: true },
+  jq: { flags: /^-[rcesnjaS]+$/, valued: ["--arg", "--argjson"], operands: true },
+  diff: {
+    flags: /^(?:-[uqNwBbiyU0-9]+|--brief|--unified(?:=\d+)?|--color(?:=\w+)?)$/,
+    operands: true,
+  },
+  cmp: { flags: /^-[bls]+$/, operands: true },
+  comm: { flags: /^-[123]+$/, operands: true },
+  sort: { flags: /^-[nrufbdhVMs]+$/, valued: ["-k", "-t"], operands: true },
+  // uniq writes its second operand: standard input only.
+  uniq: { flags: /^-[cdui]+$/, valued: ["-f", "-s"], operands: false },
+  sed: {
+    flags: /^-[nEr]+$/,
+    operands: true,
+    check: (operands) => LINE_RANGE.test(operands[0] ?? ""),
+  },
+  find: {
+    flags:
+      /^(?:-(?:name|iname|path|ipath|type|maxdepth|mindepth|newer|mtime|mmin|size|regex|iregex|perm|user|group|print|print0|o|or|a|and|not|prune|empty|true|false|depth|xdev)|!|\(|\))$/,
+    operands: true,
+  },
+};
+const GIT_READ_ONLY: Record<string, ReadOnlySpec> = {
+  status: {
+    flags:
+      /^(?:-[sbz]+|--short|--branch|--porcelain(?:=v[12])?|-u\w*|--untracked-files(?:=\w+)?|--ignored)$/,
+    operands: true,
+  },
+  log: {
+    flags:
+      /^(?:-\d+|-[pz]|--oneline|--graph|--decorate(?:=\w+)?|--stat|--shortstat|--name-only|--name-status|--no-merges|--merges|--first-parent|--reverse|--all|--abbrev-commit|--no-color|--color(?:=\w+)?|--(?:format|pretty|since|until|after|before|author|grep|date|max-count|skip)=.*|--)$/,
+    valued: ["-n"],
+    operands: true,
+  },
+  diff: {
+    flags:
+      /^(?:--stat(?:=\d+)?|--shortstat|--numstat|--name-only|--name-status|--cached|--staged|-U\d+|--unified=\d+|--no-color|--color(?:=\w+)?|-w|--ignore-space-change|--ignore-all-space|--exit-code|--quiet|-M|-R|--)$/,
+    operands: true,
+  },
+  show: {
+    flags:
+      /^(?:--stat|--name-only|--name-status|--oneline|-s|--no-patch|--no-color|--color(?:=\w+)?|-U\d+|--(?:format|pretty)=.*|--)$/,
+    operands: true,
+  },
+  "rev-parse": {
+    flags:
+      /^(?:--abbrev-ref|--short(?:=\d+)?|--verify|--quiet|-q|--show-toplevel|--git-dir|--git-common-dir|--absolute-git-dir|--path-format=\w+|--symbolic-full-name|--is-inside-work-tree)$/,
+    operands: true,
+  },
+  "ls-files": {
+    flags: /^(?:-[zcmdoti]+|--others|--cached|--modified|--deleted|--exclude-standard|--)$/,
+    operands: true,
+  },
+  "for-each-ref": {
+    flags: /^(?:--(?:format|count|sort|contains|merged|no-merged|points-at)(?:=.*)?)$/,
+    operands: true,
+  },
+  "merge-base": { flags: /^(?:--is-ancestor|--all|--fork-point)$/, operands: true },
+  "cat-file": { flags: /^-[tspe]$/, operands: true },
+  describe: { flags: /^(?:--tags|--always|--long|--abbrev=\d+|--exact-match)$/, operands: true },
+  "rev-list": {
+    flags:
+      /^(?:--count|--all|--max-count=\d+|--left-right|--not|--first-parent|--no-merges|-n\d*)$/,
+    operands: true,
+  },
+  shortlog: { flags: /^-[sne]+$|^--(?:summary|numbered|email)$/, operands: true },
+  blame: {
+    flags: /^(?:-[wsef]+|-L.+|--porcelain|--line-porcelain)$/,
+    valued: ["-L"],
+    operands: true,
+  },
+  // A refspec with a destination (`+pull/1/head:refs/heads/x`) can overwrite a local branch.
+  fetch: {
+    flags: /^(?:-q|--quiet|-p|--prune|--tags|--no-tags|--all|--depth=\d+|--unshallow)$/,
+    operands: true,
+    check: (operands) => operands.every((operand) => !operand.includes(":")),
+  },
+};
+function allowed(spec: ReadOnlySpec, args: string[]): boolean {
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg.startsWith("-") && arg !== "-") {
+      if (spec.valued?.includes(arg)) {
+        if (args[++i] === undefined) return false;
+        continue;
+      }
+      if (!spec.flags?.test(arg)) return false;
+      continue;
+    }
+    if (arg === "!" || arg === "(" || arg === ")") {
+      if (!spec.flags?.test(arg)) return false;
+      continue;
+    }
+    // `find -name x`: the value of a find predicate.
+    operands.push(arg);
+  }
+  if (operands.length && !spec.operands) return false;
+  return spec.check ? spec.check(operands) : true;
+}
 function readOnly(argv: string[]): boolean {
   const [program = "", ...args] = argv;
-  // sed only printing a line range (`sed -n 140,170p`); sort without an output file; uniq on
-  // standard input only (a second operand is a file it writes).
-  if (program === "sed") {
-    const operands = args.filter((arg) => !/^-[nEr]+$/.test(arg));
-    return (
-      args.some((arg) => /^-[nEr]*n[nEr]*$/.test(arg)) &&
-      /^(?:\d+|\$)(?:,(?:\d+|\$))?p$/.test(operands[0] ?? "") &&
-      operands.slice(1).every((arg) => !arg.startsWith("-"))
-    );
-  }
-  if (program === "sort")
-    return !args.some((arg) => /^-[a-zA-Z]*o/.test(arg) || arg.startsWith("--output"));
-  if (program === "uniq") return args.every((arg) => arg.startsWith("-"));
-  if (program === "find")
-    return !args.some((arg) =>
-      /^-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/.test(arg),
-    );
   if (program === "git") {
     let index = 0;
     while (args[index] === "-C" || args[index] === "--no-pager")
       index += args[index] === "-C" ? 2 : 1;
-    const sub = args[index] ?? "";
-    return GIT_READ_ONLY.has(sub) && !args.some((arg) => GIT_RUNS_PROGRAM.test(arg));
+    if (args[index] === "grep") return true; // the full plain-read check follows
+    const spec = GIT_READ_ONLY[args[index] ?? ""];
+    return !!spec && allowed(spec, args.slice(index + 1));
   }
-  return READ_ONLY.has(program);
+  // The readers (cat, ls, grep, rg, head, tail, git grep) get the full plain-read check instead.
+  if (["cat", "ls", "grep", "egrep", "fgrep", "rg", "head", "tail"].includes(program)) return true;
+  const spec = READ_ONLY[program];
+  return !!spec && allowed(spec, args);
 }
 /**
  * A chain (`a && b; c`) whose commands before the last only read (or `cd` into an existing

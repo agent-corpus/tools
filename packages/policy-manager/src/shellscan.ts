@@ -17,6 +17,8 @@ export interface Word {
   bare?: boolean;
   /** The body of a here-document fed to this command's standard input (also `redirect`). */
   heredoc?: boolean;
+  /** A here-document with a quoted delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`): nothing expands. */
+  quoted?: boolean;
 }
 
 export interface Scan {
@@ -48,7 +50,9 @@ export function scan(script: string): Scan {
   /** The next word is a here-document delimiter (`<<` or `<<-`). */
   let delimiterNext: "" | "<<" | "<<-" = "";
   /** Here-documents whose bodies start after the next newline, with the command they feed. */
-  let pending: Array<{ delimiter: string; strip: boolean; segment: Word[] }> = [];
+  let pending: Array<{ delimiter: string; strip: boolean; quoted: boolean; segment: Word[] }> = [];
+  /** The current word had a quote or a backslash escape in it (a quoted here-document delimiter). */
+  let wordQuoted = false;
   let unterminated = false;
   let quote: "" | "'" | '"' = "";
   const endWord = () => {
@@ -61,11 +65,17 @@ export function scan(script: string): Scan {
       });
       redirectNext = false;
       if (delimiterNext) {
-        pending.push({ delimiter: text, strip: delimiterNext === "<<-", segment });
+        pending.push({
+          delimiter: text,
+          strip: delimiterNext === "<<-",
+          quoted: wordQuoted,
+          segment,
+        });
         delimiterNext = "";
       }
     }
     text = "";
+    wordQuoted = false;
     active = false;
     literal = true;
     bare = false;
@@ -129,12 +139,14 @@ export function scan(script: string): Scan {
       if (next === "\n") i++;
       else if (next !== undefined) {
         text += script[++i];
+        wordQuoted = true;
         active = true;
       }
       continue;
     }
     if (c === "'" || c === '"') {
       quote = c;
+      wordQuoted = true;
       active = true;
       continue;
     }
@@ -213,7 +225,22 @@ export function scan(script: string): Scan {
           lines.push(line);
         }
         if (!found) unterminated = true;
-        doc.segment.push({ text: lines.join("\n"), literal: true, redirect: true, heredoc: true });
+        const body = lines.join("\n");
+        doc.segment.push({
+          text: body,
+          literal: true,
+          redirect: true,
+          heredoc: true,
+          ...(doc.quoted ? { quoted: true } : {}),
+        });
+        // With an unquoted delimiter the shell expands `$(...)`, backticks and `${...}` in the
+        // body, as in a double-quoted string: those substitutions run, so they are commands here.
+        if (!doc.quoted && /[$`]/.test(body)) {
+          const inner = scan(`"${body.replace(/"/g, '\\"')}"`);
+          if (!inner.complete) unterminated = true;
+          // The last segment is the body itself as one word; the others are its substitutions.
+          segments.push(...inner.segments.slice(0, -1));
+        }
       }
       pending = [];
       continue;
@@ -252,6 +279,7 @@ const WRAPPERS: Record<string, string[]> = {
   xargs: ["-I", "-n", "-L", "-P", "-d", "-s", "-E", "-a", "--arg-file", "--delimiter"],
   nocorrect: [],
   noglob: [],
+  watch: ["-n", "--interval", "-q", "--equexit"],
 };
 const KEYWORDS = new Set(["then", "do", "else", "elif", "if", "while", "until", "!", "{", "}"]);
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"]);

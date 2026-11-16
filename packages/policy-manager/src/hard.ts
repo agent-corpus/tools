@@ -277,6 +277,32 @@ function floorRules(name: string, cmd: Command, context: Context, rules: Set<Har
             .find((word) => /^(?:-X|--method=)/.test(word.text))
             ?.text.replace(/^(?:-X|--method=)/, "");
     if (first === "api" && /^delete$/i.test(value ?? "")) rules.add("repo-delete");
+    // Any other method than GET, or a field (which makes gh send a POST), writes.
+    const fields = cmd.args.some((word) =>
+      /^(?:-[fF]|--(?:field|raw-field|input)(?:=|$))/.test(word.text),
+    );
+    if (first === "api" && (value !== undefined ? !/^(?:get|head)$/i.test(value) : fields))
+      rules.add("cloud-write");
+  }
+  if (
+    httpWrite(
+      name,
+      cmd.args.map((word) => word.text),
+    )
+  )
+    rules.add("cloud-write");
+  if (name === "find") {
+    const texts = cmd.args.map((word) => word.text);
+    const exec = texts.findIndex((text) => /^-(?:exec|execdir|ok|okdir)$/.test(text));
+    const deletes =
+      texts.includes("-delete") ||
+      (exec >= 0 && /^(?:.*\/)?(?:rm|rmdir|unlink|shred)$/.test(texts[exec + 1] ?? ""));
+    if (deletes) {
+      const start = cmd.args.findIndex((word) => /^[-!(]/.test(word.text));
+      const roots = cmd.args.slice(0, start < 0 ? cmd.args.length : start);
+      const targets = roots.length ? roots : [{ text: ".", literal: true } as Word];
+      if (targets.some((word) => !disposableTarget(word, context))) rules.add("rm-outside");
+    }
   }
   if (name === "rm" && cmd.args.some((word) => /^-[a-zA-Z]*[rR]|^--recursive$/.test(word.text)))
     for (const word of cmd.args) {
@@ -662,4 +688,63 @@ function cloudGet(args: string[]): boolean {
     if (named !== undefined && !/^(?:get|head)$/i.test(named)) return false;
   }
   return true;
+}
+
+const LOOPBACK = /^(?:localhost|127(?:\.\d+){3}|\[?::1\]?|0\.0\.0\.0)(?::\d+)?$/i;
+/** The hosts of the URLs among `args`, and whether any is not loopback. */
+function remoteUrl(args: string[]): boolean {
+  return args.some((arg) => {
+    const match = /^(?:https?:\/\/)([^/?#\s]+)/i.exec(arg);
+    return !!match && !LOOPBACK.test((match[1] ?? "").replace(/^[^@]*@/, ""));
+  });
+}
+/**
+ * An HTTP client sending anything but GET or HEAD to a host that is not loopback: curl (`-X`,
+ * `--request`, data or form options imply POST, `-T` a PUT, `-G` forces GET), wget (`--method`,
+ * `--post-*`, `--body-*`), httpie (`http`/`https` with a write method or data items), and
+ * PowerShell's `Invoke-RestMethod`/`Invoke-WebRequest` (`-Method`, `-Body`).
+ */
+function httpWrite(name: string, args: string[]): boolean {
+  const lower = name.toLowerCase();
+  let method: string | undefined;
+  let body = false;
+  if (name === "curl") {
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i] as string;
+      if (arg === "-X" || arg === "--request") method = args[++i];
+      else if (/^-X./.test(arg)) method = arg.slice(2);
+      else if (arg.startsWith("--request=")) method = arg.slice(10);
+      else if (
+        /^(?:-d|-F|--data|--data-\w+|--json|--form|--form-string)(?:=|$)/.test(arg) ||
+        /^-[dF]./.test(arg)
+      )
+        body = true;
+      else if (arg === "-T" || arg.startsWith("--upload-file")) method = method ?? "PUT";
+      else if (arg === "-G" || arg === "--get") method = "GET";
+    }
+  } else if (name === "wget") {
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i] as string;
+      if (arg === "--method") method = args[++i];
+      else if (arg.startsWith("--method=")) method = arg.slice(9);
+      else if (/^--(?:post|body)-(?:data|file)/.test(arg)) body = true;
+    }
+  } else if (name === "http" || name === "https" || name === "xh") {
+    const positional = args.filter((arg) => !arg.startsWith("-"));
+    if (/^[A-Z]+$/.test(positional[0] ?? "")) method = positional[0];
+    else if (
+      positional
+        .slice(1)
+        .some((item) => /^[^=:@]+(?::=|==?|@)/.test(item) && !/^[^=]+==/.test(item))
+    )
+      body = true;
+  } else if (["invoke-restmethod", "invoke-webrequest", "irm", "iwr"].includes(lower)) {
+    for (let i = 0; i < args.length; i++) {
+      const arg = (args[i] as string).toLowerCase();
+      if (arg === "-method") method = args[++i];
+      else if (arg === "-body" || arg === "-infile") body = true;
+    }
+  } else return false;
+  const effective = (method ?? (body ? "POST" : "GET")).toUpperCase();
+  return !["GET", "HEAD", "OPTIONS"].includes(effective) && remoteUrl(args);
 }

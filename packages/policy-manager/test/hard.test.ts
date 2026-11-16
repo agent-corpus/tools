@@ -400,3 +400,73 @@ describe("more data is not code", () => {
     expect(hardRules(shell(command), base())).toContain(rule);
   });
 });
+
+describe("here-documents: quoted delimiters are data, unquoted ones expand", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  test.each([
+    ["force-push", "$(git push --force origin x)"],
+    ["credential-read", "$(cat ~/.aws/credentials)"],
+    ["cloud-write", "$(az group delete -n x --yes)"],
+    ["repo-delete", "`gh repo delete o/r --yes`"],
+    ["force-push", "${X:-$(git push -f origin x)}"],
+  ])("%s runs from an unquoted body: %s", (rule, line) => {
+    expect(hardRules(shell(`cat <<EOF\n${line}\nEOF`), base())).toContain(rule);
+    for (const delimiter of ["'EOF'", '"EOF"', "\\EOF"])
+      expect(hardRules(shell(`cat > notes.md <<${delimiter}\n${line}\nEOF`), base())).toEqual([]);
+  });
+  test("the classifier never approves them", async () => {
+    for (const line of ["$(git push --force origin x)", "$(az group delete -n x --yes)"]) {
+      const { s, runs } = session();
+      const d = await s.decide(shell(`cat <<EOF\n${line}\nEOF`), "PreToolUse");
+      expect(d.decision, line).toBe("human");
+      expect(runs()).toBe(0);
+    }
+  });
+});
+
+describe("more of the floor", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  test.each([
+    ["cloud-write", "curl -X DELETE https://management.example.com/sub/x"],
+    ["cloud-write", "curl -XPATCH https://api.example.com/x"],
+    ["cloud-write", "curl --request PUT https://api.example.com/x"],
+    ["cloud-write", "curl -d '{}' https://api.example.com/repos/o/r/releases"],
+    ["cloud-write", "curl -T file.bin https://upload.example.com/x"],
+    ["cloud-write", "wget --method=DELETE https://api.example.com/x"],
+    ["cloud-write", "http DELETE https://api.example.com/x"],
+    ["cloud-write", "http https://api.example.com/x name=value"],
+    ["cloud-write", "gh api repos/o/r -f archived=true -X PATCH"],
+    ["cloud-write", "gh api repos/o/r/issues -f title=x"],
+    ["rm-outside", "find ~/proj -delete"],
+    ["rm-outside", "find /opt/data -name '*.log' -exec rm {} ;"],
+    ["cloud-write", "eval 'az group delete -n x --yes'"],
+    ["cloud-write", "bash -c 'kubectl delete ns prod'"],
+    ["cloud-write", "xargs -n1 az group delete -n"],
+    ["cloud-write", "env A=1 terraform destroy"],
+    ["cloud-write", "nohup helm uninstall app"],
+    ["cloud-write", "timeout 30 pulumi destroy --yes"],
+    ["cloud-write", "watch -n 5 kubectl delete pod x"],
+  ])("%s: %s", (rule, command) => {
+    expect(hardRules(shell(command), base())).toContain(rule);
+  });
+  test.each([
+    "curl https://api.example.com/x",
+    "curl -G -d q=1 https://api.example.com/search",
+    "curl -X POST http://localhost:3000/api",
+    "curl -X DELETE http://127.0.0.1:8080/x",
+    "gh api repos/o/r/pulls",
+    "gh api -X GET repos/o/r -f per_page=100",
+    `find ${tmpdir().replace(/\\/g, "/")}/x -delete`,
+  ])("not the floor: %s", (command) => {
+    const rules = hardRules(shell(command), base());
+    expect(
+      rules.filter((rule) => ["cloud-write", "rm-outside", "repo-delete"].includes(rule)),
+    ).toEqual([]);
+  });
+});

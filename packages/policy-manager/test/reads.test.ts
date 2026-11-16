@@ -204,3 +204,29 @@ describe("read-only prefixes cannot read secrets", () => {
     ).toBe("approve");
   });
 });
+
+describe("read-only prefixes take only listed options", () => {
+  test.each([
+    "git show HEAD:AGENTS.md --output=/tmp/nobody/.zshrc && ls",
+    "git diff --output=/tmp/nobody/.zshrc HEAD~0 && ls",
+    "git diff --output=../outside.txt && ls",
+    "git log --output=x.txt && ls",
+    "git diff --ext-diff && ls",
+    "sort -o out.txt AGENTS.md && ls",
+    "sort --compress-program=sh AGENTS.md && ls",
+    "uniq AGENTS.md out.txt && ls",
+    "sed -n 1p AGENTS.md -i && ls",
+    "git fetch origin +pull/1/head:refs/heads/x && ls",
+    "date -s 2020-01-01 && ls",
+  ])("%s is not approved", (command) => {
+    expect(evaluate(bash(command), undefined, strictProfile).decision, command).not.toBe("approve");
+  });
+  test.each([
+    "git log --oneline -3 && cat AGENTS.md",
+    "git diff --stat && ls",
+    "git status -sb; git show --stat && cat AGENTS.md",
+    "sort -u AGENTS.md | uniq -c; ls",
+  ])("%s is approved", (command) => {
+    expect(evaluate(bash(command), undefined, strictProfile).decision, command).toBe("approve");
+  });
+});
