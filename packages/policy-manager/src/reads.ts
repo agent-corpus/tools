@@ -253,7 +253,10 @@ export function enterable(target: string): string | undefined {
 export function operandReadable(cwd: string, word: string, roots: readonly string[] = []): boolean {
   const value = word.startsWith("-") ? /^-[^=]*=(.+)$/.exec(word)?.[1] : word;
   if (value === undefined) return true;
-  const revisionPath = /^[^:\s]*:(.+)$/.exec(value)?.[1];
+  // `rev:path` names a file in Git; a Windows drive path (`C:/x`) is not one.
+  const revisionPath = /^[A-Za-z]:[\\/]/.test(value)
+    ? undefined
+    : /^[^:\s]*:(.+)$/.exec(value)?.[1];
   if (secretPath(value) || (revisionPath && secretPath(revisionPath))) return false;
   const path = resolveSafe(cwd, value);
   if (path === undefined) return false;
