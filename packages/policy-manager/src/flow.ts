@@ -1669,6 +1669,12 @@ function cannotFail(ctx: Ctx, node: PipelineNode, state: State): boolean {
 }
 
 /** With `outcome`, also reports the state when the list's exit status is success. */
+/** How long one evaluation may take before it asks instead. */
+export const TIME_BUDGET_MS = 5_000;
+export const TIME_BUDGET_REASON = "Command took too long to check";
+/** When the evaluation in progress must stop, checked between commands. */
+let deadline = 0;
+
 function runList(
   ctx: Ctx,
   list: ListNode,
@@ -1676,6 +1682,7 @@ function runList(
   outcome?: { success?: State },
 ): Decision | undefined {
   for (const [index, item] of list.items.entries()) {
+    if (deadline && Date.now() > deadline) return human(ctx.request, "unknown", TIME_BUDGET_REASON);
     const last = index === list.items.length - 1;
     // Each item runs whether or not the one before it succeeded.
     settle(state);
@@ -1785,11 +1792,18 @@ export function commandDecision(
   };
   const opening = script.items[0];
   if (depth === 0 && opening && !opening.background) ctx.box.first = opening.node.first;
-  const refusal = runList(ctx, script, {
-    cwds: [...start],
-    vars: new Map(),
-    funcs: new Map(),
-  });
+  const outer = depth === 0 && !deadline;
+  if (outer) deadline = Date.now() + TIME_BUDGET_MS;
+  let refusal: Decision | undefined;
+  try {
+    refusal = runList(ctx, script, {
+      cwds: [...start],
+      vars: new Map(),
+      funcs: new Map(),
+    });
+  } finally {
+    if (outer) deadline = 0;
+  }
   if (refusal) return refusal;
   const last = ctx.box.last ?? human(request, "unknown", "Empty command");
   return ctx.box.helpers?.size && last.decision === "approve"

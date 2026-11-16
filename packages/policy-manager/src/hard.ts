@@ -26,6 +26,12 @@ export const HARD_RULES = [
    * temp directory: audit logs, token, socket, grants, cache). Reading the audit logs is allowed.
    */
   "policy-state",
+  /**
+   * A shell or interpreter that reads its script from standard input, a here-string or a file the
+   * policy cannot read (`cat x.sh | sh`, `sh < x.sh`, `. <(curl ...)`, `| pwsh`). A literal
+   * `echo`, `printf` or quoted here-document piped in is unwrapped and judged instead.
+   */
+  "opaque-script",
   /** `git push --force`/`--mirror`, and `+` refspecs: they overwrite remote history. */
   "force-push",
   /** Deleting a local or remote branch whose commits are not verified merged. */
@@ -755,6 +761,111 @@ function split(word: Word): string[] {
   return text.split(/\s+/).filter(Boolean);
 }
 
+/** Shells whose script can come from standard input; PowerShell's is never read here. */
+const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh"]);
+const POWERSHELLS = new Set(["pwsh", "powershell", "pwsh.exe", "powershell.exe"]);
+/** Interpreter options whose value is the code to run (`python3 -c`, `node -e`, `php -r`). */
+const CODE_FLAG = /^(?:-c|-e|-E|-p|-r|--eval|--print)$/;
+
+/**
+ * The text a literal producer writes to its standard output: `echo` and `printf` with literal
+ * arguments, or `cat` of a here-document (quoted, or unquoted with no expansion). Undefined when
+ * the output cannot be read here.
+ */
+function producedText(segment: Word[]): string | undefined {
+  const cmd = command(segment);
+  const name = cmd.program?.literal ? (cmd.program.text.split("/").pop() ?? "") : "";
+  if (cmd.redirects.some((word) => !word.heredoc && !word.writes)) return undefined;
+  if (name === "echo" || name === "printf") {
+    if (!cmd.args.every((word) => word.literal)) return undefined;
+    const args = cmd.args.map((word) => word.text);
+    const text = (name === "echo" ? args.filter((arg) => !/^-[neE]+$/.test(arg)) : args).join(" ");
+    return text.replace(/\\n/g, "\n");
+  }
+  if (name === "cat" && !cmd.args.length) {
+    const docs = segment.filter((word) => word.heredoc || word.herestring);
+    if (docs.length !== 1) return undefined;
+    const doc = docs[0] as Word;
+    if (!doc.literal || (doc.heredoc && !doc.quoted && /[$`\\]/.test(doc.text))) return undefined;
+    return doc.text;
+  }
+  return undefined;
+}
+
+/**
+ * A shell or interpreter in segment `k` that reads its script from standard input: from a
+ * here-string, or piped from the segment before. Literal text is judged as the script it is (the
+ * floor and every hard rule for a shell, the interpreter rule for code); anything else, a file
+ * (`sh < x.sh`), a process substitution (`. <(curl ...)`) or PowerShell, is `opaque-script`.
+ */
+function stdinScript(
+  segments: Word[][],
+  k: number,
+  context: Context,
+  rules: Set<HardRule>,
+  depth: number,
+): void {
+  const segment = segments[k] as Word[];
+  const cmd = command(segment);
+  if (!cmd.program?.literal) return;
+  const name = cmd.program.text.split(/[\\/]/).pop() ?? "";
+  const args = cmd.args.map((word) => word.text);
+  const operands = args.filter((arg) => !arg.startsWith("-"));
+  let kind: "shell" | "code" | "opaque" | undefined;
+  if (STDIN_SHELLS.has(name)) {
+    if (args.some((arg) => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg))) return; // `sh -c`: innerScript
+    if (operands.length && !args.includes("-s")) return; // `bash script.sh`
+    kind = "shell";
+  } else if (POWERSHELLS.has(name.toLowerCase())) {
+    const command = args.findIndex((arg) => /^-(?:c|command)$/i.test(arg));
+    if (command >= 0 && args[command + 1] !== "-") return;
+    if (args.some((arg) => /^-(?:f|file)$/i.test(arg))) return;
+    kind = "opaque";
+  } else if (name === "source" || name === ".") {
+    const target = cmd.args[0];
+    if (!target) return;
+    if (!target.literal)
+      kind = "opaque"; // `. <(curl ...)`, `source $f`
+    else if (/^\/dev\/(?:stdin|fd\/0)$|^-$/.test(target.text)) kind = "shell";
+    else return;
+  } else if (INTERPRETERS.has(name)) {
+    if (cmd.args.some((word, i) => i > 0 && CODE_FLAG.test(args[i - 1] ?? ""))) return;
+    if (operands.some((arg) => arg !== "-")) return; // `python3 script.py`
+    kind = "code";
+  } else return;
+  const here = segment.filter((word) => word.herestring);
+  const docs = segment.filter((word) => word.heredoc);
+  const fromFile = cmd.redirects.some(
+    (word) => !word.heredoc && !word.herestring && !word.writes && !/^\d*$/.test(word.text),
+  );
+  const piped = segment.some((word) => word.piped);
+  let text: string | undefined;
+  let known = true;
+  if (here.length) {
+    const word = here[here.length - 1] as Word;
+    if (word.literal) text = word.text;
+    else known = false;
+  } else if (docs.length)
+    return; // a here-document: judged as code where it is read
+  else if (fromFile) known = false;
+  else if (piped) {
+    text = producedText(segments[k - 1] ?? []);
+    if (text === undefined) known = false;
+  } else if (kind !== "opaque") return; // nothing is fed in (an interactive shell)
+  if (kind === "opaque" || !known || text === undefined) {
+    rules.add("opaque-script");
+    return;
+  }
+  context.runsText = true;
+  if (kind === "shell") {
+    if (depth < 4) analyzeScript(text, context, rules, depth + 1);
+    textRules(text, [...context.cwds][0] ?? "", rules);
+  } else {
+    if (codeTouchesState(text, context.cwds)) rules.add("policy-state");
+    textRules(text, [...context.cwds][0] ?? "", rules);
+  }
+}
+
 function analyzeScript(
   script: string,
   context: Context,
@@ -773,8 +884,9 @@ function analyzeScript(
     }
   // A script the scanner could not read fully is judged on its words alone.
   if (!complete) opaqueGitRules(context.words, true, rules);
-  for (const segment of segments) {
+  for (const [k, segment] of segments.entries()) {
     analyzeCommand(command(segment), segment, context, rules, depth);
+    stdinScript(segments, k, context, rules, depth);
     // A here-document fed to a shell, or in a script that runs text (`cat <<EOF | sh`), is code.
     for (const doc of segment.filter((word) => word.heredoc)) {
       if (depth >= 4) continue;

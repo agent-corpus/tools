@@ -61,23 +61,36 @@ let cache: { at: number; temp: string; dirs: string[] } | undefined;
 /**
  * The state directories: every `acp-<uid>-*` directory in each temp root, plus a sample one in the
  * temp directory the service uses, so a pattern that would match a later session's directory
- * counts too.
+ * counts too. Each is listed under both the temp directory as the system gives it (on macOS the
+ * logical `/var/folders/...`, where the service creates them) and its real path
+ * (`/private/var/folders/...`), so a pattern written against either form matches.
  */
 export function stateDirs(): string[] {
   if (cache && cache.temp === tmpdir() && Date.now() - cache.at < 2000) return cache.dirs;
   const uid = String(process.getuid?.() ?? "user");
-  const dirs = new Set<string>();
+  const sample = `acp-${uid}-0123456789abcdef01234567`;
+  const logical = trim(slashes(tmpdir()));
+  let real = logical;
   try {
-    dirs.add(`${trim(slashes(canonical(tmpdir())))}/acp-${uid}-0123456789abcdef01234567`);
+    real = trim(slashes(canonical(tmpdir())));
   } catch {
-    /* no temp directory */
+    /* judged as given */
   }
+  const dirs = new Set<string>([`${logical}/${sample}`, `${real}/${sample}`]);
   for (const root of tempRoots()) {
+    const base = trim(slashes(root));
+    let names: string[];
     try {
-      for (const name of readdirSync(root))
-        if (STATE_DIR.test(name)) dirs.add(`${trim(slashes(root))}/${name}`);
+      names = readdirSync(root);
     } catch {
-      /* unreadable: the sample still counts */
+      continue; // unreadable: the samples still count
+    }
+    for (const name of names) {
+      if (!STATE_DIR.test(name)) continue;
+      dirs.add(`${base}/${name}`);
+      // The same directory under the other form of the temp directory.
+      if (base === real && logical !== real) dirs.add(`${logical}/${name}`);
+      if (base === logical && logical !== real) dirs.add(`${real}/${name}`);
     }
   }
   cache = { at: Date.now(), temp: tmpdir(), dirs: [...dirs] };
@@ -330,6 +343,163 @@ export function findReachesState(args: string[], cwds: Iterable<string>): boolea
 /** Longest inline code judged; longer code fails closed. */
 const MAX_CODE = 100_000;
 
+/** File calls that take two paths (source and destination); every other one takes one. */
+const TWO_PATHS = new Set([
+  ...["rename", "renames", "replace", "move", "copy", "copyfile", "copy2", "copytree", "mv"],
+  ...["cp", "renameSync", "copyFileSync", "cpSync", "copyFile", "symlink", "link", "symlinkSync"],
+  ...["linkSync", "cp_r", "ln_s", "ln_sf"],
+]);
+/** Names specific enough to count with no receiver (and Perl and PHP builtins, which have none). */
+const BARE_CALLS =
+  /^(?:rmtree|rmSync|unlinkSync|rmdirSync|renameSync|copyFileSync|cpSync|writeFileSync|appendFileSync|truncateSync|chmodSync|chownSync|symlinkSync|linkSync|file_put_contents|remove_tree|rimraf|unlink|rmdir|rename|chmod|chown|chdir|truncate|symlink|link|copy|fopen)$/;
+/** Receivers whose file calls count (`os.remove`, `shutil.rmtree`, `fs.rmSync`, `FileUtils.rm_rf`). */
+const RECEIVERS = /^(?:os|shutil|fs|fsp|promises|File|FileUtils|Dir|IO|Pathname)$/;
+const FILE_CALL =
+  /(?:\b([A-Za-z_]\w*)\s*\.\s*)?\b(remove|unlink|rmtree|rmdir|removedirs|rmSync|unlinkSync|rmdirSync|rm_rf|rm_r|rm_f|rm|remove_tree|rimraf|delete|rename|renames|replace|move|copy|copyfile|copy2|copytree|renameSync|copyFileSync|cpSync|copyFile|mv|cp|cp_r|writeFileSync|appendFileSync|writeFile|appendFile|write|binwrite|write_text|write_bytes|file_put_contents|truncate|truncateSync|chmod|chmodSync|chown|chownSync|chdir|touch|symlink|symlinkSync|link|linkSync|ln_s|ln_sf|open|fopen|glob)\b(\s*\(|[ \t]+(?=[$'"\w]))/g;
+/** Methods that act on the path object they are called on (`Path('/x').unlink()`, `p.write_text(...)`). */
+const PATH_METHODS =
+  /^(?:unlink|rmdir|write_text|write_bytes|rename|replace|touch|chmod|symlink_to)$/;
+
+/**
+ * The value of a plain string literal (`'x'`, `"x"`, `r'x'`), or undefined for anything else:
+ * an f-string, a template or interpolating string, concatenation, a call, a variable.
+ */
+function plainLiteral(text: string): string | undefined {
+  const arg = text.trim();
+  const prefix = /^[rRbBuU]{0,2}/.exec(arg)?.[0] ?? "";
+  const quote = arg[prefix.length];
+  if ((quote !== "'" && quote !== '"') || arg.length < prefix.length + 2) return undefined;
+  if (arg[arg.length - 1] !== quote) return undefined;
+  const inner = arg.slice(prefix.length + 1, -1);
+  if (inner.includes(quote) || inner.includes("\\")) return undefined;
+  if (quote === '"' && /\$|#\{/.test(inner)) return undefined;
+  return inner;
+}
+
+/**
+ * The arguments of a call from `start` (just after its `(`, or after the name for a call without
+ * parentheses), split at top-level commas. Undefined when they cannot be read within the limit.
+ */
+function callArgs(code: string, start: number, parens: boolean): string[] | undefined {
+  const args: string[] = [];
+  let depth = 0;
+  let quote = "";
+  let from = start;
+  const end = Math.min(code.length, start + MAX_TARGET);
+  for (let i = start; i < end; i++) {
+    const c = code[i] as string;
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") quote = c;
+    else if ("([{".includes(c)) depth++;
+    else if (")]}".includes(c) || (!parens && (c === ";" || c === "\n") && depth === 0)) {
+      if (depth === 0) {
+        args.push(code.slice(from, i));
+        return args;
+      }
+      depth--;
+    } else if (c === "," && depth === 0) {
+      args.push(code.slice(from, i));
+      from = i + 1;
+    }
+  }
+  if (!parens && end === code.length) {
+    args.push(code.slice(from, end));
+    return args;
+  }
+  return undefined;
+}
+
+/** Variables assigned exactly once, to a plain string literal: `p = '/x'`, `const p = "/x"`. */
+function literalVariables(code: string): Map<string, string | undefined> {
+  const found = new Map<string, string | undefined>();
+  for (const line of code.split(/[\n;]/)) {
+    const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)(.*)$/.exec(line);
+    if (!match) continue;
+    const [, name = "", value = ""] = match;
+    found.set(name, found.has(name) ? undefined : plainLiteral(value));
+  }
+  return found;
+}
+
+/**
+ * Whether a file call in the code deletes, moves, copies, writes or enters a path that could be
+ * the state, or one this cannot read as a plain string literal (concatenation, `chr()`, `os.sep`,
+ * `join`, an f-string, a variable not assigned a literal once, a `listdir`/`walk` result): the
+ * state lies in the temp directory, so a computed path fails closed.
+ */
+function callsReachState(code: string, cwds: string[]): boolean {
+  const vars = literalVariables(code);
+  const value = (arg: string): string | undefined => {
+    const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
+    if (name) return vars.get(name);
+    const path = /^\s*(?:pathlib\s*\.\s*)?Path\s*\((.*)\)\s*$/.exec(arg)?.[1];
+    if (path !== undefined) return value(path);
+    return plainLiteral(arg);
+  };
+  const reaches = (arg: string | undefined) => {
+    if (arg === undefined) return true;
+    const path = value(arg);
+    return path === undefined || namesState(path, cwds, true);
+  };
+  for (const match of code.matchAll(FILE_CALL)) {
+    const [whole, receiver, name = "", opener = ""] = match;
+    const at = (match.index ?? 0) + whole.length;
+    const parens = opener.includes("(");
+    // Without parentheses only Ruby's `FileUtils.rm_rf dir`, `File.delete f` and Perl's
+    // `unlink $f`/`unlink glob(...)` forms count, so prose in a string or comment does not.
+    if (
+      !parens &&
+      !(receiver && RECEIVERS.test(receiver)) &&
+      !(/^(?:unlink|rmdir)$/.test(name) && /^[$'"]|^glob\b/.test(code.slice(at)))
+    )
+      continue;
+    // A method on an expression (`Path('/x').unlink()`, `(base / 'x').write_text(...)`).
+    const dotted =
+      !receiver && /\.\s*$/.test(code.slice(Math.max(0, (match.index ?? 0) - 8), match.index));
+    if (dotted) {
+      if (!PATH_METHODS.test(name)) continue;
+      const before = code.slice(Math.max(0, (match.index ?? 0) - MAX_TARGET), match.index ?? 0);
+      const object = /Path\s*\(([^()]*)\)\s*\.\s*$/.exec(before)?.[1];
+      if (reaches(object)) return true;
+      continue;
+    }
+    if (name === "glob" || name === "open" || name === "fopen" || name === "write") {
+      // A glob only finds names; `open`/`fopen`/`File.write` write only in a write mode.
+      if (name === "glob") continue;
+      const args = callArgs(code, at, parens);
+      if (!args) return true;
+      if (name === "write") {
+        if (receiver !== "File" && receiver !== "IO") continue;
+      } else {
+        const mode = args[1];
+        if (mode === undefined) continue;
+        const literal = plainLiteral(mode);
+        if (literal !== undefined && !/[wax+]/.test(literal)) continue;
+      }
+      if (reaches(args[0])) return true;
+      continue;
+    }
+    if (receiver ? !RECEIVERS.test(receiver) : !BARE_CALLS.test(name)) {
+      // A method on a path object: `Path('/x').unlink()` or `p.write_text(...)`.
+      // On a variable, `replace` and `rename` are string methods far more often than path ones.
+      if (!receiver || !PATH_METHODS.test(name) || /^(?:replace|rename)$/.test(name)) continue;
+      const before = code.slice(Math.max(0, (match.index ?? 0) - MAX_TARGET), match.index ?? 0);
+      const object = /Path\s*\(([^()]*)\)\s*$/.exec(before.replace(/\s*\.\s*$/, ""))?.[1];
+      if (reaches(object ?? receiver)) return true;
+      continue;
+    }
+    const args = callArgs(code, at, parens);
+    if (!args) return true;
+    const count = TWO_PATHS.has(name) ? 2 : 1;
+    for (let i = 0; i < count; i++) if (reaches(args[i])) return true;
+  }
+  return false;
+}
+
 /**
  * Whether inline interpreter code could change the state. It names `acp`; or it deletes, moves or
  * writes files and either computes the temp directory at run time (an environment variable or an
@@ -341,6 +511,8 @@ const MAX_CODE = 100_000;
 export function codeTouchesState(code: string, cwds: Iterable<string>): boolean {
   if (code.length > MAX_CODE) return true;
   if (/\bacp/i.test(code)) return true;
+  const roots = [...cwds];
+  if (callsReachState(code, roots.length ? roots : ["/"])) return true;
   const changes =
     /unlink|remove|rmtree|rmdir|\brm\b|rmSync|rename|truncate|writeFile|open\s*\(|shutil|glob|listdir|walk|readdir|system|exec|spawn|subprocess/i.test(
       code,

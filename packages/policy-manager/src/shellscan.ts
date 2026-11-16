@@ -15,6 +15,10 @@ export interface Word {
   redirect?: boolean;
   /** The target of a redirection that writes (`>`, `>>`, `>|`, `<>`, `&>`). */
   writes?: boolean;
+  /** The text of a here-string (`<<< text`), fed to the command's standard input. */
+  herestring?: boolean;
+  /** The first word of a command whose standard input is the previous command's output (`a | b`). */
+  piped?: boolean;
   /** Holds an unquoted expansion or substitution, which can split into words and options. */
   bare?: boolean;
   /** The body of a here-document fed to this command's standard input (also `redirect`). */
@@ -57,6 +61,8 @@ export function scan(script: string, heredoc = false): Scan {
   let bare = false;
   let redirectNext = false;
   let redirectWrites = false;
+  let redirectHere = false;
+  let pipeNext = false;
   /** The next word is a here-document delimiter (`<<` or `<<-`). */
   let delimiterNext: "" | "<<" | "<<-" = "";
   /** Here-documents whose bodies start after the next newline, with the command they feed. */
@@ -72,10 +78,14 @@ export function scan(script: string, heredoc = false): Scan {
         literal,
         ...(redirectNext ? { redirect: true } : {}),
         ...(redirectNext && redirectWrites ? { writes: true } : {}),
+        ...(redirectNext && redirectHere ? { herestring: true } : {}),
+        ...(pipeNext && !segment.length ? { piped: true } : {}),
         ...(bare ? { bare: true } : {}),
       });
+      if (!redirectNext) pipeNext = false;
       redirectNext = false;
       redirectWrites = false;
+      redirectHere = false;
       if (delimiterNext) {
         pending.push({
           delimiter: text,
@@ -226,6 +236,7 @@ export function scan(script: string, heredoc = false): Scan {
       while (/[<>|&-]/.test(script[i + 1] ?? "") && (script[i + 1] !== "-" || heredoc)) i++;
       redirectNext = true;
       redirectWrites = script.slice(start, i + 1).includes(">");
+      redirectHere = script.slice(start, i + 1) === "<<<";
       if (heredoc) delimiterNext = heredoc;
       continue;
     }
@@ -271,6 +282,10 @@ export function scan(script: string, heredoc = false): Scan {
     }
     if (/[;&|()\n]/.test(c)) {
       endSegment();
+      // `a | b` and `a |& b`, not `a || b`.
+      pipeNext =
+        (c === "|" && next !== "|" && script[i - 1] !== "|") ||
+        (c === "&" && script[i - 1] === "|" && pipeNext);
       continue;
     }
     if (/\s/.test(c)) {

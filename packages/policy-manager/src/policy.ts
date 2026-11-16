@@ -22,6 +22,7 @@ import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
 import { enterable, plainRead, readOnly, unsafeGlob } from "./reads.js";
 import { redactText } from "./redact.js";
 import { parseShell } from "./shell.js";
+import { scan } from "./shellscan.js";
 import { defaultAllowed } from "./tools.js";
 import {
   CATEGORIES,
@@ -367,6 +368,16 @@ function chainApproved(request: Request, profile: Profile): boolean {
   }
   return true;
 }
+/** Most words of a shell command the engine judges; here-document bodies do not count. */
+export const MAX_WORDS = 1_000;
+export const TOO_MANY_WORDS = "Command has too many words to check";
+/** Whether a script has more than MAX_WORDS words outside here-documents (one linear scan). */
+function tooManyWords(command: string): boolean {
+  let count = 0;
+  for (const segment of scan(command).segments)
+    for (const word of segment) if (!word.heredoc && ++count > MAX_WORDS) return true;
+  return false;
+}
 /** Hard items no step approves, the engine's included: the deterministic floor. */
 const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside", "policy-state"]);
 export const FLOOR_REASON =
@@ -381,6 +392,10 @@ export function evaluate(
   ai?: Classification,
   profile: Profile = strictProfile,
 ): Decision {
+  // A shell command with more words than the engine judges in time asks, before any judging.
+  const command = request.input?.command ?? request.input?.cmd;
+  if (SHELL_TOOLS.has(request.tool) && typeof command === "string" && tooManyWords(command))
+    return result(request, "unknown", TOO_MANY_WORDS);
   const decision = evaluateSteps(request, ai, profile);
   if (decision.decision !== "approve" || !SHELL_TOOLS.has(request.tool)) return decision;
   const floor = hardRules(request, { ...decision, decision: "human" }, profile.scratchRoots).find(
