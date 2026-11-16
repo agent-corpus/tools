@@ -1172,3 +1172,65 @@ describe("round 10: scripts fed to a shell, computed paths, logical temp paths, 
     expect(d.reason).toBe(TOO_MANY_WORDS);
   });
 });
+
+describe("round 11: file calls by method name, dynamic imports, subshells, awk", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  const rulesIn = (command: string) => hardRules(shell(command, worktree), base());
+  const saved = process.env.TMPDIR;
+  beforeAll(() => {
+    process.env.TMPDIR = "/tmp";
+  });
+  afterAll(() => {
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  });
+  test.each([
+    `node -e "require('fs').readdirSync('/'+'tmp').forEach(f=>require('fs').rmSync('/'+'tmp/'+f,{recursive:true}))"`,
+    `node -e "const p='/'+'tmp/x';require('fs').rmSync(p,{recursive:true})"`,
+    `node -e "require('fs/promises').rm('/'+'tmp',{recursive:true})"`,
+    `node -e "require('fs').rm('/'+'tmp/x',{recursive:true},()=>{})"`,
+    `node -p "require('fs').rmSync('/'+'tmp/x')"`,
+    `node -e "require('fs').promises.unlink(p)"`,
+    `python3 -c "__import__('os').remove(p)"`,
+    `python3 -c "import os as o; o.remove(p)"`,
+    `python3 -c "import shutil as s; s.rmtree(d)"`,
+    `python3 -c "import os; getattr(os, 'rem'+'ove')('/'+'tmp/x')"`,
+    `node -e "const m='f'+'s'; require(m)['rm'+'Sync']('/'+'tmp/x')"`,
+    `ruby -e "require 'fileutils'; FileUtils.send(:rm_rf, '/'+'tmp')"`,
+  ])("policy-state: %s", (command) => {
+    expect(rulesIn(command)).toContain("policy-state");
+  });
+  test.each([
+    `python3 -c "print(open('/etc/hosts').read().strip().replace('a','b'))"`,
+    `node -e "console.log('a-b'.replace('-','+'))"`,
+    `python3 -c "import os as o; print(o.getcwd())"`,
+    `node -e "require('fs').writeFileSync('/tmp/pm-x/out.json','{}')"`,
+  ])("not policy-state: %s", (command) => {
+    expect(rulesIn(command)).not.toContain("policy-state");
+  });
+  test.each([
+    ["publish", "echo 'npm publish' | (sh)"],
+    ["publish", "echo 'npm publish' | { sh; }"],
+    ["publish", "echo 'npm publish' | ( bash -s )"],
+    ["cloud-write", `awk 'BEGIN{system("az group delete -n x --yes")}'`],
+    ["publish", `awk 'BEGIN{print "x" | "npm publish"}'`],
+    ["repo-delete", `awk 'BEGIN{"gh repo delete o/r --yes" | getline}'`],
+    ["opaque-script", `awk '{system("rm -rf " $1)}' f`],
+    ["opaque-script", `awk '{print | cmd}' f`],
+    ["opaque-script", `awk '{print | "sh"}' f`],
+    ["opaque-script", `awk '{cmd | getline x}' f`],
+  ])("%s: %s", (rule, command) => {
+    expect(rulesIn(command)).toContain(rule);
+  });
+  test.each([
+    `awk '/foo|bar/ {print $1}' f`,
+    `awk '{printf "%s\\n", $1}' f`,
+    `awk -F, '{print $2 || "none"}' f`,
+    `awk 'BEGIN{system("ls -la")}'`,
+  ])("no hard rule: %s", (command) => {
+    expect(rulesIn(command)).toEqual([]);
+  });
+});

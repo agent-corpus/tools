@@ -282,10 +282,11 @@ export function scan(script: string, heredoc = false): Scan {
     }
     if (/[;&|()\n]/.test(c)) {
       endSegment();
-      // `a | b` and `a |& b`, not `a || b`.
+      // `a | b` and `a |& b`, not `a || b`; `a | (b)` pipes into the subshell's first command.
       pipeNext =
         (c === "|" && next !== "|" && script[i - 1] !== "|") ||
-        (c === "&" && script[i - 1] === "|" && pipeNext);
+        (c === "&" && script[i - 1] === "|" && pipeNext) ||
+        (c === "(" && pipeNext);
       continue;
     }
     if (/\s/.test(c)) {

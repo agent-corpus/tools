@@ -340,6 +340,10 @@ export function findReachesState(args: string[], cwds: Iterable<string>): boolea
   return false;
 }
 
+/** The temp directory computed at run time (case matters: `/tmp` in a path is not `TMP`). */
+const TEMP_LOOKUP =
+  /\$\{?(?:TMPDIR|TMP|TEMP)\b|environ\b[^\n]{0,40}\b(?:TMPDIR|TMP|TEMP)\b|process\.env\.(?:TMPDIR|TMP|TEMP)\b|ENV\[\s*["'](?:TMPDIR|TMP|TEMP)|getenv\(\s*["'](?:TMPDIR|TMP|TEMP)|gettempdir|tempfile\.tempdir|os\.tmpdir|tmpdir\(\)|Dir\.tmpdir|sys_get_temp_dir|GetTempPath/;
+
 /** Longest inline code judged; longer code fails closed. */
 const MAX_CODE = 100_000;
 
@@ -356,6 +360,27 @@ const BARE_CALLS =
 const RECEIVERS = /^(?:os|shutil|fs|fsp|promises|File|FileUtils|Dir|IO|Pathname)$/;
 const FILE_CALL =
   /(?:\b([A-Za-z_]\w*)\s*\.\s*)?\b(remove|unlink|rmtree|rmdir|removedirs|rmSync|unlinkSync|rmdirSync|rm_rf|rm_r|rm_f|rm|remove_tree|rimraf|delete|rename|renames|replace|move|copy|copyfile|copy2|copytree|renameSync|copyFileSync|cpSync|copyFile|mv|cp|cp_r|writeFileSync|appendFileSync|writeFile|appendFile|write|binwrite|write_text|write_bytes|file_put_contents|truncate|truncateSync|chmod|chmodSync|chown|chownSync|chdir|touch|symlink|symlinkSync|link|linkSync|ln_s|ln_sf|open|fopen|glob)\b(\s*\(|[ \t]+(?=[$'"\w]))/g;
+/**
+ * Method names that are file calls on any receiver: in the APIs that have them they mean nothing
+ * else (`require('fs').rmSync(x)`, `fsp.rm(x)`, `x.rmtree()`).
+ */
+const FILE_METHODS =
+  /^(?:rmSync|rm|unlinkSync|unlink|rmdirSync|rmdir|rmtree|removedirs|renameSync|renames|writeFileSync|appendFileSync|writeFile|appendFile|truncateSync|chmodSync|chownSync|copyFileSync|copyFile|cpSync|symlinkSync|linkSync|rm_rf|rm_r|rm_f|cp_r|ln_s|ln_sf|file_put_contents|copytree|copyfile|copy2|chdir|write_text|write_bytes)$/;
+/** A call chain that starts by loading a module: `require('fs').`, `__import__('os').`. */
+const LOADED = /\b(?:require|__import__|import_module)\s*\([^()]*\)(?:\s*\.\s*\w+)*\s*\.\s*$/;
+
+/** Names bound to a module: `import os as o`, `const f = require('fs')`, `m = __import__('os')`. */
+function moduleAliases(code: string): Set<string> {
+  const found = new Set<string>();
+  for (const match of code.matchAll(/\bimport\s+[\w.]+\s+as\s+(\w+)/g))
+    found.add(match[1] as string);
+  for (const match of code.matchAll(
+    /\b\$?(\w+)\s*=\s*(?:require|__import__|importlib\s*\.\s*import_module|import_module)\s*\(/g,
+  ))
+    found.add(match[1] as string);
+  return found;
+}
+
 /** Methods that act on the path object they are called on (`Path('/x').unlink()`, `p.write_text(...)`). */
 const PATH_METHODS =
   /^(?:unlink|rmdir|write_text|write_bytes|rename|replace|touch|chmod|symlink_to)$/;
@@ -433,6 +458,7 @@ function literalVariables(code: string): Map<string, string | undefined> {
  */
 function callsReachState(code: string, cwds: string[]): boolean {
   const vars = literalVariables(code);
+  const aliases = moduleAliases(code);
   const value = (arg: string): string | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
     if (name) return vars.get(name);
@@ -457,13 +483,22 @@ function callsReachState(code: string, cwds: string[]): boolean {
       !(/^(?:unlink|rmdir)$/.test(name) && /^[$'"]|^glob\b/.test(code.slice(at)))
     )
       continue;
-    // A method on an expression (`Path('/x').unlink()`, `(base / 'x').write_text(...)`).
-    const dotted =
-      !receiver && /\.\s*$/.test(code.slice(Math.max(0, (match.index ?? 0) - 8), match.index));
-    if (dotted) {
+    const index = match.index ?? 0;
+    const before = code.slice(Math.max(0, index - MAX_TARGET), index);
+    // A method on an expression: `Path('/x').unlink()`, `require('fs').rmSync(x)`.
+    const dotted = !receiver && /\.\s*$/.test(before.slice(-8));
+    // The path object a method is called on, when it is `Path(<literal>)`.
+    const pathObject = () =>
+      /Path\s*\(([^()]*)\)\s*\.?\s*$/.exec(before.replace(/\s*\.\s*$/, ""))?.[1];
+    // A module, an alias of one, or a chain that starts by loading one: any name is a file call.
+    const moduleCall =
+      (receiver !== undefined && (RECEIVERS.test(receiver) || aliases.has(receiver))) ||
+      (dotted && LOADED.test(before.slice(-200)));
+    if (dotted && !moduleCall && !FILE_METHODS.test(name)) {
       if (!PATH_METHODS.test(name)) continue;
-      const before = code.slice(Math.max(0, (match.index ?? 0) - MAX_TARGET), match.index ?? 0);
-      const object = /Path\s*\(([^()]*)\)\s*\.\s*$/.exec(before)?.[1];
+      // `.replace(...)`/`.rename(...)` on anything but a `Path(...)` is a string or table method.
+      const object = pathObject();
+      if (object === undefined && /^(?:replace|rename)$/.test(name)) continue;
       if (reaches(object)) return true;
       continue;
     }
@@ -483,13 +518,20 @@ function callsReachState(code: string, cwds: string[]): boolean {
       if (reaches(args[0])) return true;
       continue;
     }
-    if (receiver ? !RECEIVERS.test(receiver) : !BARE_CALLS.test(name)) {
-      // A method on a path object: `Path('/x').unlink()` or `p.write_text(...)`.
-      // On a variable, `replace` and `rename` are string methods far more often than path ones.
+    const fileCall =
+      moduleCall ||
+      ((receiver !== undefined || dotted) && FILE_METHODS.test(name)) ||
+      (receiver === undefined && !dotted && BARE_CALLS.test(name));
+    if (!fileCall) {
+      // A method on a path object: `p.write_text(...)`. On a plain variable, `replace` and
+      // `rename` are string methods far more often than path ones.
       if (!receiver || !PATH_METHODS.test(name) || /^(?:replace|rename)$/.test(name)) continue;
-      const before = code.slice(Math.max(0, (match.index ?? 0) - MAX_TARGET), match.index ?? 0);
-      const object = /Path\s*\(([^()]*)\)\s*$/.exec(before.replace(/\s*\.\s*$/, ""))?.[1];
-      if (reaches(object ?? receiver)) return true;
+      if (reaches(pathObject() ?? receiver)) return true;
+      continue;
+    }
+    // A path object's own method (`p.unlink()`, `Path(x).write_text(s)`) acts on the object.
+    if (!moduleCall && (receiver !== undefined || dotted) && PATH_METHODS.test(name)) {
+      if (reaches(pathObject() ?? receiver)) return true;
       continue;
     }
     const args = callArgs(code, at, parens);
@@ -513,18 +555,24 @@ export function codeTouchesState(code: string, cwds: Iterable<string>): boolean 
   if (/\bacp/i.test(code)) return true;
   const roots = [...cwds];
   if (callsReachState(code, roots.length ? roots : ["/"])) return true;
+  // Dynamic import or attribute indirection hides which call runs (`__import__`, `getattr`,
+  // `require(x)`, `eval`, `Function`): with a temp lookup or a path built at run time, fail closed.
+  if (
+    /__import__\s*\(|\bimportlib\b|\bgetattr\s*\(|\brequire\s*\(\s*[^'"\s)]|\beval\s*\(|\bexec\s*\(|\bFunction\s*\(|\bsend\s*\(|\bcall_user_func/.test(
+      code,
+    ) &&
+    (TEMP_LOOKUP.test(code) ||
+      /['"]\s*\+|\+\s*['"]|\bos\.sep\b|\bchr\s*\(|\.join\s*\(|\bf['"]|`[^`]*\$\{/.test(code) ||
+      /['"]\/(?:tmp|var|private)\b/.test(code))
+  )
+    return true;
   const changes =
     /unlink|remove|rmtree|rmdir|\brm\b|rmSync|rename|truncate|writeFile|open\s*\(|shutil|glob|listdir|walk|readdir|system|exec|spawn|subprocess/i.test(
       code,
     );
   if (!changes) return false;
   // The temp directory computed at run time (case matters: `/tmp` in a path is not `TMP`).
-  if (
-    /\$\{?(?:TMPDIR|TMP|TEMP)\b|environ\b[^\n]{0,40}\b(?:TMPDIR|TMP|TEMP)\b|process\.env\.(?:TMPDIR|TMP|TEMP)\b|ENV\[\s*["'](?:TMPDIR|TMP|TEMP)|getenv\(\s*["'](?:TMPDIR|TMP|TEMP)|gettempdir|tempfile\.tempdir|os\.tmpdir|tmpdir\(\)|Dir\.tmpdir|sys_get_temp_dir|GetTempPath/.test(
-      code,
-    )
-  )
-    return true;
+  if (TEMP_LOOKUP.test(code)) return true;
   const list = [...cwds];
   for (const match of code.matchAll(/(?:~\/|\/)[\w.*?[\]{}$%-][^\s'"`,;)(]*/g)) {
     // Parts filled in at run time are any name: `{x}`, `%s`, `$x`; a path that ends where code

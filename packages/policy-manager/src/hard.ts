@@ -761,6 +761,99 @@ function split(word: Word): string[] {
   return text.split(/\s+/).filter(Boolean);
 }
 
+/**
+ * The commands an awk program runs: the literal ones (`system("cmd")`, `print | "cmd"`,
+ * `"cmd" | getline`) and whether any is not a literal string. One pass that skips strings and
+ * regular expressions, so a `|` inside `/a|b/` is not a pipe.
+ */
+function awkCommands(program: string): { literal: string[]; opaque: boolean } {
+  const literal: string[] = [];
+  let opaque = false;
+  let last = ""; // the previous significant character
+  let lastString: string | undefined; // the string literal just before, if the last token was one
+  /** A string from `from`: its text, where it ends, and whether it has escapes (not judged). */
+  const readString = (from: number): [string, number, boolean] | undefined => {
+    let text = "";
+    let escaped = false;
+    for (let j = from + 1; j < program.length; j++) {
+      const c = program[j] as string;
+      if (c === "\\") {
+        escaped = true;
+        text += c + (program[++j] ?? "");
+        continue;
+      }
+      if (c === '"') return [text, j, escaped];
+      text += c;
+    }
+    return undefined;
+  };
+  const skipSpace = (from: number) => {
+    let j = from;
+    while (j < program.length && /\s/.test(program[j] as string)) j++;
+    return j;
+  };
+  for (let i = 0; i < program.length; i++) {
+    const c = program[i] as string;
+    if (/\s/.test(c)) continue;
+    if (c === '"') {
+      const read = readString(i);
+      if (!read) {
+        opaque = true;
+        break;
+      }
+      lastString = read[2] ? undefined : read[0];
+      i = read[1];
+      last = '"';
+      continue;
+    }
+    if (c === "/" && (last === "" || "(,~!&|{};:?\n".includes(last))) {
+      let j = i + 1;
+      while (j < program.length && program[j] !== "/") j += program[j] === "\\" ? 2 : 1;
+      i = j;
+      last = "/";
+      lastString = undefined;
+      continue;
+    }
+    if (c === "|" && program[i + 1] !== "|" && program[i - 1] !== "|") {
+      let j = skipSpace(i + 1 + (program[i + 1] === "&" ? 1 : 0));
+      if (program.startsWith("getline", j)) {
+        if (lastString === undefined) opaque = true;
+        else literal.push(lastString);
+      } else if (program[j] === '"') {
+        const read = readString(j);
+        // Output piped into a shell or interpreter is a script nobody can read here.
+        if (
+          !read ||
+          read[2] ||
+          /^\s*(?:\S*\/)?(?:sh|bash|zsh|dash|ksh|mksh|pwsh|powershell|python\d*(?:\.\d+)?|node|perl|ruby|php)(?:\s|$)/.test(
+            read[0],
+          )
+        )
+          opaque = true;
+        else {
+          literal.push(read[0]);
+          j = read[1];
+        }
+      } else opaque = true;
+      last = "|";
+      lastString = undefined;
+      continue;
+    }
+    if (program.startsWith("system", i) && !/\w/.test(program[i - 1] ?? "")) {
+      const open = skipSpace(i + 6);
+      if (program[open] === "(") {
+        const start = skipSpace(open + 1);
+        const read = program[start] === '"' ? readString(start) : undefined;
+        if (read && !read[2] && program[skipSpace(read[1] + 1)] === ")") literal.push(read[0]);
+        else opaque = true;
+      }
+    }
+    last = c;
+    lastString = undefined;
+  }
+  return { literal, opaque };
+}
+
 /** Shells whose script can come from standard input; PowerShell's is never read here. */
 const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh"]);
 const POWERSHELLS = new Set(["pwsh", "powershell", "pwsh.exe", "powershell.exe"]);
@@ -988,6 +1081,31 @@ function analyzeCommand(
       ...segment.filter((word) => word.heredoc),
     ].map((word) => word.text);
     if (code.some((text) => codeTouchesState(text, context.cwds))) rules.add("policy-state");
+  }
+  // awk runs commands through `system(...)` and pipes (`print | "cmd"`, `"cmd" | getline`): a
+  // literal command is judged like `sh -c`, anything else is opaque.
+  if (cmd.program?.literal && /^(?:awk|gawk|mawk|nawk)$/.test(programName)) {
+    const texts = cmd.args.map((word) => word.text);
+    let program: string | undefined;
+    for (let i = 0; i < texts.length; i++) {
+      const text = texts[i] as string;
+      if (/^-[Fvf]$/.test(text)) {
+        if (text === "-f") break; // a program file: not read here
+        i++;
+      } else if (!text.startsWith("-")) {
+        program = text;
+        break;
+      }
+    }
+    if (program !== undefined) {
+      const run = awkCommands(program);
+      if (run.opaque) rules.add("opaque-script");
+      for (const script of run.literal)
+        if (depth < 4) {
+          analyzeScript(script, context, rules, depth + 1);
+          textRules(script, [...context.cwds][0] ?? "", rules);
+        }
+    }
   }
   for (const word of segment) {
     if (word.heredoc) continue;
