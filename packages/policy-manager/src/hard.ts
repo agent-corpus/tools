@@ -808,8 +808,14 @@ function awkCommands(program: string): {
   /** Files `print > "f"` and `printf >> "f"` write, and whether a target is not a literal. */
   const writes: string[] = [];
   let writesOpaque = false;
-  /** The first word of the statement so far (`print`, `printf`, `if`...) and the paren depth. */
-  let statement = "";
+  /**
+   * Whether the program prints at all (any `print`/`printf`, even in a string: fail closed), and
+   * the paren depth. With a print anywhere, every `>`/`>>` outside parentheses is read as an
+   * output redirection, whatever control keyword (`if`, `else`, `for`, `while`, `do`) or statement
+   * it follows; a comparison there is read the same way, which only fails closed.
+   */
+  const prints = /\bprintf?\b/.test(program);
+  let braces = 0;
   let parens = 0;
   let last = ""; // the previous significant character
   let lastString: string | undefined; // the string literal just before, if the last token was one
@@ -881,14 +887,14 @@ function awkCommands(program: string): {
       lastString = undefined;
       continue;
     }
-    if ("{};\n".includes(c)) statement = "";
-    else if (c === "(") parens++;
+    if (c === "(") parens++;
     else if (c === ")") parens = Math.max(0, parens - 1);
-    else if (/[A-Za-z_]/.test(c) && statement === "" && !/\w/.test(program[i - 1] ?? ""))
-      statement = /^\w+/.exec(program.slice(i, i + 16))?.[0] ?? "";
-    // Output redirection, `print ... > "file"` or `>>`, outside parentheses (a comparison). A
-    // target that is not one string literal (a variable, a concatenation) is not judged.
-    if (c === ">" && parens === 0 && /^printf?$/.test(statement)) {
+    else if (c === "{") braces++;
+    else if (c === "}") braces = Math.max(0, braces - 1);
+    // Output redirection, `print ... > "file"` or `>>`, inside an action and outside parentheses
+    // (a pattern such as `$3 > 100`, and anything in parentheses, is a comparison). A target that
+    // is not one string literal (a variable, a concatenation) is an opaque write. `>=` compares.
+    if (c === ">" && prints && braces > 0 && parens === 0 && program[i + 1] !== "=") {
       const at = skipSpace(i + (program[i + 1] === ">" ? 2 : 1));
       const read = program[at] === '"' ? readString(at) : undefined;
       const after = read ? program[skipSpace(read[1] + 1)] : undefined;

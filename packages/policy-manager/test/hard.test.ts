@@ -1341,3 +1341,36 @@ describe("round 12: piped stages, other shells, writes inside programs, cost", (
     expect(performance.now() - start).toBeLessThan(limit);
   });
 });
+
+describe("awk output after control keywords", () => {
+  const base = () => ({
+    ...evaluate(shell("ls"), undefined, permissive),
+    decision: "human" as const,
+  });
+  const rulesIn = (command: string) => hardRules(shell(command, worktree), base());
+  const state = `${realpathSync(tmpdir()).replace(/\\/g, "/")}/acp-501-demo`;
+  test.each([
+    ["policy-state", `awk 'BEGIN{if(1) print "x" > "${state}/token"}'`],
+    ["policy-state", `awk 'BEGIN{if (0) x=1; else print "x" > "${state}/token"}'`],
+    ["policy-state", `awk '{while (i++ < 3) print $0 >> "${state}/audit.jsonl"}' f`],
+    ["policy-state", `awk 'BEGIN{for(;;) printf "x" > "${state}/token"}'`],
+    ["policy-state", `awk 'BEGIN{do print "x" > "${state}/token"; while (0)}'`],
+    ["policy-state", `awk 'BEGIN{x=1\nprint "x" > "${state}/token"}'`],
+    ["harness-settings", `awk 'BEGIN{if(1) print "x" > ".claude/settings.json"}'`],
+    ["harness-settings", `awk '{for (i=1;i<2;i++) printf "x" > ".claude/settings.json"}' f`],
+    ["opaque-script", `awk '{if ($1) print > $2}' f`],
+    ["opaque-script", `awk '{if ($1) print $1 > out}' f`],
+  ])("%s: %s", (rule, command) => {
+    expect(rulesIn(command)).toContain(rule);
+  });
+  test.each([
+    `awk '$3 > 100 {print $1}' f`,
+    `awk '{if ($1 > 3) print $1}' f`,
+    `awk '{if ($1 >= 3) print $1}' f`,
+    `awk '{for (i=1; i>0 && i<3; i++) print i}' f`,
+  ])("a comparison is not a write: %s", (command) => {
+    const rules = rulesIn(command);
+    expect(rules).not.toContain("opaque-script");
+    expect(rules).not.toContain("policy-state");
+  });
+});
