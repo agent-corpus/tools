@@ -331,6 +331,46 @@ export interface Fill {
 
 export const OUTSIDE_REPOSITORY = "Cannot verify repository and path evidence";
 
+/** A write target the engine refused only for its protected name, as written and resolved. */
+export interface ProtectedWrite {
+  word: string;
+  lexical: string;
+  path: string;
+  /** Named by `mkdir`: a directory, not a file. */
+  directory: boolean;
+}
+let protectedWrites: ProtectedWrite[] | undefined;
+export const NOTED_WRITE = "Protected write noted for a session approval";
+
+/**
+ * Runs `run` while each write target refused only because it names a protected path (not a
+ * credential path) is noted and allowed, so the rest of the request is judged as if a person had
+ * approved those writes. Session grants use it to read what a protected-path request writes.
+ */
+export function noteProtectedWrites<T>(run: () => T): { value: T; writes: ProtectedWrite[] } {
+  const previous = protectedWrites;
+  const writes: ProtectedWrite[] = [];
+  protectedWrites = writes;
+  try {
+    return { value: run(), writes };
+  } finally {
+    protectedWrites = previous;
+  }
+}
+
+/** While noting, records a protected, non-credential write target and reports it as allowed. */
+export function notedProtectedWrite(
+  word: string,
+  lexical: string,
+  path: string,
+  directory = false,
+): boolean {
+  if (!protectedWrites || sensitive(lexical) || sensitive(path)) return false;
+  if (!isProtectedPath(path) && !isProtectedPath(lexical)) return false;
+  protectedWrites.push({ word, lexical, path, directory });
+  return true;
+}
+
 export function pathEvidence(
   cwd: string,
   input: string,
@@ -339,6 +379,8 @@ export function pathEvidence(
   try {
     const lexical = resolveWord(cwd, input);
     const path = canonical(lexical);
+    if (write && notedProtectedWrite(input, lexical, path))
+      return { allowed: true, category: "worktree-write", reason: NOTED_WRITE };
     if (
       sensitive(path) ||
       sensitive(lexical) ||

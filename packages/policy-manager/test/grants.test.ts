@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -201,6 +201,116 @@ describe("session approval", () => {
     s.grant(first.requestHash, true, true);
     const d = s.review(shell("terraform apply y && rm -rf /tmp/z"), undefined, "PreToolUse");
     expect(d.decision).toBe("human");
+  });
+});
+
+describe("a remembered yes for a protected write in a compound command", () => {
+  const first = (dir: string) =>
+    `mkdir -p ${dir} && echo "test line appended $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> ${dir}/test.md && cat ${dir}/test.md`;
+  const second = (dir: string) =>
+    `echo "second line appended $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> ${dir}/test.md && cat ${dir}/test.md`;
+  const bash = (command: string): Request => ({
+    ...shell(command),
+    harness: "claude",
+    tool: "Bash",
+  });
+  // Test data is built before the repositories exist; OTHER is filled in when run.
+  const real = (command: string) => command.replaceAll("OTHER", other.replaceAll("\\", "/"));
+  function claude() {
+    const directory = join(root, `s${counter++}`);
+    mkdirSync(directory, { mode: 0o700 });
+    return new PolicySession(directory, "claude", "s1", profile, undefined, {
+      nativeRules: () => undefined,
+    });
+  }
+  /** Asks the first command, runs its effect, and reports the yes as Claude Code's PostToolUse. */
+  async function approvedFirst(dir: string) {
+    const s = claude();
+    const asked = await s.decide(bash(first(dir)), "PreToolUse", "toolu_1", "default");
+    expect([asked.decision, asked.hard, asked.reason]).toEqual([
+      "human",
+      "protected",
+      PROTECTED_PATH,
+    ]);
+    expect(asked.sessionGrantable).toBe(true);
+    // Windows may report the temp directory by its short (8.3) name, so compare the tail only.
+    expect(asked.sessionScopeLabel).toMatch(/^writes to [^,]+$/);
+    expect(asked.sessionScopeLabel?.endsWith(join(".worktrees", "feat", dir, "test.md"))).toBe(
+      true,
+    );
+    mkdirSync(join(worktree, dir), { recursive: true });
+    appendFileSync(join(worktree, dir, "test.md"), "test line\n");
+    const yes = { requestHash: asked.requestHash, phase: "PostToolUse", toolUseId: "toolu_1" };
+    expect(s.answered(yes)).toBe("session");
+    return s;
+  }
+
+  test("covers the next request that writes the same file", async () => {
+    const s = await approvedFirst(".agent-config");
+    const later = await s.decide(bash(second(".agent-config")), "PreToolUse", "toolu_2", "default");
+    expect([later.decision, later.reason]).toEqual([
+      "approve",
+      "Approved for this session by the user",
+    ]);
+    // The first command again: its `mkdir -p` only creates the file's own directory.
+    expect((await s.decide(bash(first(".agent-config")), "PreToolUse")).decision).toBe("approve");
+  });
+
+  test("approve --session covers it too", () => {
+    const { s } = session();
+    const asked = s.review(shell(first(".agent-config/codex")), undefined, "PreToolUse");
+    expect(asked.sessionGrantable).toBe(true);
+    expect(s.grant(asked.requestHash, true, true).scope).toBe("session");
+    expect(s.review(shell(second(".agent-config/codex")), undefined, "PreToolUse").decision).toBe(
+      "approve",
+    );
+  });
+
+  test.each([
+    [
+      "also writes a different protected file",
+      `${second(".agent-config")} && echo x >> .agent-config/other.md`,
+    ],
+    [
+      "creates another protected directory",
+      `mkdir -p .agent-config/new && ${second(".agent-config")}`,
+    ],
+    [
+      "has a substitution in the redirect target",
+      'echo "x" >> .agent-config/$(date +%s).md && cat .agent-config/test.md',
+    ],
+    [
+      "has a variable in the redirect target",
+      'echo "x" >> $DIR/test.md && cat .agent-config/test.md',
+    ],
+    ["has a glob in the redirect target", 'echo "x" >> .agent-config/t*.md'],
+    [
+      "adds rm -rf outside the worktree",
+      `${second(".agent-config")} && rm -rf ~/policy-manager-test-elsewhere`,
+    ],
+    ["writes harness settings", `${second(".agent-config")} && echo x >> .claude/settings.json`],
+    ["writes the file of another checkout", second("OTHER/.agent-config")],
+  ])("still asks when the command %s", async (_, command) => {
+    const s = await approvedFirst(".agent-config");
+    expect((await s.decide(bash(real(command)), "PreToolUse")).decision).toBe("human");
+  });
+
+  test.each([
+    ["a substitution in the redirect target", "echo x >> .agent-config/$(date +%s).md"],
+    [
+      "rm -rf outside the worktree",
+      `${first(".agent-config")} && rm -rf ~/policy-manager-test-elsewhere`,
+    ],
+    [
+      "an unapproved write elsewhere",
+      `${first(".agent-config")} && echo x >> ~/policy-manager-test-out.txt`,
+    ],
+    ["a credential path", `${first(".agent-config")} && cat ~/.ssh/id_rsa`],
+  ])("a command with %s is approved once only", (_, command) => {
+    const { s } = session();
+    const asked = s.review(shell(real(command)), undefined, "PreToolUse");
+    expect(asked.decision).toBe("human");
+    expect(asked.sessionGrantable).toBe(false);
   });
 });
 

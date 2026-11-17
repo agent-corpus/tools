@@ -130,7 +130,10 @@ export class PolicySession {
   /** Session grants: hashes of a human rule and the scope the user approved it for. */
   private sessionGrants = new Set<string>();
   /** Harness prompts waiting for their answer, by `tool_use_id` (or `request:<hash>`). */
-  private asks = new Map<string, { request: Request; decision: Decision; at: number }>();
+  private asks = new Map<
+    string,
+    { request: Request; decision: Decision; at: number; scope: string | undefined }
+  >();
   /** Classifications running now, so concurrent hooks for one request share one CLI run. */
   private running = new Map<string, Promise<ClassifierResult>>();
   /** The classifier CLI is not installed: later requests go straight to a person. */
@@ -694,7 +697,9 @@ export class PolicySession {
     if (!permissionMode || !PROMPTING_MODES.has(permissionMode)) return;
     if (!toolUseId || !/^[\w.:-]{1,200}$/.test(toolUseId)) return;
     if (this.asks.size >= 256) this.asks.delete(this.asks.keys().next().value ?? "");
-    this.asks.set(toolUseId, { request, decision, at: Date.now() });
+    // The scope shown with the prompt, read before the tool runs and changes what it reads.
+    const scope = this.humanDecisions.get(decision.requestHash)?.sessionScope;
+    this.asks.set(toolUseId, { request, decision, at: Date.now(), scope });
   }
   /**
    * PostToolUse (or PostToolUseFailure) for a tool call the harness asked the person about: they
@@ -727,7 +732,7 @@ export class PolicySession {
       return "rejected";
     }
     this.humanDecisions.delete(report.requestHash);
-    const scope = grantScope(ask.request, ask.decision, this.profile);
+    const scope = ask.scope;
     audit(this.directory, {
       event: "human-response",
       requestHash: report.requestHash,

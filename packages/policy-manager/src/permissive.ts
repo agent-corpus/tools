@@ -8,6 +8,8 @@ import {
   git,
   inside,
   isProtectedPath,
+  NOTED_WRITE,
+  notedProtectedWrite,
   OUTSIDE_REPOSITORY,
   pathEvidence,
   policyState,
@@ -671,8 +673,14 @@ const DISPOSABLE_WRITES = new Set([
   "Write within the system temp directory",
 ]);
 /** Temp and scratch writes are trusted only before anything could plant a symlink (see `Fill`). */
-export function permissiveWrite(cwd: string, input: string, profile: Profile, fill?: Fill) {
-  const check = writeEvidence(cwd, input, profile);
+export function permissiveWrite(
+  cwd: string,
+  input: string,
+  profile: Profile,
+  fill?: Fill,
+  directory = false,
+) {
+  const check = writeEvidence(cwd, input, profile, directory);
   if (!check.allowed || !fill || !DISPOSABLE_WRITES.has(check.reason)) return check;
   if (fill.script.tainted)
     return {
@@ -694,12 +702,14 @@ function hardLinked(path: string): boolean {
   }
 }
 
-function writeEvidence(cwd: string, input: string, profile: Profile) {
+function writeEvidence(cwd: string, input: string, profile: Profile, directory: boolean) {
   let lexical: string | undefined;
   let path: string | undefined;
   try {
     lexical = resolveWord(cwd, input);
     path = canonical(lexical);
+    if (notedProtectedWrite(input, lexical, path, directory))
+      return { allowed: true, category: "worktree-write" as const, reason: NOTED_WRITE };
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
         allowed: false,
@@ -2047,7 +2057,7 @@ export function simpleDecision(
       if (!check.allowed) return human(request, check.category, check.reason);
     }
     for (const file of [...(split?.targets ?? operands), ...optionValues]) {
-      const check = permissiveWrite(cwd, file, profile, fill);
+      const check = permissiveWrite(cwd, file, profile, fill, program === "mkdir");
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   }
