@@ -44,7 +44,7 @@ beforeAll(() => {
   session = join(root, "session");
   repo = join(root, "repo");
   execFileSync("git", ["init", "--bare", "-b", "main", origin]);
-  execFileSync("git", ["clone", origin, repo], { stdio: "ignore" });
+  execFileSync("git", ["clone", "--", origin, repo], { stdio: "ignore" });
   for (const dir of [repo]) {
     git(dir, ["config", "user.name", "T"]);
     git(dir, ["config", "user.email", "t@example.com"]);

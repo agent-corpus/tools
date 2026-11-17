@@ -1322,7 +1322,9 @@ describe("round 12: piped stages, other shells, writes inside programs, cost", (
 
   // Shapes of the slowest real commands: a long script whose unquoted here-document holds many
   // `cd ... && rm -rf ...` lines and is run, and one with many backticks in a here-document.
-  const limit = process.platform === "win32" ? 1_500 : 500;
+  // About 0.2 s locally; shared runners are several times slower. Before the fixes these took
+  // minutes, so a 3 s bound still catches the regression.
+  const limit = 3_000;
   test.each([
     [
       "many cd lines in a run here-document",
