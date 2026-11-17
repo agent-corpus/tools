@@ -841,7 +841,7 @@ const SYMLINK_FREE = new Set([
   ...["cd", "chdir", "export", "set", "shift", "unset", "read", "local"],
   ...["cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "paste", "diff", "cmp", "jq"],
   ...["grep", "egrep", "fgrep", "rg", "sed", "ls", "stat", "file", "which", "type"],
-  ...["basename", "dirname", "realpath", "readlink", "mkdir", "touch", "tee"],
+  ...["basename", "dirname", "realpath", "readlink", "mkdir", "touch", "tee", "truncate"],
   ...["rm", "rmdir", "unlink", "bash", "sh", "zsh", "dash"],
   ...["seq", "mktemp", "chmod", "find", "curl", "du", "df", "tree", "column", "nl"],
   ...["tac", "rev", "comm", "join", "fold", "od", "xxd", "shasum", "sha256sum", "md5sum", "md5"],

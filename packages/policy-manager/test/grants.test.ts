@@ -254,6 +254,12 @@ describe("a remembered yes for a protected write in a compound command", () => {
     ]);
     // The first command again: its `mkdir -p` only creates the file's own directory.
     expect((await s.decide(bash(first(".agent-config")), "PreToolUse")).decision).toBe("approve");
+    // truncate writes only the file it names, so neither it nor a later write is distrusted.
+    for (const command of [
+      "truncate -s 0 .agent-config/test.md",
+      `truncate -s 0 .agent-config/test.md && ${second(".agent-config")}`,
+    ])
+      expect((await s.decide(bash(command), "PreToolUse")).decision, command).toBe("approve");
   });
 
   test("approve --session covers it too", () => {
@@ -362,6 +368,7 @@ describe("a write after a command that can plant a symlink is not approved by it
       "echo ok >> x.md && cat x.md",
       "mkdir -p notes && echo ok > notes/a.md && truncate -s 0 notes/a.md",
       "cp README.md out.txt && sed -i s/a/b/ out.txt",
+      "truncate -s 0 notes/a.md && echo ok >> notes/a.md",
     ])
       expect(s.review(shell(command), undefined, "PreToolUse").decision, command).toBe("approve");
   });
