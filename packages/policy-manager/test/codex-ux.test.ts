@@ -86,37 +86,29 @@ describe("single-quoted literals", () => {
 describe("session scope for shell redirect writes", () => {
   test("a redirect write is session-grantable for that exact file only", () => {
     const { s } = session();
-    const first = s.review(
-      shell("printf test >> .agent-config/README.md"),
-      undefined,
-      "PreToolUse",
-    );
+    const first = s.review(shell("printf test >> .github/README.md"), undefined, "PreToolUse");
     expect(first.decision).toBe("human");
     expect(first.sessionGrantable).toBe(true);
-    expect(first.sessionScopeLabel).toMatch(/^writes to .*\.agent-config[\\/]README\.md$/);
+    expect(first.sessionScopeLabel).toMatch(/^writes to .*\.github[\\/]README\.md$/);
     s.grant(first.requestHash, true, true);
     expect(
-      s.review(shell("printf other >> .agent-config/README.md"), undefined, "PreToolUse").decision,
+      s.review(shell("printf other >> .github/README.md"), undefined, "PreToolUse").decision,
     ).toBe("approve");
     for (const later of [
-      shell("printf x > .agent-config/agents/a.md"),
-      shell("tee -a .agent-config/skills/b.md"),
-      patch(join(worktree, ".agent-config", "c.md")),
+      shell("printf x > .github/agents/a.md"),
+      shell("tee -a .github/skills/b.md"),
+      patch(join(worktree, ".github", "c.md")),
     ])
       expect(s.review(later, undefined, "PreToolUse").decision).toBe("human");
   });
   test.each([
-    "printf x >> AGENTS.md",
-    "cp .agent-config/a AGENTS.md",
-    "tee .agent-config/a AGENTS.md",
+    "printf x >> .github/CODEOWNERS",
+    "cp .github/a .codex/AGENTS.md",
+    "tee .github/a .github/CODEOWNERS",
     "printf x > .claude/settings.json",
   ])("a write that also touches another protected path is not covered: %s", (command) => {
     const { s } = session();
-    const first = s.review(
-      shell("printf test >> .agent-config/README.md"),
-      undefined,
-      "PreToolUse",
-    );
+    const first = s.review(shell("printf test >> .github/README.md"), undefined, "PreToolUse");
     s.grant(first.requestHash, true, true);
     expect(s.review(shell(command), undefined, "PreToolUse").decision).not.toBe("approve");
   });
@@ -126,8 +118,8 @@ describe("approve --last", () => {
   test("the session reports its newest request waiting for a person", () => {
     const { s } = session();
     expect(s.latestHumanDecision()).toBeUndefined();
-    const a = s.review(shell("printf a >> .agent-config/a.md"), undefined, "PreToolUse");
-    const b = s.review(shell("printf b >> AGENTS.md"), undefined, "PreToolUse");
+    const a = s.review(shell("printf a >> .github/a.md"), undefined, "PreToolUse");
+    const b = s.review(shell("printf b >> .github/CODEOWNERS"), undefined, "PreToolUse");
     const latest = s.latestHumanDecision();
     expect(latest?.requestHash).toBe(b.requestHash);
     expect(latest?.harness).toBe("codex");

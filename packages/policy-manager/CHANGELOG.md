@@ -1,5 +1,11 @@
 # @agent-corpus/policy-manager
 
+## 0.11.2
+
+### Patch Changes
+
+- Claude Code: a yes to the hook's ask is remembered in every permission mode except `bypassPermissions` and `dontAsk`, so `auto` mode no longer asks again for the same protected file. Codex: a request that needs a person now waits in the `PreToolUse` hook (10 minutes by default, `setup-hook-codex --approval-wait <seconds>`) while the user runs `pm approve --last`, which asks "Allow just this once, or for this session? [o/s/N]"; on approval the command runs with no retry, and without one it is denied as before. Re-trust the Codex `PreToolUse` hook in `/hooks` after setup. In a linked feature worktree, `.agent-config/**`, `.agents/**`, `AGENTS.md` and `CLAUDE.md` are ordinary code; harness settings and hooks, `.codex`, `.github`, the policy profile, and everything in the main checkout or on the default branch stay protected.
+
 ## 0.11.1
 
 ### Patch Changes

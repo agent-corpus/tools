@@ -56,9 +56,10 @@ test.each([
   ".env",
   ".git/config",
   ".codex/hooks.json",
-  ".agent-config/AGENTS.md",
+  ".agent-config/.claude/settings.json",
   ".github/hooks/policy.json",
-  "AGENTS.md",
+  ".github/workflows/ci.yml",
+  ".claude/CLAUDE.md",
 ])("protects %s", (path) =>
   expect(evaluate({ ...request(""), tool: "Write", input: { file_path: path } }).decision).toBe(
     "human",

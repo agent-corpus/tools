@@ -34,8 +34,14 @@ const CREATION_REPORT_MS = 15 * 60_000;
 
 export { APPROVE_GUARD };
 
-/** Claude Code permission modes in which a hook's ask is shown to a person. */
-const PROMPTING_MODES = new Set(["default", "acceptEdits", "plan"]);
+/**
+ * Claude Code permission modes in which a hook's ask may never reach a person: `bypassPermissions`
+ * skips prompts and `dontAsk` denies what would prompt. In every other mode (`default`,
+ * `acceptEdits`, `plan`, `auto`) Claude Code shows the person a hook's ask.
+ */
+const SILENT_MODES = new Set(["bypassPermissions", "dontAsk"]);
+/** How recently a hook must have polled for its request to count as waiting for an approval. */
+const WAITING_MS = 5_000;
 /** Hard items no allow rule approves, at any level: they always ask the person. */
 const NO_ALLOW = new Set([
   "credential-read",
@@ -129,6 +135,10 @@ export class PolicySession {
   private grants = new Map<string, { phases: Set<string> }>();
   /** Session grants: hashes of a human rule and the scope the user approved it for. */
   private sessionGrants = new Set<string>();
+  /** Requests the user turned down from their terminal, so a waiting hook stops waiting. */
+  private refused = new Set<string>();
+  /** When a hook last polled for each request it is waiting on (`approvalState`). */
+  private waiting = new Map<string, number>();
   /** Harness prompts waiting for their answer, by `tool_use_id` (or `request:<hash>`). */
   private asks = new Map<
     string,
@@ -251,7 +261,7 @@ export class PolicySession {
     requestHash: string,
     confirm: boolean,
     session = false,
-  ): GrantPreview & { granted: boolean; scope: "once" | "session" } {
+  ): GrantPreview & { granted: boolean; scope: "once" | "session"; waiting?: boolean } {
     if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new GrantError("Not a request hash");
     const pending = this.humanDecisions.get(requestHash);
     if (!pending || Date.now() - pending.at > GRANT_WINDOW_MS) {
@@ -291,7 +301,56 @@ export class PolicySession {
       response: "approved",
       summary: "User approved the request from the terminal",
     });
-    return { ...preview, granted: true, scope };
+    return { ...preview, granted: true, scope, waiting: this.isWaiting(requestHash) };
+  }
+  /** A hook polled for this request within WAITING_MS: it is blocked waiting for the user. */
+  private isWaiting(requestHash: string): boolean {
+    const at = this.waiting.get(requestHash);
+    return at !== undefined && Date.now() - at <= WAITING_MS;
+  }
+  /**
+   * The user turned down a request this session sent to a person, from their own terminal. It
+   * can no longer be approved, and a hook waiting for it stops and denies it.
+   */
+  refuse(requestHash: string): { refused: boolean } {
+    if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new GrantError("Not a request hash");
+    const pending = this.humanDecisions.get(requestHash);
+    this.humanDecisions.delete(requestHash);
+    if (!pending || Date.now() - pending.at > GRANT_WINDOW_MS) return { refused: false };
+    if (this.refused.size >= 64) this.refused.delete(this.refused.values().next().value ?? "");
+    this.refused.add(requestHash);
+    audit(this.directory, {
+      event: "human-response",
+      requestHash,
+      response: "denied",
+      summary: "User declined the request from the terminal",
+    });
+    return { refused: true };
+  }
+  /**
+   * What a hook waiting for the user's answer to a request it was told needs a person sees:
+   * `granted` once the user approved it (once or for the session) and the grant is unused,
+   * `refused` when they turned it down, `pending` while it can still be approved, and `gone`
+   * when it can no longer be (expired, or replaced). Each poll marks the request as waiting.
+   */
+  approvalState(requestHash: string): "granted" | "refused" | "pending" | "gone" {
+    if (!/^[a-f0-9]{64}$/.test(requestHash)) return "gone";
+    if (this.waiting.size >= 64 && !this.waiting.has(requestHash))
+      this.waiting.delete(this.waiting.keys().next().value ?? "");
+    this.waiting.set(requestHash, Date.now());
+    if (this.refused.delete(requestHash)) {
+      this.waiting.delete(requestHash);
+      return "refused";
+    }
+    const once = this.grants.get(requestHash);
+    if (once && !once.phases.has("PreToolUse")) {
+      this.waiting.delete(requestHash);
+      return "granted";
+    }
+    const pending = this.humanDecisions.get(requestHash);
+    if (pending && Date.now() - pending.at <= GRANT_WINDOW_MS) return "pending";
+    this.waiting.delete(requestHash);
+    return "gone";
   }
   private state(requestHash: string): ClassificationState | undefined {
     const state = this.states.get(requestHash);
@@ -682,10 +741,10 @@ export class PolicySession {
   }
   /**
    * The hook asked, so the harness prompts the person. Its PostToolUse for this exact tool call
-   * means they said yes, but only when the harness reports a permission mode in which an ask is
-   * really shown to a person: Claude Code's `default`, `acceptEdits` or `plan`. Under
-   * `bypassPermissions`, `dontAsk`, an auto mode, or with no mode reported (Copilot reports none,
-   * so `--allow-all`/`--yolo` cannot be told apart), nothing is remembered. Codex cannot ask.
+   * means they said yes, in every Claude Code permission mode that shows a hook's ask to a person:
+   * `default`, `acceptEdits`, `plan` and `auto` (where an ask goes to the prompt, not the auto-mode
+   * classifier). Under `bypassPermissions` or `dontAsk`, or with no mode reported (Copilot reports
+   * none, so `--allow-all`/`--yolo` cannot be told apart), nothing is remembered. Codex cannot ask.
    */
   private awaitAnswer(
     request: Request,
@@ -694,7 +753,7 @@ export class PolicySession {
     permissionMode: string | undefined,
   ): void {
     if (this.harness !== "claude") return;
-    if (!permissionMode || !PROMPTING_MODES.has(permissionMode)) return;
+    if (!permissionMode || SILENT_MODES.has(permissionMode)) return;
     if (!toolUseId || !/^[\w.:-]{1,200}$/.test(toolUseId)) return;
     if (this.asks.size >= 256) this.asks.delete(this.asks.keys().next().value ?? "");
     // The scope shown with the prompt, read before the tool runs and changes what it reads.

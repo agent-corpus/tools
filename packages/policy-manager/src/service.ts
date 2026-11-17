@@ -11,7 +11,16 @@ import type { Classification, OutcomeReport, Request } from "./types.js";
 
 interface Message {
   token: string;
-  action: "ping" | "review" | "classify" | "record" | "grant" | "pending" | "stop";
+  action:
+    | "ping"
+    | "review"
+    | "classify"
+    | "record"
+    | "grant"
+    | "refuse"
+    | "await"
+    | "pending"
+    | "stop";
   request?: Request;
   classification?: Classification;
   report?: OutcomeReport;
@@ -26,6 +35,34 @@ interface Message {
 }
 /** How long a hook waits for a review, which can include the AI classifier's run. */
 export const REVIEW_TIMEOUT_MS = 40_000;
+/** How often a hook waiting for the user's approval asks the service whether it came. */
+export const APPROVAL_POLL_MS = 1_000;
+export type ApprovalState = "granted" | "refused" | "pending" | "gone";
+/**
+ * Waits until `deadline` (epoch ms) for the user's answer to a request that needs a person,
+ * asking `poll` every `intervalMs`. Returns `granted`, `refused`, `gone` (it can no longer be
+ * approved) or `timeout`. A failed poll is not an answer: it waits on, and fails closed at the end.
+ */
+export async function waitForApproval(
+  poll: () => Promise<unknown>,
+  deadline: number,
+  intervalMs = APPROVAL_POLL_MS,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((done) => setTimeout(done, ms)),
+): Promise<Exclude<ApprovalState, "pending"> | "timeout"> {
+  while (Date.now() < deadline) {
+    let state: unknown;
+    try {
+      state = await poll();
+    } catch {
+      state = "pending";
+    }
+    if (state === "granted" || state === "refused" || state === "gone") return state;
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(intervalMs, left));
+  }
+  return "timeout";
+}
 function endpoint(directory: string): string {
   return process.platform === "win32"
     ? `\\\\.\\pipe\\acp-${hash(directory).slice(0, 32)}`
@@ -70,9 +107,17 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
                 : message.grant
                   ? { requestHash: String(message.grant.requestHash) }
                   : {}),
-          action: ["ping", "review", "classify", "record", "grant", "pending", "stop"].includes(
-            message.action,
-          )
+          action: [
+            "ping",
+            "review",
+            "classify",
+            "record",
+            "grant",
+            "refuse",
+            "await",
+            "pending",
+            "stop",
+          ].includes(message.action)
             ? message.action
             : "invalid",
         });
@@ -112,6 +157,15 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
                 })
               : undefined;
           result = { recorded: true, ...(answer ? { answer } : {}) };
+        } else if (message.action === "await" && message.grant)
+          result = session.approvalState(String(message.grant.requestHash));
+        else if (message.action === "refuse" && message.grant) {
+          try {
+            result = session.refuse(String(message.grant.requestHash));
+          } catch (error) {
+            if (!(error instanceof GrantError)) throw error;
+            result = { refused: false };
+          }
         } else if (message.action === "grant" && message.grant) {
           try {
             result = session.grant(

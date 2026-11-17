@@ -551,7 +551,8 @@ describe("session scope wording", () => {
   test("a protected file is written to, a protected directory under", () => {
     const directory = join(root, "session");
     mkdirSync(directory, { mode: 0o700 });
-    writeFileSync(join(worktree, "AGENTS.md"), "x");
+    mkdirSync(join(worktree, ".github"), { recursive: true });
+    writeFileSync(join(worktree, ".github", "CODEOWNERS"), "x");
     const s = new PolicySession(directory, "codex", "s1", profile);
     const shell = (command: string): Request => ({
       sessionId: "s1",
@@ -560,9 +561,9 @@ describe("session scope wording", () => {
       tool: "exec_command",
       input: { command },
     });
-    const file = s.review(shell("printf x >> AGENTS.md"), undefined, "PreToolUse");
-    expect(file.sessionScopeLabel).toMatch(/^writes to .*AGENTS\.md$/);
-    const dir = s.review(shell("printf x >> .agent-config/README.md"), undefined, "PreToolUse");
+    const file = s.review(shell("printf x >> .github/CODEOWNERS"), undefined, "PreToolUse");
+    expect(file.sessionScopeLabel).toMatch(/^writes to .*CODEOWNERS$/);
+    const dir = s.review(shell("printf x >> .github/README.md"), undefined, "PreToolUse");
     expect(dir.sessionScopeLabel).toMatch(/^writes to .*README\.md$/);
   });
 });

@@ -1,3 +1,4 @@
+import { formatWait } from "./config.js";
 import { requestHash } from "./policy.js";
 import type { Decision, OutcomeReport, Request } from "./types.js";
 export function normalize(harness: Request["harness"], payload: Record<string, unknown>): Request {
@@ -20,6 +21,12 @@ export interface HookContext {
   sessionId: string;
   /** A managed `pm` launcher for this CLI is installed and on PATH. */
   pmOnPath?: boolean;
+  /**
+   * The Codex hook waited this many seconds for the user's approval and none came: `timeout`
+   * (the wait ran out) or `gone` (the request can no longer be approved); `refused` when the
+   * user turned it down from their terminal.
+   */
+  waited?: { seconds: number; outcome: "timeout" | "gone" | "refused" };
 }
 /**
  * The exact command the model is told to run to record a classification. A here-string, not a
@@ -127,18 +134,29 @@ export function approveLastCommand(context?: HookContext): string {
   return cliPath ? `node "${cliPath}" approve --last` : "policy-manager approve --last";
 }
 /**
- * What Codex shows for a decision that needs a person. Codex cannot ask, so the agent must stop
- * and hand the user one command; the first line says so, and the command stands on its own line.
+ * What Codex shows for a decision that needs a person, after the hook waited for an approval that
+ * did not come (or without waiting, when setup configured none). Codex cannot ask, so the agent
+ * must stop and hand the user one command; the first line says so, and the command stands on its
+ * own line.
  */
 export function approveInstruction(decision: Decision, context?: HookContext): string {
+  if (context?.waited?.outcome === "refused")
+    return [
+      `⏹ You declined this request in your terminal. Not run: ${decision.reason}.`,
+      "Agent: do not retry it unchanged. Stop and ask the user how to proceed.",
+      `Request ${decision.requestHash}.`,
+    ].join("\n");
+  const waited = context?.waited
+    ? ` No approval came within ${formatWait(context.waited.seconds)}.`
+    : "";
   return [
-    `⏸ Waiting for your approval. Not run: ${decision.reason}.`,
+    `⏸ Waiting for your approval. Not run: ${decision.reason}.${waited}`,
     ...(askWhy(decision) ? [`${askWhy(decision)}.`] : []),
     'Run in your own terminal, then say "retry":',
     `  ${approveLastCommand(context)}`,
     ...(decision.sessionGrantable
       ? [
-          `Add --session to also allow ${decision.sessionScopeLabel ?? "the same rule for the same scope"} for the rest of this session.`,
+          `It asks whether to allow it just once or, for ${decision.sessionScopeLabel ?? "the same rule and scope"}, for the rest of this session.`,
         ]
       : []),
     "Agent: stop now and end your turn; approving it in chat does not unblock it. Show the user the command above exactly, in a code block. Never run it yourself.",

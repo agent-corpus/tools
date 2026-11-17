@@ -165,7 +165,28 @@ describe("a yes is only remembered when a person was really asked", () => {
     expect((await s.decide(r, "PreToolUse")).decision).toBe("human");
   });
 
-  test.each([undefined, "bypassPermissions", "dontAsk", "auto"])(
+  test.each(["default", "acceptEdits", "plan", "auto"])(
+    "Claude Code in permission mode %s: the yes is remembered",
+    async (mode) => {
+      const { s } = session("claude");
+      const r = bash("git pull origin a");
+      const asked = await s.decide(r, "PreToolUse", "toolu_m", mode);
+      expect(asked.decision).toBe("human");
+      expect(s.answered(executed(asked.requestHash, "toolu_m"))).toBe("session");
+      expect((await s.decide(r, "PreToolUse")).decision).toBe("approve");
+    },
+  );
+
+  test("auto mode: a yes is remembered only for the request the hook asked about", async () => {
+    const { s } = session("claude");
+    const asked = await s.decide(bash("git pull origin a"), "PreToolUse", "toolu_a", "auto");
+    // A PostToolUse for another tool call, or for another request under the same id, is no yes.
+    expect(s.answered(executed(asked.requestHash, "toolu_other"))).toBeUndefined();
+    expect(s.answered(executed("0".repeat(64), "toolu_a"))).toBeUndefined();
+    expect((await s.decide(bash("git pull origin a"), "PreToolUse")).decision).toBe("human");
+  });
+
+  test.each([undefined, "bypassPermissions", "dontAsk"])(
     "Claude Code in permission mode %s: nothing is remembered",
     async (mode) => {
       const { s } = session("claude");
@@ -265,6 +286,7 @@ describe("setup writes timeouts above the classifier's", () => {
         const entry = entries[0] as { timeoutSec?: number; hooks?: Array<{ timeout?: number }> };
         const seconds = harness === "copilot" ? entry.timeoutSec : entry.hooks?.[0]?.timeout;
         if (harness === "codex" && event === "SessionEnd") expect(seconds).toBe(3);
+        else if (harness === "codex" && event === "PreToolUse") expect(seconds).toBe(45 + 600);
         else expect(seconds, event).toBe(45);
       }
       if (harness !== "codex")
