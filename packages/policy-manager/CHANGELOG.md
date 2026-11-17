@@ -1,5 +1,15 @@
 # @agent-corpus/policy-manager
 
+## 0.11.0
+
+### Minor Changes
+
+- [#52](https://github.com/agent-corpus/tools/pull/52) [`275ac8a`](https://github.com/agent-corpus/tools/commit/275ac8a3ad017eec324f6f40c6dc8adae56f354c) Thanks [@charlesprakash](https://github.com/charlesprakash)! - The hook now classifies what the deterministic engine cannot approve itself, synchronously, with the harness's own logged-in CLI (`claude -p` and `copilot -p` with no tools, `codex exec` in a read-only sandbox; no hooks, no session persistence). It approves when the answer is recoverable with confidence 0.95 or more and a category other than sensitive or unknown. The command is JSON-encoded and fenced by a random per-call boundary; a command over 20,000 characters is never sent and asks the person. Hard human items never reach the classifier: credentials, protected configuration, unrecoverable loss, humanPatterns, and a deterministic floor of cloud and infrastructure writes, repository and release deletion, publishing, and recursive `rm` outside a feature worktree, temp or scratch roots. Everything else asks the person and waits: Claude Code and Copilot ask in their own prompt, and under Claude Code a "yes" (seen in PostToolUse, only in a permission mode that really asks) is remembered for that exact rule and target; Codex keeps the deny with `pm approve --last`. The user's own Claude Code permission rules and Codex execpolicy rules are checked before the classifier: deny and ask rules from every level leave the request to the harness; allow rules count only from the user's own settings and never approve credential reads, writes to harness settings, hooks, permission files or the policy profile, or a force push. Plain reads (`cat`, `ls`, `grep`, `rg`, `head`, `tail`, `find`, `git grep`, the Read tool) of non-secret files are approved under protected paths, with allow-listed options and recursive searches checked for secrets, and a read-only prefix no longer blocks an approvable last command. Deleting a branch whose tip is on a remote-tracking ref is approved. Here-documents and quoted text that are only data are no longer scanned as commands. The old "block and ask the agent to classify" flow is gone and a `classify` record no longer approves anything. New profile key `classifier` (per-CLI `model`, `enabled: false`). Every managed hook now has a 45-second timeout. `replay --classify` runs the real classifier on recorded escalations.
+
+### Patch Changes
+
+- [#50](https://github.com/agent-corpus/tools/pull/50) [`25798c3`](https://github.com/agent-corpus/tools/commit/25798c3972a04fbdbe7837d9f895648e84ab4d7f) Thanks [@charlesprakash](https://github.com/charlesprakash)! - Docs, code comments and tests now use organization-neutral examples (`github.com/example-org/`, `tools/review-bot.mjs`). No behavior change.
+
 ## 0.10.0
 
 ### Minor Changes
