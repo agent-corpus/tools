@@ -145,6 +145,40 @@ describe("a Codex hook waits for the user's approval", () => {
     expect(() => s.grant(asked.requestHash, true)).toThrow();
   });
 
+  test("two waiting requests with one scope: --session on one releases the other", async () => {
+    const s = session();
+    const a = await s.decide(shell("printf a >> .github/CODEOWNERS"), "PreToolUse");
+    const b = await s.decide(shell("printf b >> .github/CODEOWNERS"), "PreToolUse");
+    expect(a.requestHash).not.toBe(b.requestHash);
+    expect(a.sessionScopeLabel).toBe(b.sessionScopeLabel);
+    expect(s.approvalState(b.requestHash)).toBe("pending");
+    s.grant(a.requestHash, true, true);
+    expect(s.approvalState(a.requestHash)).toBe("granted");
+    expect(s.approvalState(b.requestHash)).toBe("granted");
+    // The hook's re-review approves both.
+    expect((await s.decide(shell("printf b >> .github/CODEOWNERS"), "PreToolUse")).decision).toBe(
+      "approve",
+    );
+  });
+
+  test("two waiting requests with one scope: --once on one does not release the other", async () => {
+    const s = session();
+    const a = await s.decide(shell("printf a >> .github/CODEOWNERS"), "PreToolUse");
+    const b = await s.decide(shell("printf b >> .github/CODEOWNERS"), "PreToolUse");
+    s.grant(a.requestHash, true);
+    expect(s.approvalState(a.requestHash)).toBe("granted");
+    expect(s.approvalState(b.requestHash)).toBe("pending");
+  });
+
+  test("a decline stays per request, even when another request's session grant covers it", async () => {
+    const s = session();
+    const a = await s.decide(shell("printf a >> .github/CODEOWNERS"), "PreToolUse");
+    const b = await s.decide(shell("printf b >> .github/CODEOWNERS"), "PreToolUse");
+    s.refuse(b.requestHash);
+    s.grant(a.requestHash, true, true);
+    expect(s.approvalState(b.requestHash)).toBe("refused");
+  });
+
   test("a failed poll is not an answer", async () => {
     const outcome = await waitForApproval(
       async () => {

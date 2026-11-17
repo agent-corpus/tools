@@ -336,8 +336,9 @@ export class PolicySession {
   }
   /**
    * What a hook waiting for the user's answer to a request it was told needs a person sees:
-   * `granted` once the user approved it (once or for the session) and the grant is unused,
-   * `refused` when they turned it down, `pending` while it can still be approved, and `gone`
+   * `granted` once the user approved it (once or for the session) and the grant is unused, or
+   * approved another request with the same rule and scope for the session; `refused` (per
+   * request) when they turned it down, `pending` while it can still be approved, and `gone`
    * when it can no longer be (expired, or replaced). Each poll marks the request as waiting.
    */
   approvalState(requestHash: string): "granted" | "refused" | "pending" | "gone" {
@@ -355,7 +356,18 @@ export class PolicySession {
       return "granted";
     }
     const pending = this.humanDecisions.get(requestHash);
-    if (pending && Date.now() - pending.at <= GRANT_WINDOW_MS) return "pending";
+    if (pending && Date.now() - pending.at <= GRANT_WINDOW_MS) {
+      // A session grant the user gave for another request with the same rule and scope covers
+      // this one too: `granted()` uses the same key, so the hook's re-review approves it.
+      if (
+        pending.sessionScope !== undefined &&
+        this.sessionGrants.has(hash([pending.reason, pending.sessionScope]))
+      ) {
+        this.waiting.delete(requestHash);
+        return "granted";
+      }
+      return "pending";
+    }
     this.waiting.delete(requestHash);
     return "gone";
   }
