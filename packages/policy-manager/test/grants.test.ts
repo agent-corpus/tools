@@ -71,7 +71,7 @@ const events = async (directory: string, name: string) =>
 describe("one-time approval", () => {
   test("a protected-path write the user approves runs once per hook phase", async () => {
     const { directory, s } = session();
-    const r = write(join(worktree, ".agent-config", "skills", "a.md"));
+    const r = write(join(worktree, ".github", "skills", "a.md"));
     const first = s.review(r, undefined, "PreToolUse");
     expect(first.decision).toBe("human");
     expect(first.reason).toBe(PROTECTED_PATH);
@@ -87,7 +87,7 @@ describe("one-time approval", () => {
     expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
     // A one-time grant covers nothing else.
     expect(
-      s.review(write(join(worktree, ".agent-config", "b.md")), undefined, "PreToolUse").decision,
+      s.review(write(join(worktree, ".github", "b.md")), undefined, "PreToolUse").decision,
     ).toBe("human");
     expect(await events(directory, "human-grant")).toHaveLength(1);
     expect(await events(directory, "human-grant-use")).toHaveLength(2);
@@ -96,7 +96,7 @@ describe("one-time approval", () => {
 
   test("a Codex apply_patch retry after approval has the same hash and runs", () => {
     const { s } = session();
-    const r = patch(".agent-config/skills/example-skill/references/plan.md");
+    const r = patch(".github/skills/example-skill/references/plan.md");
     const first = s.review(r, undefined, "PreToolUse");
     expect([first.decision, first.reason]).toEqual(["human", PROTECTED_PATH]);
     s.grant(first.requestHash, true);
@@ -109,7 +109,7 @@ describe("one-time approval", () => {
     const { s } = session();
     expect(() => s.grant("a".repeat(64), true)).toThrow(GrantError);
     expect(() => s.grant("nope", true)).toThrow(GrantError);
-    const first = s.review(write(join(worktree, ".agent-config", "c.md")), undefined, "PreToolUse");
+    const first = s.review(write(join(worktree, ".github", "c.md")), undefined, "PreToolUse");
     s.grant(first.requestHash, true);
     expect(() => s.grant(first.requestHash, true)).toThrow(/Retry the request/);
   });
@@ -117,11 +117,7 @@ describe("one-time approval", () => {
   test("another session cannot approve it", () => {
     const one = session().s;
     const two = session().s;
-    const first = one.review(
-      write(join(worktree, ".agent-config", "d.md")),
-      undefined,
-      "PreToolUse",
-    );
+    const first = one.review(write(join(worktree, ".github", "d.md")), undefined, "PreToolUse");
     expect(() => two.grant(first.requestHash, true)).toThrow(GrantError);
   });
 });
@@ -130,17 +126,17 @@ describe("session approval", () => {
   test("covers later writes to the same protected file of the same worktree only", async () => {
     const { directory, s } = session();
     const first = s.review(
-      write(join(worktree, ".agent-config", "skills", "a.md")),
+      write(join(worktree, ".github", "skills", "a.md")),
       undefined,
       "PreToolUse",
     );
     expect(s.grant(first.requestHash, true, true).scope).toBe("session");
     const same = [
       {
-        ...write(join(worktree, ".agent-config", "skills", "a.md")),
-        input: { file_path: join(worktree, ".agent-config", "skills", "a.md"), content: "y" },
+        ...write(join(worktree, ".github", "skills", "a.md")),
+        input: { file_path: join(worktree, ".github", "skills", "a.md"), content: "y" },
       },
-      patch(".agent-config/skills/a.md"),
+      patch(".github/skills/a.md"),
     ];
     for (const r of same) {
       const d = s.review(r, undefined, "PreToolUse");
@@ -151,11 +147,11 @@ describe("session approval", () => {
       ]);
     }
     const outside = [
-      write(join(worktree, ".agent-config", "agents", "b.md")),
+      write(join(worktree, ".github", "agents", "b.md")),
       write(join(worktree, ".claude", "settings.json")),
-      write(join(worktree, "AGENTS.md")),
-      write(join(other, ".agent-config", "skills", "a.md"), other),
-      write(join(repo, ".agent-config", "skills", "a.md"), repo),
+      write(join(worktree, ".github", "CODEOWNERS")),
+      write(join(other, ".github", "skills", "a.md"), other),
+      write(join(repo, ".github", "skills", "a.md"), repo),
     ];
     for (const r of outside) expect(s.review(r, undefined, "PreToolUse").decision).toBe("human");
     expect(await events(directory, "human-grant-use")).toHaveLength(2);
@@ -227,6 +223,8 @@ describe("a remembered yes for a protected write in a compound command", () => {
   async function approvedFirst(dir: string) {
     const s = claude();
     const asked = await s.decide(bash(first(dir)), "PreToolUse", "toolu_1", "default");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(bash(first(dir)), "PermissionRequest");
     expect([asked.decision, asked.hard, asked.reason]).toEqual([
       "human",
       "protected",
@@ -246,28 +244,28 @@ describe("a remembered yes for a protected write in a compound command", () => {
   }
 
   test("covers the next request that writes the same file", async () => {
-    const s = await approvedFirst(".agent-config");
-    const later = await s.decide(bash(second(".agent-config")), "PreToolUse", "toolu_2", "default");
+    const s = await approvedFirst(".github");
+    const later = await s.decide(bash(second(".github")), "PreToolUse", "toolu_2", "default");
     expect([later.decision, later.reason]).toEqual([
       "approve",
       "Approved for this session by the user",
     ]);
     // The first command again: its `mkdir -p` only creates the file's own directory.
-    expect((await s.decide(bash(first(".agent-config")), "PreToolUse")).decision).toBe("approve");
+    expect((await s.decide(bash(first(".github")), "PreToolUse")).decision).toBe("approve");
     // truncate writes only the file it names, so neither it nor a later write is distrusted.
     for (const command of [
-      "truncate -s 0 .agent-config/test.md",
-      `truncate -s 0 .agent-config/test.md && ${second(".agent-config")}`,
+      "truncate -s 0 .github/test.md",
+      `truncate -s 0 .github/test.md && ${second(".github")}`,
     ])
       expect((await s.decide(bash(command), "PreToolUse")).decision, command).toBe("approve");
   });
 
   test("approve --session covers it too", () => {
     const { s } = session();
-    const asked = s.review(shell(first(".agent-config/codex")), undefined, "PreToolUse");
+    const asked = s.review(shell(first(".github/codex")), undefined, "PreToolUse");
     expect(asked.sessionGrantable).toBe(true);
     expect(s.grant(asked.requestHash, true, true).scope).toBe("session");
-    expect(s.review(shell(second(".agent-config/codex")), undefined, "PreToolUse").decision).toBe(
+    expect(s.review(shell(second(".github/codex")), undefined, "PreToolUse").decision).toBe(
       "approve",
     );
   });
@@ -275,62 +273,56 @@ describe("a remembered yes for a protected write in a compound command", () => {
   test.each([
     [
       "also writes a different protected file",
-      `${second(".agent-config")} && echo x >> .agent-config/other.md`,
+      `${second(".github")} && echo x >> .github/other.md`,
     ],
-    [
-      "creates another protected directory",
-      `mkdir -p .agent-config/new && ${second(".agent-config")}`,
-    ],
+    ["creates another protected directory", `mkdir -p .github/new && ${second(".github")}`],
     [
       "has a substitution in the redirect target",
-      'echo "x" >> .agent-config/$(date +%s).md && cat .agent-config/test.md',
+      'echo "x" >> .github/$(date +%s).md && cat .github/test.md',
     ],
-    [
-      "has a variable in the redirect target",
-      'echo "x" >> $DIR/test.md && cat .agent-config/test.md',
-    ],
-    ["has a glob in the redirect target", 'echo "x" >> .agent-config/t*.md'],
+    ["has a variable in the redirect target", 'echo "x" >> $DIR/test.md && cat .github/test.md'],
+    ["has a glob in the redirect target", 'echo "x" >> .github/t*.md'],
     [
       "adds rm -rf outside the worktree",
-      `${second(".agent-config")} && rm -rf ~/policy-manager-test-elsewhere`,
+      `${second(".github")} && rm -rf ~/policy-manager-test-elsewhere`,
     ],
-    ["writes harness settings", `${second(".agent-config")} && echo x >> .claude/settings.json`],
-    ["writes the file of another checkout", second("OTHER/.agent-config")],
+    ["writes harness settings", `${second(".github")} && echo x >> .claude/settings.json`],
+    ["writes the file of another checkout", second("OTHER/.github")],
     // The scope's paths are read before the script runs; a link it plants sends the write away.
     [
       "links the file elsewhere first",
-      "ln -sf ~/.zshrc .agent-config/test.md && echo evil >> .agent-config/test.md",
+      "ln -sf ~/.zshrc .github/test.md && echo evil >> .github/test.md",
     ],
-    ["only replaces the file with a link", "ln -sf ~/.zshrc .agent-config/test.md"],
+    ["only replaces the file with a link", "ln -sf ~/.zshrc .github/test.md"],
     [
       "copies a link over it first",
-      "cp -s ~/.zshrc .agent-config/test.md && echo evil >> .agent-config/test.md",
+      "cp -s ~/.zshrc .github/test.md && echo evil >> .github/test.md",
     ],
     [
       "moves another file over it first",
-      "mv ~/policy-manager-test-link .agent-config/test.md && echo evil >> .agent-config/test.md",
+      "mv ~/policy-manager-test-link .github/test.md && echo evil >> .github/test.md",
     ],
-    ["unpacks an archive after the write", `${second(".agent-config")} && tar xf a.tar`],
-    ["runs an unknown program after the write", `${second(".agent-config")} && ./build.sh`],
-    ["creates a directory at the file's path", "mkdir -p .agent-config/test.md"],
+    ["unpacks an archive after the write", `${second(".github")} && tar xf a.tar`],
+    ["runs an unknown program after the write", `${second(".github")} && ./build.sh`],
+    ["creates a directory at the file's path", "mkdir -p .github/test.md"],
   ])("still asks when the command %s", async (_, command) => {
-    const s = await approvedFirst(".agent-config");
+    const s = await approvedFirst(".github");
     expect((await s.decide(bash(real(command)), "PreToolUse")).decision).toBe("human");
   });
 
   test.each([
-    ["a substitution in the redirect target", "echo x >> .agent-config/$(date +%s).md"],
+    ["a substitution in the redirect target", "echo x >> .github/$(date +%s).md"],
     [
       "rm -rf outside the worktree",
-      `${first(".agent-config")} && rm -rf ~/policy-manager-test-elsewhere`,
+      `${first(".github")} && rm -rf ~/policy-manager-test-elsewhere`,
     ],
     [
       "an unapproved write elsewhere",
-      `${first(".agent-config")} && echo x >> ~/policy-manager-test-out.txt`,
+      `${first(".github")} && echo x >> ~/policy-manager-test-out.txt`,
     ],
-    ["a credential path", `${first(".agent-config")} && cat ~/.ssh/id_rsa`],
-    ["a symlink planted first", `ln -sf ~/.zshrc .agent-config/l.md && ${second(".agent-config")}`],
-    ["a symlink planted after", `${first(".agent-config")} && ln -sf ~/.zshrc .agent-config/l.md`],
+    ["a credential path", `${first(".github")} && cat ~/.ssh/id_rsa`],
+    ["a symlink planted first", `ln -sf ~/.zshrc .github/l.md && ${second(".github")}`],
+    ["a symlink planted after", `${first(".github")} && ln -sf ~/.zshrc .github/l.md`],
   ])("a command with %s is approved once only", (_, command) => {
     const { s } = session();
     const asked = s.review(shell(real(command)), undefined, "PreToolUse");
@@ -340,7 +332,7 @@ describe("a remembered yes for a protected write in a compound command", () => {
 
   test("a directory a script creates is named as one in the scope", () => {
     const { s } = session();
-    const asked = s.review(shell("mkdir -p .agent-config/dirs/a"), undefined, "PreToolUse");
+    const asked = s.review(shell("mkdir -p .github/dirs/a"), undefined, "PreToolUse");
     expect(asked.sessionGrantable).toBe(true);
     expect(asked.sessionScopeLabel).toMatch(/^writes to directory .*a$/);
   });
@@ -408,11 +400,11 @@ describe("a session grant on a generic command covers only that command", () => 
     expect(s.grant(first.requestHash, false, true).sessionScope).toMatch(
       /^the exact command `terraform apply -auto-approve` in /,
     );
-    const w = s.review(write(join(worktree, ".agent-config", "a.md")), undefined, "PreToolUse");
+    const w = s.review(write(join(worktree, ".github", "a.md")), undefined, "PreToolUse");
     // Windows may report the temp directory by its short (8.3) name, so compare the tail only.
     const label = s.grant(w.requestHash, false, true).sessionScope ?? "";
     expect(label.startsWith("writes to ")).toBe(true);
-    expect(label.endsWith(join(".worktrees", "feat", ".agent-config", "a.md"))).toBe(true);
+    expect(label.endsWith(join(".worktrees", "feat", ".github", "a.md"))).toBe(true);
   });
 });
 
@@ -457,6 +449,9 @@ describe("only the user approves", () => {
   test("stays fast on a long run of program names", () => {
     const start = performance.now();
     expect(looksLikeApproveGrant("policy-manager@".repeat(50_000))).toBe(false);
+    expect(looksLikeApproveGrant(`policy-manager@${"/policy-manager@".repeat(50_000)}`)).toBe(
+      false,
+    );
     expect(performance.now() - start).toBeLessThan(500);
   });
 });
@@ -506,7 +501,7 @@ describe("Codex deny message", () => {
     expect(reason(false)).not.toContain("--session");
     expect(reason(false)).not.toMatch(/policy profile/i);
   });
-  test("offers --session with the scope it covers", () => {
+  test("says approve offers the session, with the scope it covers", () => {
     const text = (
       hookResponse(
         "codex",
@@ -519,13 +514,13 @@ describe("Codex deny message", () => {
           cache: "none",
           cached: false,
           sessionGrantable: true,
-          sessionScopeLabel: "writes under /w/.agent-config",
+          sessionScopeLabel: "writes under /w/.github",
         },
         context,
       ).hookSpecificOutput as { permissionDecisionReason: string }
     ).permissionDecisionReason;
     expect(text).toContain(
-      "Add --session to also allow writes under /w/.agent-config for the rest of this session.",
+      "It asks whether to allow it just once or, for writes under /w/.github, for the rest of this session.",
     );
   });
   test("uses pm when the launcher is installed and on PATH", () => {

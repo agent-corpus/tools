@@ -145,8 +145,21 @@ export function inside(root: string, path: string): boolean {
 }
 const CREDENTIAL_CONFIG_DIRS = /(?:^|[\\/])\.config[\\/](?:gh|gcloud|op|hub)(?:[\\/]|$)/i;
 
+/**
+ * A file in a policy service session directory (`acp-<uid>-*`) other than its audit logs: the
+ * session token authenticates grants, so it and everything beside it (socket, grants) is a secret.
+ */
+function stateSecret(path: string): boolean {
+  const parts = path.split(/[\\/]/);
+  const at = parts.findIndex((part) => /^acp-(?:\d+|user)-/i.test(part));
+  if (at < 0) return false;
+  const rest = parts.slice(at + 1).filter(Boolean);
+  return rest.length > 1 || (rest.length === 1 && !/^audit(?:\.\d+)?\.jsonl$/i.test(rest[0] ?? ""));
+}
+
 export function sensitive(path: string): boolean {
   return (
+    stateSecret(path) ||
     CREDENTIAL_CONFIG_DIRS.test(path) ||
     path
       .split(/[\\/]/)
@@ -157,34 +170,90 @@ export function sensitive(path: string): boolean {
       )
   );
 }
-export function protectedPath(path: string): boolean {
+const PROTECTED_NAME =
+  /^(?:\.agent-config|\.local|\.codex|\.claude|\.agents|AGENTS\.md|CLAUDE\.md|\.github)$/i;
+/**
+ * Protected names that are ordinary code in a linked feature worktree: the repository's agent
+ * instructions and shared agent configuration. Harness settings and hooks (`.claude`, `.codex`),
+ * CI (`.github`) and `.local` stay protected there too.
+ */
+const WORKTREE_CODE_NAME = /^(?:\.agent-config|\.agents|AGENTS\.md|CLAUDE\.md)$/i;
+/**
+ * Whether a path names a protected file or directory at any depth. With `featureWorktree` (the
+ * path is relative to a verified linked feature worktree) only names outside WORKTREE_CODE_NAME
+ * count, so `.agent-config/x.md` is code there while `.agent-config/.claude/x` is not.
+ */
+export function protectedPath(path: string, featureWorktree = false): boolean {
   return path
     .split(/[\\/]/)
-    .some((part) =>
-      /^(?:\.agent-config|\.local|\.codex|\.claude|\.agents|AGENTS\.md|CLAUDE\.md|\.github)$/i.test(
-        part,
-      ),
+    .some(
+      (part) => PROTECTED_NAME.test(part) && !(featureWorktree && WORKTREE_CODE_NAME.test(part)),
     );
+}
+/**
+ * The top level of the linked worktree that contains `dir`, when it is on a feature branch: not
+ * the main checkout, not detached, and not main, master or origin's default branch. When the
+ * default branch is unknown (no `origin/HEAD`, and no main or master), it is not one.
+ */
+export function featureCheckout(dir: string): string | undefined {
+  try {
+    const root = canonical(git(dir, ["rev-parse", "--show-toplevel"]));
+    const gitDir = canonical(git(dir, ["rev-parse", "--absolute-git-dir"]));
+    const common = canonical(resolve(dir, git(dir, ["rev-parse", "--git-common-dir"])));
+    const branch = git(dir, ["branch", "--show-current"]);
+    if (gitDir === common || !branch || /^(?:main|master)$/.test(branch)) return undefined;
+    let fallback = "";
+    try {
+      fallback = git(dir, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    } catch {
+      /* no remote default recorded */
+    }
+    if (fallback && fallback.replace(/^origin\//, "") === branch) return undefined;
+    // With no origin default recorded, the default branch is known only by its usual names: a
+    // repository with neither main nor master has an unknown default, and fails closed.
+    if (!fallback) {
+      const named = [
+        "refs/heads/main",
+        "refs/heads/master",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+      ].some((ref) => {
+        try {
+          git(dir, ["rev-parse", "--verify", "--quiet", ref]);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (!named) return undefined;
+    }
+    return root;
+  } catch {
+    return undefined;
+  }
 }
 /**
  * Protected names (.claude, .agent-config, AGENTS.md ...) guard a repository's own configuration,
  * so they are judged relative to the Git top level. A linked worktree that lives under
  * `<repo>/.claude/worktrees/<name>` is ordinary code, while `<worktree>/.claude/settings.json`
- * stays protected.
+ * stays protected. In a linked feature worktree `.agent-config`, `.agents`, `AGENTS.md` and
+ * `CLAUDE.md` are ordinary code too (WORKTREE_CODE_NAME); in the main checkout or on the default
+ * branch they stay protected.
  */
 export function isProtectedPath(path: string): boolean {
   try {
     let parent = existsSync(path) && statSync(path).isDirectory() ? path : dirname(path);
     while (!existsSync(parent)) parent = dirname(parent);
     const root = canonical(git(parent, ["rev-parse", "--show-toplevel"]));
-    if (protectedPath(relative(root, canonical(path)))) return true;
+    const feature = featureCheckout(parent) === root;
+    if (protectedPath(relative(root, canonical(path)), feature)) return true;
     // A protected name that is a symlink (`.claude -> config`) vanishes once the path is resolved,
     // so also judge the path as written, relative to the checkout it lives in.
     const written = resolve(path);
     let ancestor = dirname(written);
     while (ancestor !== dirname(ancestor)) {
       if (existsSync(ancestor) && canonical(ancestor) === root)
-        return protectedPath(relative(ancestor, written));
+        return protectedPath(relative(ancestor, written), feature);
       ancestor = dirname(ancestor);
     }
     return false;

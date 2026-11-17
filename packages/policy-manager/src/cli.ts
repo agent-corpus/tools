@@ -4,15 +4,38 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { executionReport, hookOutput, normalize } from "./adapters.js";
+import { executionReport, type HookContext, hookOutput, normalize } from "./adapters.js";
+import { harnessOf, insideAgent, processTable } from "./ancestry.js";
+import {
+  type ApproveScope,
+  approvedMessage,
+  approveQuestion,
+  describeRequest,
+  ONCE_ONLY_NOTE,
+  parseAnswer,
+} from "./approve.js";
 import { sessionDirectoryPath } from "./audit.js";
 import { CLASSIFIER_ENV } from "./classifier.js";
-import { hookConfig } from "./config.js";
+import {
+  DEFAULT_APPROVAL_WAIT_SECONDS,
+  hookConfig,
+  MAX_APPROVAL_WAIT_SECONDS,
+  WAIT_FLAG,
+} from "./config.js";
 import { HUMAN_ONLY_FOR } from "./principle.js";
 import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
 import { replayClassified, replayTranscripts } from "./replay.js";
 import { formatReview, reviewClassifications, sessionDirectories } from "./review.js";
-import { latestHumanDecision, send, sendTo, serve, start, stop } from "./service.js";
+import {
+  harnessPids,
+  latestHumanDecision,
+  send,
+  sendTo,
+  serve,
+  start,
+  stop,
+  waitForApproval,
+} from "./service.js";
 import type { GrantPreview } from "./session.js";
 import { SetupError, setupHook } from "./setup.js";
 import { cliVersion, inspectShim, shimDirectory } from "./shim.js";
@@ -23,10 +46,11 @@ policy-manager hook <claude|codex|copilot> <SessionStart|PreToolUse|PermissionRe
 policy-manager review <claude|codex|copilot> <session-id>   # normalized request JSON on stdin
 policy-manager classify <claude|codex|copilot> <session-id> # {requestHash,category,confidence} on stdin
 policy-manager record <claude|codex|copilot> <session-id>   # host-reported human response or execution result JSON
-policy-manager approve --last [--session]  # the user, in their own terminal: allow the newest blocked request once, or its rule and scope for the session
-policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--session]  # the same for one exact request
-policy-manager setup-hook <claude|codex|copilot> [--dry-run] [--config-dir <harness-config-directory>] [--shim-dir <directory>]
-policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run] [--config-dir <directory>] [--shim-dir <directory>]
+policy-manager approve --last [--once|--session]  # the user, in their own terminal: shows the newest blocked request and asks "just this once, or for this session?"; a flag answers in advance
+policy-manager approve <claude|codex|copilot> <session-id> <request-hash> [--once|--session]  # the same for one exact request
+policy-manager setup-hook <claude|codex|copilot> [--dry-run] [--config-dir <harness-config-directory>] [--shim-dir <directory>] [--approval-wait <seconds>]
+policy-manager setup-hook-claude|setup-hook-codex|setup-hook-copilot [--dry-run] [--config-dir <directory>] [--shim-dir <directory>] [--approval-wait <seconds>]
+  --approval-wait: Codex only. How long PreToolUse waits for your approval (default ${DEFAULT_APPROVAL_WAIT_SECONDS}, at most ${MAX_APPROVAL_WAIT_SECONDS}; 0 denies at once). Its hook timeout is set to match.
 policy-manager config <claude|codex|copilot> <absolute-installed-cli-path>
 policy-manager profile validate <file>   # check a policy profile without installing it
 policy-manager profile install <file>    # install it to the user config directory outside Git
@@ -41,6 +65,8 @@ Unknown effects require human approval. Exit 0: protocol response; exit 1: malfo
 class ApproveError extends Error {}
 type GrantResult = Partial<GrantPreview> & {
   granted: boolean;
+  waiting?: boolean;
+  harnessPid?: number;
   scope?: "once" | "session";
   refused?: string;
 };
@@ -59,6 +85,16 @@ const args = process.argv.slice(2);
 const [action, harnessArg, phase] = args;
 const harness = harnessArg as Request["harness"];
 const cliPath = fileURLToPath(import.meta.url);
+/**
+ * Seconds this hook may wait for an approval: the value setup wrote after WAIT_FLAG, which it
+ * matched with the hook's timeout. A hook with none (an older setup) does not wait.
+ */
+function approvalWait(argv: string[]): number {
+  const index = argv.indexOf(WAIT_FLAG);
+  if (index < 0) return 0;
+  const value = Number(argv[index + 1]);
+  return Number.isSafeInteger(value) && value > 0 && value <= MAX_APPROVAL_WAIT_SECONDS ? value : 0;
+}
 /** Whether a managed `pm` launcher for this CLI is installed and on PATH. */
 function pmReady(): boolean {
   try {
@@ -80,14 +116,19 @@ try {
         "dry-run": { type: "boolean" },
         "config-dir": { type: "string" },
         "shim-dir": { type: "string" },
+        "approval-wait": { type: "string" },
       },
     });
+    const wait = values["approval-wait"];
+    if (wait !== undefined && !/^\d+$/.test(wait))
+      throw new SetupError("--approval-wait takes a number of seconds.");
     console.log(
       JSON.stringify(
         setupHook(selected, cliPath, {
           dryRun: values["dry-run"],
           configDirectory: values["config-dir"],
           shimDirectory: values["shim-dir"],
+          ...(wait === undefined ? {} : { approvalWaitSeconds: Number(wait) }),
         }),
         null,
         2,
@@ -183,13 +224,19 @@ try {
   } else if (action === "approve") {
     const { values, positionals } = parseArgs({
       args: args.slice(1),
-      options: { session: { type: "boolean" }, last: { type: "boolean" } },
+      options: {
+        session: { type: "boolean" },
+        once: { type: "boolean" },
+        last: { type: "boolean" },
+      },
       allowPositionals: true,
     });
     const usageText =
-      "Usage: policy-manager approve --last [--session], or approve <claude|codex|copilot> <session-id> <request-hash> [--session]";
+      "Usage: policy-manager approve --last [--once|--session], or approve <claude|codex|copilot> <session-id> <request-hash> [--once|--session]";
+    if (values.session && values.once) throw new ApproveError(usageText);
     let directory: string;
     let requestHash: string;
+    let session: { harness: string; sessionId: string; harnessPid?: number };
     if (values.last) {
       if (positionals.length) throw new ApproveError(usageText);
       if (!process.stdin.isTTY || !process.stdout.isTTY)
@@ -202,7 +249,7 @@ try {
           "No running policy session has a request waiting for approval from the last 15 minutes. Have the agent retry so it is blocked again.",
         );
       ({ directory, requestHash } = latest);
-      console.log(`Session:  ${latest.harness} ${latest.sessionId}`);
+      session = latest;
     } else {
       const [target, sessionId, hashArg] = positionals as [Request["harness"], string, string];
       if (
@@ -219,41 +266,47 @@ try {
         throw new ApproveError("No policy service is running for that session.");
       directory = sessionDirectoryPath(target, sessionId);
       requestHash = hashArg;
+      session = { harness: target, sessionId };
     }
-    const ask = (confirm: boolean) =>
+    const ask = (confirm: boolean, scope: ApproveScope) =>
       sendTo(directory, {
         action: "grant",
-        grant: { requestHash, confirm, session: values.session === true },
+        grant: { requestHash, confirm, session: scope === "session" },
       }) as Promise<GrantResult>;
-    const preview = await ask(false);
+    // A session preview: its scope says whether the request can be approved for the session.
+    const preview = await ask(false, "session");
     if (preview.refused) throw new ApproveError(preview.refused);
-    console.log(
-      `Tool:     ${preview.tool}\nRequest:  ${preview.detail}\nRule:     ${preview.reason}`,
-    );
-    if (values.session && preview.scope !== "session")
-      console.log(
-        "This request can only be approved once: credential reads, possible unrecoverable loss and requests whose effect could not be determined are never approved for a session.",
-      );
-    if (preview.scope === "session" && preview.sessionScope)
-      console.log(`Scope:    ${preview.sessionScope}`);
-    const prompt = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    const answer = await prompt.question(
-      preview.scope === "session"
-        ? "Allow this and later requests in this session that hit the same rule for the same scope? [y/N] "
-        : "Allow this request once? [y/N] ",
-    );
-    prompt.close();
-    if (!/^y(?:es)?$/i.test(answer.trim())) throw new ApproveError("Not approved.");
-    const granted = await ask(true);
+    // A terminal below the agent harness (a PTY from the agent, `script`) is the agent's, not
+    // the user's: refuse before showing or granting anything.
+    const pids = [...(await harnessPids())];
+    for (const pid of [session.harnessPid, preview.harnessPid]) if (pid) pids.push(pid);
+    const inside = insideAgent(pids);
+    if (inside) throw new ApproveError(inside);
+    const grantable = preview.scope === "session";
+    for (const line of describeRequest(preview, session)) console.log(line);
+    let scope: ApproveScope | undefined = values.once
+      ? "once"
+      : values.session && grantable
+        ? "session"
+        : undefined;
+    if (values.session && !grantable) console.log(ONCE_ONLY_NOTE);
+    if (!scope) {
+      const prompt = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await prompt.question(approveQuestion(grantable));
+      prompt.close();
+      scope = parseAnswer(answer, grantable);
+    }
+    if (!scope) {
+      // Tell the service, so a hook waiting for this request stops and denies it.
+      await sendTo(directory, {
+        action: "refuse",
+        grant: { requestHash, confirm: false },
+      }).catch(() => undefined);
+      throw new ApproveError("Not approved.");
+    }
+    const granted = await ask(true, scope);
     if (!granted.granted) throw new ApproveError(granted.refused ?? "Not approved.");
-    console.log(
-      granted.scope === "session"
-        ? "Approved for this session. Tell the agent to retry the request unchanged."
-        : "Approved once. Tell the agent to retry the request unchanged.",
-    );
+    console.log(approvedMessage(granted.scope ?? scope, granted.waiting === true));
   } else if (action === "serve") await serve(harness, phase ?? "", cliPath);
   else if (action === "stop")
     console.log(JSON.stringify(await send(harness, phase ?? "", { action: "stop" })));
@@ -326,19 +379,66 @@ try {
         });
         console.log("{}");
       } else if (phase === "PreToolUse" || phase === "PermissionRequest") {
-        const decision = (await send(harness, request.sessionId, {
-          action: "review",
-          request,
-          phase,
-          ...(typeof toolUseId === "string" ? { toolUseId } : {}),
-          ...(typeof payload.permission_mode === "string"
-            ? { permissionMode: payload.permission_mode }
-            : {}),
-        })) as Decision;
+        // The wait is measured from this process's start, so service start-up counts too.
+        const started = Math.floor(performance.timeOrigin);
+        const review = () =>
+          send(harness, request.sessionId, {
+            action: "review",
+            request,
+            phase,
+            ...(typeof toolUseId === "string" ? { toolUseId } : {}),
+            ...(typeof payload.permission_mode === "string"
+              ? { permissionMode: payload.permission_mode }
+              : {}),
+          }) as Promise<Decision>;
+        let decision = await review();
+        // Tell the service which process this session's harness is, so `approve` can refuse to
+        // run below it. Only for a decision a person must make: reading the process table costs.
+        if (decision.decision === "human") {
+          // Best effort and bounded: the hook's own timeout must still cover the review.
+          const table = processTable(3_000);
+          const harnessPid = table && harnessOf(process.pid, table);
+          if (harnessPid)
+            await send(harness, request.sessionId, { action: "harness", harnessPid }).catch(
+              () => undefined,
+            );
+        }
+        let waited: HookContext["waited"];
+        // Codex cannot ask: a request that needs a person waits here for the user's approval
+        // from their own terminal, when setup gave this hook a wait and a matching timeout.
+        const wait = approvalWait(args);
+        if (
+          harness === "codex" &&
+          phase === "PreToolUse" &&
+          wait > 0 &&
+          decision.decision === "human" &&
+          !decision.userOnly
+        ) {
+          const requestHash = decision.requestHash;
+          const outcome = await waitForApproval(
+            () =>
+              send(harness, request.sessionId, {
+                action: "await",
+                grant: { requestHash, confirm: false },
+              }),
+            started + wait * 1000,
+          );
+          if (outcome === "granted") decision = await review();
+          else {
+            waited = { seconds: wait, outcome };
+            if (outcome === "timeout")
+              await send(harness, request.sessionId, {
+                action: "await",
+                grant: { requestHash, confirm: false },
+                waitOutcome: "timeout",
+              }).catch(() => undefined);
+          }
+        }
         const output = hookOutput(harness, phase, decision, {
           cliPath,
           sessionId: request.sessionId,
           pmOnPath: decision.decision === "human" && harness === "codex" && pmReady(),
+          ...(waited ? { waited } : {}),
         });
         if (output) console.log(output);
       } else throw new Error("Unsupported hook event");

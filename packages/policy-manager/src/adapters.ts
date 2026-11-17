@@ -1,3 +1,4 @@
+import { formatWait } from "./config.js";
 import { requestHash } from "./policy.js";
 import type { Decision, OutcomeReport, Request } from "./types.js";
 export function normalize(harness: Request["harness"], payload: Record<string, unknown>): Request {
@@ -20,6 +21,12 @@ export interface HookContext {
   sessionId: string;
   /** A managed `pm` launcher for this CLI is installed and on PATH. */
   pmOnPath?: boolean;
+  /**
+   * The Codex hook waited this many seconds for the user's approval and none came: `timeout`
+   * (the wait ran out) or `gone` (the request can no longer be approved); `refused` when the
+   * user turned it down from their terminal.
+   */
+  waited?: { seconds: number; outcome: "timeout" | "gone" | "refused" | "unreachable" };
 }
 /**
  * The exact command the model is told to run to record a classification. A here-string, not a
@@ -94,14 +101,33 @@ export function looksLikeClassifyRecord(command: string): boolean {
 }
 /**
  * A command that runs, or names, a policy-manager `approve`, anywhere in the script and at any
- * nesting (`sh -c '...'`, a here-document). Unlike a classification record, the agent never runs
- * this: only the user approves, from their own terminal.
+ * nesting (`sh -c '...'`, `script -q /dev/null ...`, `env`, `xargs`, a here-document). Unlike a
+ * classification record, the agent never runs this: only the user approves, from their own
+ * terminal. Any token that names the CLI (`pm`, `pm.cmd`, a path ending in `/pm` such as the
+ * managed launcher, a `cli.js`, `policy-manager`, `@agent-corpus/policy-manager[@version]` for
+ * npx or `npm exec`) together with the word `approve` anywhere counts. Quotes and backslashes are
+ * dropped first (a backslash is also read as a path separator), so `"pm" app''rove`, `p\m approve`
+ * and `C:\\bin\\pm.cmd approve` count too. It is lexical: a command
+ * that builds the name at run time (`$(printf p)m`) is an expansion the engine asks about anyway.
  */
-const APPROVE_PROGRAM = /^(?:.*cli\.js|(?:@agent-corpus\/)?policy-manager(?:@.*)?)$/;
+/** Whether a token names the CLI: by its last path segment, so matching stays linear. */
+function approveProgram(token: string): boolean {
+  const name = token.slice(token.lastIndexOf("/") + 1);
+  return (
+    name.toLowerCase().endsWith("cli.js") ||
+    /^policy-manager(?:@|$)/i.test(name) ||
+    /^pm(?:\.cmd|\.exe|\.bat|\.ps1)?$/i.test(name)
+  );
+}
+const SEPARATORS = /[\s`;&|()<>{}=]+/;
 // A token scan rather than one regular expression over the command, so its cost stays linear.
 export function looksLikeApproveGrant(command: string): boolean {
-  const tokens = command.split(/[\s"'`;&|()]+/);
-  return tokens.some((token, i) => tokens[i + 1] === "approve" && APPROVE_PROGRAM.test(token));
+  const unquoted = command.replace(/["']/g, "");
+  const tokens = [
+    ...unquoted.replace(/\\/g, "").split(SEPARATORS),
+    ...unquoted.replace(/\\/g, "/").split(SEPARATORS),
+  ];
+  return tokens.includes("approve") && tokens.some(approveProgram);
 }
 /** The command the user runs in their own terminal to approve a human decision. */
 export function approveCommand(
@@ -127,18 +153,33 @@ export function approveLastCommand(context?: HookContext): string {
   return cliPath ? `node "${cliPath}" approve --last` : "policy-manager approve --last";
 }
 /**
- * What Codex shows for a decision that needs a person. Codex cannot ask, so the agent must stop
- * and hand the user one command; the first line says so, and the command stands on its own line.
+ * What Codex shows for a decision that needs a person, after the hook waited for an approval that
+ * did not come (or without waiting, when setup configured none). Codex cannot ask, so the agent
+ * must stop and hand the user one command; the first line says so, and the command stands on its
+ * own line.
  */
 export function approveInstruction(decision: Decision, context?: HookContext): string {
+  if (context?.waited?.outcome === "refused")
+    return [
+      `⏹ You declined this request in your terminal. Not run: ${decision.reason}.`,
+      "Agent: do not retry it unchanged. Stop and ask the user how to proceed.",
+      `Request ${decision.requestHash}.`,
+    ].join("\n");
+  const waited = !context?.waited
+    ? ""
+    : context.waited.outcome === "unreachable"
+      ? " The policy service stopped answering while the hook waited, so nothing could be approved."
+      : context.waited.outcome === "gone"
+        ? " The policy service restarted or the approval window closed while the hook waited."
+        : ` No approval came within ${formatWait(context.waited.seconds)}.`;
   return [
-    `⏸ Waiting for your approval. Not run: ${decision.reason}.`,
+    `⏸ Waiting for your approval. Not run: ${decision.reason}.${waited}`,
     ...(askWhy(decision) ? [`${askWhy(decision)}.`] : []),
     'Run in your own terminal, then say "retry":',
     `  ${approveLastCommand(context)}`,
     ...(decision.sessionGrantable
       ? [
-          `Add --session to also allow ${decision.sessionScopeLabel ?? "the same rule for the same scope"} for the rest of this session.`,
+          `It asks whether to allow it just once or, for ${decision.sessionScopeLabel ?? "the same rule and scope"}, for the rest of this session.`,
         ]
       : []),
     "Agent: stop now and end your turn; approving it in chat does not unblock it. Show the user the command above exactly, in a code block. Never run it yourself.",

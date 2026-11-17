@@ -2,7 +2,14 @@ import { execFileSync } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createdBySession } from "./created.js";
-import { canonical, inside, isProtectedPath, protectedPath, sensitive } from "./evidence.js";
+import {
+  canonical,
+  featureCheckout,
+  inside,
+  isProtectedPath,
+  protectedPath,
+  sensitive,
+} from "./evidence.js";
 import { type Command, parseScript, type Word } from "./script.js";
 import { parseShell } from "./shell.js";
 import type { Request } from "./types.js";
@@ -107,19 +114,8 @@ interface Worktree {
 
 /** The linked worktree on a feature branch that contains `dir`, or undefined. */
 function featureWorktree(dir: string): Worktree | undefined {
-  const root = canonical(git(dir, ["rev-parse", "--show-toplevel"]));
-  const gitDir = canonical(git(dir, ["rev-parse", "--absolute-git-dir"]));
-  const common = canonical(resolve(dir, git(dir, ["rev-parse", "--git-common-dir"])));
-  const branch = git(dir, ["branch", "--show-current"]);
-  if (gitDir === common || !branch || /^(?:main|master)$/.test(branch)) return undefined;
-  let fallback = "";
-  try {
-    fallback = git(dir, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
-  } catch {
-    /* no remote default recorded */
-  }
-  if (fallback && fallback.replace(/^origin\//, "") === branch) return undefined;
-  return { root };
+  const root = featureCheckout(dir);
+  return root === undefined ? undefined : { root };
 }
 
 interface Entry {
@@ -202,7 +198,7 @@ function locate(
   const tree = featureWorktree(parent);
   if (!tree || !inside(tree.root, target) || target === tree.root) return undefined;
   const rel = relative(tree.root, target).split(sep).join("/");
-  if (!rel || protectedPath(rel)) return undefined;
+  if (!rel || protectedPath(rel, true)) return undefined;
   return { root: tree.root, rel, target, trailing };
 }
 
@@ -337,7 +333,7 @@ export function restoreRecoverable(cwd: string, paths: string[], fromHead: boole
         const tree = featureWorktree(here);
         if (!tree) return false;
         const rel = relative(tree.root, here).split(sep).join("/");
-        if (protectedPath(rel) || sensitive(here) || !check(tree.root, rel || ".", fromHead))
+        if (protectedPath(rel, true) || sensitive(here) || !check(tree.root, rel || ".", fromHead))
           return false;
         continue;
       }
@@ -378,7 +374,7 @@ export function resetRecoverable(cwd: string, target = "HEAD"): boolean {
       .split("\0")
       .filter(Boolean);
     if (!written.length) return true;
-    if (written.some((path) => protectedPath(path))) return false;
+    if (written.some((path) => protectedPath(path, true))) return false;
     const loose = status(root, [], true).map((e) => e.path.replace(/\/$/, ""));
     return !written.some((path) =>
       loose.some((u) => path === u || path.startsWith(`${u}/`) || u.startsWith(`${path}/`)),

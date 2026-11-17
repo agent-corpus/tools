@@ -230,10 +230,11 @@ describe("hook timeouts", () => {
   };
   // Codex limits SessionEnd to 1 to 3 seconds and warns about anything longer.
   // Every other managed hook outlasts the classifier (at most 20 s) and the service's review wait.
-  test("Codex SessionEnd is 3 seconds and the other Codex hooks are 45", () => {
+  test("Codex SessionEnd is 3 seconds, PreToolUse 45 plus the approval wait, the others 45", () => {
     const t = timeouts("codex");
     expect(t.SessionEnd).toBe(3);
-    for (const phase of ["SessionStart", "PreToolUse", "PermissionRequest", "PostToolUse"])
+    expect(t.PreToolUse).toBe(45 + 600);
+    for (const phase of ["SessionStart", "PermissionRequest", "PostToolUse"])
       expect(t[phase]).toBe(45);
   });
   test("Claude and Copilot hooks are 45 seconds everywhere", () => {
@@ -340,8 +341,10 @@ describe("setup output", () => {
     expect(text).toContain("trusts the command text, not the code behind it");
     expect(text).toContain("review a new version before upgrading in place");
     expect(text).toContain("trust it again");
-    expect(text).toContain("returned as a deny");
-    expect(text).toContain("approving it in chat does not unblock it");
+    expect(text).toContain("waits in the hook for up to 10 minutes");
+    expect(text).toContain("pm approve --last");
+    expect(text).toContain("Approving in chat does not unblock it");
+    expect(text).toContain("the request is denied");
   });
   test("Claude and Copilot setup output has no Codex-only text", () => {
     for (const harness of ["claude", "copilot"] as const) {

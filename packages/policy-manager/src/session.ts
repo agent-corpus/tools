@@ -2,6 +2,7 @@ import { basename, dirname } from "node:path";
 import { looksLikeApproveGrant, looksLikeClassifyRecord } from "./adapters.js";
 import { audit, requestSummary } from "./audit.js";
 import { type ClassifierResult, classifyWithCli } from "./classifier.js";
+import { runsPolicyCli } from "./clirun.js";
 import {
   type CreatedFiles,
   creationTargets,
@@ -34,8 +35,14 @@ const CREATION_REPORT_MS = 15 * 60_000;
 
 export { APPROVE_GUARD };
 
-/** Claude Code permission modes in which a hook's ask is shown to a person. */
-const PROMPTING_MODES = new Set(["default", "acceptEdits", "plan"]);
+/**
+ * Claude Code permission modes in which a hook's ask may never reach a person: `bypassPermissions`
+ * skips prompts and `dontAsk` denies what would prompt. A second guard only: in every mode a yes
+ * also needs the PermissionRequest that shows a dialog was about to be shown (`notePrompt`).
+ */
+const SILENT_MODES = new Set(["bypassPermissions", "dontAsk"]);
+/** How recently a hook must have polled for its request to count as waiting for an approval. */
+const WAITING_MS = 5_000;
 /** Hard items no allow rule approves, at any level: they always ask the person. */
 const NO_ALLOW = new Set([
   "credential-read",
@@ -129,10 +136,25 @@ export class PolicySession {
   private grants = new Map<string, { phases: Set<string> }>();
   /** Session grants: hashes of a human rule and the scope the user approved it for. */
   private sessionGrants = new Set<string>();
+  /** Requests the user turned down from their terminal, so a waiting hook stops waiting. */
+  private refused = new Set<string>();
+  /** The harness process this session's hooks run under, as the hook reported it. */
+  harnessPid: number | undefined;
+  /** Requests a hook started waiting on: each wait is audited once at its start and its end. */
+  private waitStarted = new Set<string>();
+  /** When a hook last polled for each request it is waiting on (`approvalState`). */
+  private waiting = new Map<string, number>();
   /** Harness prompts waiting for their answer, by `tool_use_id` (or `request:<hash>`). */
   private asks = new Map<
     string,
-    { request: Request; decision: Decision; at: number; scope: string | undefined }
+    {
+      request: Request;
+      decision: Decision;
+      at: number;
+      scope: string | undefined;
+      /** Claude Code ran PermissionRequest for it: it was about to show the person a dialog. */
+      prompted?: boolean;
+    }
   >();
   /** Classifications running now, so concurrent hooks for one request share one CLI run. */
   private running = new Map<string, Promise<ClassifierResult>>();
@@ -178,13 +200,16 @@ export class PolicySession {
     };
   }
   /**
-   * Only the user approves a request once, from their own terminal. A shell command that runs a
-   * policy-manager `approve`, in any form or nesting, is never approved for the agent.
+   * Only the user approves a request, from their own terminal. A shell command that runs the
+   * policy-manager CLI by any name, in any form or nesting (`runsPolicyCli`), or names `approve`
+   * with it (`looksLikeApproveGrant`), is never approved for the agent. The exceptions are a few
+   * read-only subcommands written literally, and this session's own classification record.
    */
   private approveGrant(request: Request): Decision | undefined {
     const command = request.input.command ?? request.input.cmd;
     if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string") return undefined;
-    if (!looksLikeApproveGrant(command)) return undefined;
+    // Classification records (`classify`, literally) are judged by `classifyRecord`.
+    if (!looksLikeApproveGrant(command) && !runsPolicyCli(command, this.cliPath)) return undefined;
     return { ...result(request, "sensitive", APPROVE_GUARD), hard: "self-approve" };
   }
   /**
@@ -224,15 +249,26 @@ export class PolicySession {
       ...result(request, decision.category, "Approved for this session by the user", true),
     };
   }
+  /** Records the harness process a hook found above it, for `approve`'s ancestry check. */
+  noteHarness(pid: number): void {
+    if (Number.isSafeInteger(pid) && pid > 1) this.harnessPid = pid;
+  }
   /** The newest request this session sent to a person that the user may still approve. */
   latestHumanDecision():
-    | { requestHash: string; at: number; harness: string; sessionId: string }
+    | { requestHash: string; at: number; harness: string; sessionId: string; harnessPid?: number }
     | undefined {
     let latest: { requestHash: string; at: number } | undefined;
     for (const [requestHash, entry] of this.humanDecisions)
       if (Date.now() - entry.at <= GRANT_WINDOW_MS && (!latest || entry.at >= latest.at))
         latest = { requestHash, at: entry.at };
-    return latest && { ...latest, harness: this.harness, sessionId: this.sessionId };
+    return (
+      latest && {
+        ...latest,
+        harness: this.harness,
+        sessionId: this.sessionId,
+        ...(this.harnessPid ? { harnessPid: this.harnessPid } : {}),
+      }
+    );
   }
   private addSessionGrant(reason: string, scope: string): string {
     if (this.sessionGrants.size >= 64) this.sessionGrants.clear();
@@ -251,7 +287,12 @@ export class PolicySession {
     requestHash: string,
     confirm: boolean,
     session = false,
-  ): GrantPreview & { granted: boolean; scope: "once" | "session" } {
+  ): GrantPreview & {
+    granted: boolean;
+    scope: "once" | "session";
+    waiting?: boolean;
+    harnessPid?: number;
+  } {
     if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new GrantError("Not a request hash");
     const pending = this.humanDecisions.get(requestHash);
     if (!pending || Date.now() - pending.at > GRANT_WINDOW_MS) {
@@ -268,7 +309,13 @@ export class PolicySession {
         ? { sessionScope: scopeLabel(sessionScope, this.profile) }
         : {}),
     };
-    if (!confirm) return { ...preview, granted: false, scope };
+    if (!confirm)
+      return {
+        ...preview,
+        granted: false,
+        scope,
+        ...(this.harnessPid ? { harnessPid: this.harnessPid } : {}),
+      };
     this.humanDecisions.delete(requestHash);
     if (scope === "session" && sessionScope !== undefined)
       this.addSessionGrant(preview.reason, sessionScope);
@@ -291,7 +338,88 @@ export class PolicySession {
       response: "approved",
       summary: "User approved the request from the terminal",
     });
-    return { ...preview, granted: true, scope };
+    return { ...preview, granted: true, scope, waiting: this.isWaiting(requestHash) };
+  }
+  /** A hook polled for this request within WAITING_MS: it is blocked waiting for the user. */
+  private isWaiting(requestHash: string): boolean {
+    const at = this.waiting.get(requestHash);
+    return at !== undefined && Date.now() - at <= WAITING_MS;
+  }
+  /**
+   * The user turned down a request this session sent to a person, from their own terminal. It
+   * can no longer be approved, and a hook waiting for it stops and denies it.
+   */
+  refuse(requestHash: string): { refused: boolean } {
+    if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new GrantError("Not a request hash");
+    const pending = this.humanDecisions.get(requestHash);
+    this.humanDecisions.delete(requestHash);
+    if (!pending || Date.now() - pending.at > GRANT_WINDOW_MS) return { refused: false };
+    if (this.refused.size >= 64) this.refused.delete(this.refused.values().next().value ?? "");
+    this.refused.add(requestHash);
+    audit(this.directory, {
+      event: "human-response",
+      requestHash,
+      response: "denied",
+      summary: "User declined the request from the terminal",
+    });
+    return { refused: true };
+  }
+  /**
+   * What a hook waiting for the user's answer to a request it was told needs a person sees:
+   * `granted` once the user approved it (once or for the session) and the grant is unused, or
+   * approved another request with the same rule and scope for the session; `refused` (per
+   * request) when they turned it down, `pending` while it can still be approved, and `gone`
+   * when it can no longer be (expired, or replaced). Each poll marks the request as waiting.
+   */
+  approvalState(requestHash: string): "granted" | "refused" | "pending" | "gone" {
+    if (!/^[a-f0-9]{64}$/.test(requestHash)) return "gone";
+    const state = this.pollState(requestHash);
+    if (state !== "pending") this.endWait(requestHash, state);
+    return state;
+  }
+  /** Ends a wait: audited once, with its outcome. */
+  endWait(
+    requestHash: string,
+    outcome: "granted" | "refused" | "gone" | "timeout",
+  ): { ended: boolean } {
+    if (!this.waitStarted.delete(requestHash)) return { ended: false };
+    this.waiting.delete(requestHash);
+    audit(this.directory, { event: "approval-wait", requestHash, outcome });
+    return { ended: true };
+  }
+  private pollState(requestHash: string): "granted" | "refused" | "pending" | "gone" {
+    if (!this.waitStarted.has(requestHash)) {
+      if (this.waitStarted.size >= 64) this.waitStarted.clear();
+      this.waitStarted.add(requestHash);
+      audit(this.directory, { event: "approval-wait", requestHash, outcome: "started" });
+    }
+    if (this.waiting.size >= 64 && !this.waiting.has(requestHash))
+      this.waiting.delete(this.waiting.keys().next().value ?? "");
+    this.waiting.set(requestHash, Date.now());
+    if (this.refused.delete(requestHash)) {
+      this.waiting.delete(requestHash);
+      return "refused";
+    }
+    const once = this.grants.get(requestHash);
+    if (once && !once.phases.has("PreToolUse")) {
+      this.waiting.delete(requestHash);
+      return "granted";
+    }
+    const pending = this.humanDecisions.get(requestHash);
+    if (pending && Date.now() - pending.at <= GRANT_WINDOW_MS) {
+      // A session grant the user gave for another request with the same rule and scope covers
+      // this one too: `granted()` uses the same key, so the hook's re-review approves it.
+      if (
+        pending.sessionScope !== undefined &&
+        this.sessionGrants.has(hash([pending.reason, pending.sessionScope]))
+      ) {
+        this.waiting.delete(requestHash);
+        return "granted";
+      }
+      return "pending";
+    }
+    this.waiting.delete(requestHash);
+    return "gone";
   }
   private state(requestHash: string): ClassificationState | undefined {
     const state = this.states.get(requestHash);
@@ -662,6 +790,8 @@ export class PolicySession {
     decision = this.conclude(request, decision);
     if (decision.decision === "human" && phase === "PreToolUse")
       this.awaitAnswer(request, decision, toolUseId, permissionMode);
+    else if (decision.decision === "human" && phase === "PermissionRequest")
+      this.notePrompt(decision.requestHash, toolUseId);
     return decision;
   }
   /**
@@ -681,11 +811,10 @@ export class PolicySession {
     }
   }
   /**
-   * The hook asked, so the harness prompts the person. Its PostToolUse for this exact tool call
-   * means they said yes, but only when the harness reports a permission mode in which an ask is
-   * really shown to a person: Claude Code's `default`, `acceptEdits` or `plan`. Under
-   * `bypassPermissions`, `dontAsk`, an auto mode, or with no mode reported (Copilot reports none,
-   * so `--allow-all`/`--yolo` cannot be told apart), nothing is remembered. Codex cannot ask.
+   * The hook asked. A person said yes only if Claude Code then showed them a dialog (PermissionRequest,
+   * see `notePrompt`) and the tool ran (PostToolUse). The permission mode is a second guard only:
+   * under `bypassPermissions` or `dontAsk`, or with no mode reported, nothing is awaited. Copilot
+   * reports no mode, so `--allow-all`/`--yolo` cannot be told apart, and Codex cannot ask.
    */
   private awaitAnswer(
     request: Request,
@@ -694,7 +823,7 @@ export class PolicySession {
     permissionMode: string | undefined,
   ): void {
     if (this.harness !== "claude") return;
-    if (!permissionMode || !PROMPTING_MODES.has(permissionMode)) return;
+    if (!permissionMode || SILENT_MODES.has(permissionMode)) return;
     if (!toolUseId || !/^[\w.:-]{1,200}$/.test(toolUseId)) return;
     if (this.asks.size >= 256) this.asks.delete(this.asks.keys().next().value ?? "");
     // The scope shown with the prompt, read before the tool runs and changes what it reads.
@@ -702,8 +831,32 @@ export class PolicySession {
     this.asks.set(toolUseId, { request, decision, at: Date.now(), scope });
   }
   /**
-   * PostToolUse (or PostToolUseFailure) for a tool call the harness asked the person about: they
-   * said yes. The answer is remembered like `approve --session`: the same rule for the same scope
+   * Claude Code runs PermissionRequest only when it is about to ask the person for permission (or
+   * would auto-deny a call that cannot prompt, which then never runs). After our PreToolUse ask, a
+   * PermissionRequest for the same request that this hook leaves undecided is direct evidence that
+   * the person saw the dialog. PermissionRequest carries no `tool_use_id`, so without one it marks
+   * the newest unprompted ask for the same request hash in this session.
+   */
+  private notePrompt(requestHash: string, toolUseId: string | undefined): void {
+    if (this.harness !== "claude") return;
+    const direct = toolUseId ? this.asks.get(toolUseId) : undefined;
+    if (direct) {
+      if (direct.decision.requestHash === requestHash) direct.prompted = true;
+      return;
+    }
+    let newest: { at: number; prompted?: boolean } | undefined;
+    for (const ask of this.asks.values())
+      if (
+        ask.decision.requestHash === requestHash &&
+        !ask.prompted &&
+        (!newest || ask.at >= newest.at)
+      )
+        newest = ask;
+    if (newest) newest.prompted = true;
+  }
+  /**
+   * PostToolUse (or PostToolUseFailure) for a tool call the harness showed the person a dialog
+   * about (PreToolUse ask, then PermissionRequest): they said yes. The answer is remembered like `approve --session`: the same rule for the same scope
    * is approved for the rest of the session (a protected root, a humanPatterns entry, or the exact
    * command for other rules); unknown, sensitive and destructive requests stay once-only.
    */
@@ -731,6 +884,9 @@ export class PolicySession {
       });
       return "rejected";
     }
+    // No PermissionRequest after the ask: no dialog was shown (an auto-mode approval, a hook or
+    // rule that decided it), so the run is not a person's yes.
+    if (!ask.prompted) return undefined;
     this.humanDecisions.delete(report.requestHash);
     const scope = ask.scope;
     audit(this.directory, {

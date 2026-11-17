@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
+import { computesProgram } from "./clirun.js";
 import {
   branchEvidence,
   canonical,
@@ -10,7 +11,7 @@ import {
   resolveWord,
   withEvidence,
 } from "./evidence.js";
-import { hardRule, hardRules } from "./hard.js";
+import { hardRule, hardRules, readsPolicySecret } from "./hard.js";
 
 /** Tools that write a file (a shell command is judged by the engine itself). */
 const WRITE_TOOLS = new Set([
@@ -386,10 +387,16 @@ function tooManyWords(command: string): boolean {
     for (const word of segment) if (!word.heredoc && ++count > MAX_WORDS) return true;
   return false;
 }
+/** Why a command whose program name is computed at run time is not approved by the engine. */
+export const COMPUTED_PROGRAM =
+  "The program name is computed at run time, so what runs needs review";
 /** Hard items no step approves, the engine's included: the deterministic floor. */
 const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside", "policy-state"]);
 export const FLOOR_REASON =
   "A cloud, repository, publishing or deletion command outside disposable roots needs a person";
+/** Why a request that could change the policy manager's own files needs a person. */
+export const POLICY_STATE_REASON =
+  "Could change the policy manager's own files (its session state in the temp directory); needs a person";
 /**
  * The decision for a request. The floor runs after the engine: a cloud or infrastructure write, a
  * repository deletion, a publish or a recursive delete outside disposable roots is never approved,
@@ -419,7 +426,27 @@ function evaluateOnce(
     // engine still asks for cloud deletion there.
     (rule) => FLOOR.has(rule) && !(rule === "cloud-write" && profile.cloudWrites === "allow"),
   );
-  return floor ? { ...result(request, "destructive", FLOOR_REASON), hard: floor } : decision;
+  if (floor)
+    return {
+      ...result(
+        request,
+        floor === "policy-state" ? "sensitive" : "destructive",
+        floor === "policy-state" ? POLICY_STATE_REASON : FLOOR_REASON,
+      ),
+      hard: floor,
+    };
+  // The session token authenticates grants: reading it, or anything beside it but the audit logs,
+  // is a credential read no step approves.
+  if (readsPolicySecret(request, profile.scratchRoots))
+    return {
+      ...result(
+        request,
+        "sensitive",
+        "Reading the policy service's session credentials requires a person",
+      ),
+      hard: "credential-read",
+    };
+  return decision;
 }
 
 function evaluateSteps(
@@ -427,15 +454,25 @@ function evaluateSteps(
   ai?: Classification,
   profile: Profile = strictProfile,
 ): Decision {
-  const core = evaluateCore(request, profile);
+  let core = evaluateCore(request, profile);
+  // A program whose name is computed at run time (`$p$q approve`) is never approved by the
+  // engine, in any profile: what runs is unknown until it runs, so the classifier or a person judges.
+  const shellScript = request.input?.command ?? request.input?.cmd;
+  const computed =
+    SHELL_TOOLS.has(request.tool) &&
+    typeof shellScript === "string" &&
+    computesProgram(shellScript);
+  if (computed && core.decision === "approve") core = result(request, "unknown", COMPUTED_PROGRAM);
   // A plain read of non-secret files, protected configuration included, changes nothing.
   if (
+    !computed &&
     core.decision === "human" &&
     !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
     plainRead(request, profile.scratchRoots)
   )
     return result(request, "code-read", PLAIN_READ, true);
   if (
+    !computed &&
     core.decision === "human" &&
     !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
     chainApproved(request, profile)
@@ -450,7 +487,13 @@ function evaluateSteps(
     );
     if (tamper)
       return {
-        ...result(request, "sensitive", "Harness settings and the policy profile require a person"),
+        ...result(
+          request,
+          "sensitive",
+          tamper === "policy-state"
+            ? POLICY_STATE_REASON
+            : "Harness settings and the policy profile require a person",
+        ),
         hard: tamper,
       };
   }

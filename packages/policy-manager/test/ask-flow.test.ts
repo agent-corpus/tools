@@ -63,6 +63,8 @@ describe("Claude Code: ask, wait, remember", () => {
     const { s, runs, directory } = session("claude");
     const r = bash("git pull origin a");
     const asked = await s.decide(r, "PreToolUse", "toolu_1", "default");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(r, "PermissionRequest");
     expect(asked.decision).toBe("human");
     expect(hookResponse("claude", "PreToolUse", asked)).toMatchObject({
       hookSpecificOutput: { permissionDecision: "ask" },
@@ -87,6 +89,8 @@ describe("Claude Code: ask, wait, remember", () => {
     );
     const { s, runs } = session("claude", profile);
     const asked = await s.decide(bash("make deploy"), "PreToolUse", "toolu_p", "default");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(bash("make deploy"), "PermissionRequest");
     expect(asked).toMatchObject({ decision: "human", hard: "human-patterns" });
     expect(s.answered(executed(asked.requestHash, "toolu_p"))).toBe("session");
     expect((await s.decide(bash("make deploy"), "PreToolUse")).decision).toBe("approve");
@@ -103,6 +107,8 @@ describe("Claude Code: ask, wait, remember", () => {
     ]) {
       const r = bash(command);
       const asked = await s.decide(r, "PreToolUse", `toolu_${command.length}`, "default");
+      // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+      await s.decide(r, "PermissionRequest");
       expect(asked.decision, command).toBe("human");
       expect(s.answered(executed(asked.requestHash, `toolu_${command.length}`)), command).toBe(
         "once",
@@ -115,6 +121,8 @@ describe("Claude Code: ask, wait, remember", () => {
     const { s, directory } = session("claude");
     const r = bash("git pull origin a");
     const asked = await s.decide(r, "PreToolUse", "toolu_r", "default");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(r, "PermissionRequest");
     expect(
       s.answered({
         ...executed(asked.requestHash, "toolu_r", "PostToolUseFailure"),
@@ -130,6 +138,8 @@ describe("Claude Code: ask, wait, remember", () => {
     const { s } = session("claude");
     const r = bash("git pull origin a");
     const asked = await s.decide(r, "PreToolUse", "toolu_f", "default");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(r, "PermissionRequest");
     expect(
       s.answered({
         ...executed(asked.requestHash, "toolu_f", "PostToolUseFailure"),
@@ -142,6 +152,8 @@ describe("Claude Code: ask, wait, remember", () => {
     const { s } = session("claude");
     const r = bash("git pull origin a");
     const asked = await s.decide(r, "PreToolUse", "toolu_x", "default");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(r, "PermissionRequest");
     expect(s.answered(executed(asked.requestHash, "toolu_other"))).toBeUndefined();
     expect(s.answered(executed("f".repeat(64), "toolu_x"))).toBeUndefined();
     // No id: nothing is remembered.
@@ -165,12 +177,95 @@ describe("a yes is only remembered when a person was really asked", () => {
     expect((await s.decide(r, "PreToolUse")).decision).toBe("human");
   });
 
-  test.each([undefined, "bypassPermissions", "dontAsk", "auto"])(
+  test.each(["default", "acceptEdits", "plan", "auto"])(
+    "Claude Code in permission mode %s: the yes is remembered",
+    async (mode) => {
+      const { s } = session("claude");
+      const r = bash("git pull origin a");
+      const asked = await s.decide(r, "PreToolUse", "toolu_m", mode);
+      // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+      await s.decide(r, "PermissionRequest");
+      expect(asked.decision).toBe("human");
+      expect(s.answered(executed(asked.requestHash, "toolu_m"))).toBe("session");
+      expect((await s.decide(r, "PreToolUse")).decision).toBe("approve");
+    },
+  );
+
+  test.each(["default", "auto"])(
+    "%s: PreToolUse ask, then PostToolUse with no PermissionRequest: no grant",
+    async (mode) => {
+      const { s } = session("claude");
+      const r = bash("git pull origin a");
+      const asked = await s.decide(r, "PreToolUse", "toolu_n", mode);
+      expect(asked.decision).toBe("human");
+      // No dialog was shown (in auto mode, the classifier may have let it through).
+      expect(s.answered(executed(asked.requestHash, "toolu_n"))).toBeUndefined();
+      expect((await s.decide(r, "PreToolUse")).decision).toBe("human");
+    },
+  );
+
+  test.each(["default", "auto"])(
+    "%s: PreToolUse ask, PermissionRequest, then PostToolUse: a grant",
+    async (mode) => {
+      const { s } = session("claude");
+      const r = bash("git pull origin a");
+      const asked = await s.decide(r, "PreToolUse", "toolu_y", mode);
+      await s.decide(r, "PermissionRequest");
+      expect(s.answered(executed(asked.requestHash, "toolu_y"))).toBe("session");
+      expect((await s.decide(r, "PreToolUse")).decision).toBe("approve");
+    },
+  );
+
+  test("a PermissionRequest matches by tool_use_id when it has one", async () => {
+    const { s } = session("claude");
+    const r = bash("git pull origin a");
+    const first = await s.decide(r, "PreToolUse", "toolu_1", "auto");
+    await s.decide(r, "PreToolUse", "toolu_2", "auto");
+    await s.decide(r, "PermissionRequest", "toolu_2");
+    // The dialog was for toolu_2: the run of toolu_1 is no yes.
+    expect(s.answered(executed(first.requestHash, "toolu_1"))).toBeUndefined();
+    expect(s.answered(executed(first.requestHash, "toolu_2"))).toBe("session");
+  });
+
+  test("a PermissionRequest for another request, or before the ask, does not count", async () => {
+    const { s } = session("claude");
+    const r = bash("git pull origin a");
+    await s.decide(r, "PermissionRequest");
+    await s.decide(bash("git pull origin b"), "PermissionRequest");
+    const asked = await s.decide(r, "PreToolUse", "toolu_o", "default");
+    expect(s.answered(executed(asked.requestHash, "toolu_o"))).toBeUndefined();
+  });
+
+  test.each(["bypassPermissions", "dontAsk"])(
+    "%s: even with a PermissionRequest, nothing is remembered",
+    async (mode) => {
+      const { s } = session("claude");
+      const r = bash("git pull origin a");
+      const asked = await s.decide(r, "PreToolUse", "toolu_b", mode);
+      await s.decide(r, "PermissionRequest");
+      expect(s.answered(executed(asked.requestHash, "toolu_b"))).toBeUndefined();
+    },
+  );
+
+  test("auto mode: a yes is remembered only for the request the hook asked about", async () => {
+    const { s } = session("claude");
+    const asked = await s.decide(bash("git pull origin a"), "PreToolUse", "toolu_a", "auto");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(bash("git pull origin a"), "PermissionRequest");
+    // A PostToolUse for another tool call, or for another request under the same id, is no yes.
+    expect(s.answered(executed(asked.requestHash, "toolu_other"))).toBeUndefined();
+    expect(s.answered(executed("0".repeat(64), "toolu_a"))).toBeUndefined();
+    expect((await s.decide(bash("git pull origin a"), "PreToolUse")).decision).toBe("human");
+  });
+
+  test.each([undefined, "bypassPermissions", "dontAsk"])(
     "Claude Code in permission mode %s: nothing is remembered",
     async (mode) => {
       const { s } = session("claude");
       const r = bash("git pull origin a");
       const asked = await s.decide(r, "PreToolUse", "toolu_m", mode);
+      // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+      await s.decide(r, "PermissionRequest");
       expect(s.answered(executed(asked.requestHash, "toolu_m"))).toBeUndefined();
       expect((await s.decide(r, "PreToolUse")).decision).toBe("human");
     },
@@ -192,6 +287,8 @@ describe("a yes is only remembered when a person was really asked", () => {
         input: { file_path: path, content: "x" },
       };
       const asked = await s.decide(write, "PreToolUse", "toolu_w", "default");
+      // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+      await s.decide(write, "PermissionRequest");
       expect(asked.decision, path).toBe("human");
       s.answered(executed(asked.requestHash, "toolu_w"));
     }
@@ -265,6 +362,7 @@ describe("setup writes timeouts above the classifier's", () => {
         const entry = entries[0] as { timeoutSec?: number; hooks?: Array<{ timeout?: number }> };
         const seconds = harness === "copilot" ? entry.timeoutSec : entry.hooks?.[0]?.timeout;
         if (harness === "codex" && event === "SessionEnd") expect(seconds).toBe(3);
+        else if (harness === "codex" && event === "PreToolUse") expect(seconds).toBe(45 + 600);
         else expect(seconds, event).toBe(45);
       }
       if (harness !== "codex")

@@ -16,7 +16,13 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { hookConfig, managedHookFlag } from "./config.js";
+import {
+  DEFAULT_APPROVAL_WAIT_SECONDS,
+  formatWait,
+  hookConfig,
+  managedHookFlag,
+  WAIT_FLAG,
+} from "./config.js";
 import { cliVersion, installShim, type ShimStatus, shimDirectory } from "./shim.js";
 import type { Request } from "./types.js";
 
@@ -26,6 +32,8 @@ export interface SetupOptions {
   dryRun?: boolean;
   /** Where to put the `pm` launcher. Without it, a `configDirectory` run leaves the launcher alone. */
   shimDirectory?: string;
+  /** Seconds a Codex PreToolUse hook waits for the user's approval (default 600; 0 denies at once). */
+  approvalWaitSeconds?: number;
 }
 export interface SetupResult {
   harness: Request["harness"];
@@ -83,10 +91,12 @@ function owned(hook: unknown, harness: Request["harness"], event: string): boole
       hook.args[2] === harness &&
       hook.args.at(-1) === managedHookFlag
     );
-  return (
-    typeof hook.command === "string" &&
-    hook.command.endsWith(` hook ${harness} ${event} ${managedHookFlag}`)
-  );
+  if (typeof hook.command !== "string") return false;
+  const tail = ` ${managedHookFlag}`;
+  if (!hook.command.endsWith(tail)) return false;
+  const head = hook.command.slice(0, -tail.length);
+  const base = ` hook ${harness} ${event}`;
+  return head.endsWith(base) || new RegExp(`${base} ${WAIT_FLAG} \\d+$`).test(head);
 }
 function merge(config: JsonObject, harness: Request["harness"], desired: JsonObject): JsonObject {
   if (config.hooks !== undefined && !object(config.hooks))
@@ -164,7 +174,18 @@ export function setupHook(
       : harness === "codex"
         ? join(root, "hooks.json")
         : join(root, "hooks", "policy-manager.json");
-  const desired = hookConfig(harness, installedCli);
+  const shimDir =
+    options.shimDirectory ?? (options.configDirectory === undefined ? shimDirectory() : undefined);
+  const wait = options.approvalWaitSeconds ?? DEFAULT_APPROVAL_WAIT_SECONDS;
+  let desired: JsonObject;
+  try {
+    desired = hookConfig(harness, installedCli, {
+      approvalWaitSeconds: wait,
+      ...(shimDir === undefined ? {} : { approveCommand: "pm approve --last" }),
+    });
+  } catch (error) {
+    throw new SetupError(error instanceof Error ? error.message : String(error));
+  }
   const dryRun = options.dryRun ?? false;
   const nextSteps = [
     "Start a new harness session to load the hooks.",
@@ -172,13 +193,13 @@ export function setupHook(
       ? [
           "Open /hooks and explicitly review and trust the installed hooks. Setup does not grant hook trust, and Codex skips hooks it has not trusted.",
           "Codex trusts the command text, not the code behind it: an upgrade at the same CLI path keeps trust, so review a new version before upgrading in place. A changed command (a new install path or Node binary) is skipped until you trust it again.",
-          "Codex does not support ask in PreToolUse, so a decision that needs a human is returned as a deny and the command does not run, and approving it in chat does not unblock it: run `pm approve --last` (or the command in the deny reason) in your own terminal, then tell the agent to retry.",
+          wait > 0
+            ? `Codex does not support ask in PreToolUse, so a request that needs you waits in the hook for up to ${formatWait(wait)}. While it waits Codex shows only the hook's status line: "Policy check. If this keeps running, a request is waiting for you: run pm approve --last in your own terminal". Run \`pm approve --last\` there and answer once (o) or session (s); the command then runs with no retry. Approving in chat does not unblock it. Without an answer in time the request is denied, with the same command to approve and retry.`
+            : "Codex does not support ask in PreToolUse, so a decision that needs a human is returned as a deny and the command does not run, and approving it in chat does not unblock it: run `pm approve --last` (or the command in the deny reason) in your own terminal, then tell the agent to retry.",
         ]
       : []),
     "Native sandbox controls and existing permission rules remain in effect.",
   ];
-  const shimDir =
-    options.shimDirectory ?? (options.configDirectory === undefined ? shimDirectory() : undefined);
   const shim = (dry: boolean) => {
     if (shimDir === undefined) return undefined;
     let status: ReturnType<typeof installShim>;

@@ -5,6 +5,7 @@ import {
   canonical,
   git,
   inside,
+  isProtectedPath,
   resolveWord,
   sensitive,
   tempRoots,
@@ -14,7 +15,13 @@ import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { defaultProfilePath } from "./profile.js";
 import { readOnly } from "./reads.js";
 import { type Command, command, innerScript, scan, type Word } from "./shellscan.js";
-import { codeTouchesState, findReachesState, namesState, stateText } from "./statepaths.js";
+import {
+  codeTouchesState,
+  findReachesState,
+  namesState,
+  namesStateSecret,
+  stateText,
+} from "./statepaths.js";
 import type { Decision, Request } from "./types.js";
 
 /**
@@ -90,6 +97,11 @@ const REASON_RULES: Array<[RegExp, HardRule]> = [
 ];
 
 const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell", "powershell"]);
+/** Tools that read or search a directory tree, by path (Claude Code, Codex, Copilot names). */
+const TREE_TOOLS = new Set([
+  ...["grep", "glob", "ls", "notebookread", "list_dir", "list_directory", "search", "find"],
+  ...["grep_search", "file_search", "view_image"],
+]);
 const WRITE_TOOLS = new Set([
   "Write",
   "Edit",
@@ -743,6 +755,22 @@ interface Context {
 /** Programs that delete or move their operands: a directory above the state counts for them. */
 /** Most directories a script is judged in before its directory counts as unknown. */
 const MAX_CWDS = 16;
+/** Readers that walk the directory trees they are given, with no flag needed. */
+const TREE_READERS = new Set(["rg", "ag", "ack", "tar", "zip", "7z", "rsync", "scp", "rclone"]);
+/** Programs that only list or name a directory, whatever their flags. */
+const LISTERS = new Set([
+  "ls",
+  "find",
+  "du",
+  "stat",
+  "tree",
+  "cd",
+  "pushd",
+  "echo",
+  "printf",
+  "test",
+  "[",
+]);
 const REMOVERS = new Set(["rm", "rmdir", "unlink", "shred", "mv", "trash", "srm", "rsync"]);
 const SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "source", "."]);
 /** Programs that run text they are given (inline code, a here-document, standard input). */
@@ -1176,6 +1204,12 @@ function analyzeCommand(
     /^(?:chmod|chown|chgrp)$/.test(programName) &&
     argTexts.some((text) => /^-[a-zA-Z]*R|^--recursive$/.test(text));
   const removes = !cmd.program?.literal || REMOVERS.has(programName) || recursive;
+  // A reader that walks a directory tree reads the session token below a directory it names.
+  const walks =
+    !cmd.program?.literal ||
+    TREE_READERS.has(programName) ||
+    (!LISTERS.has(programName) &&
+      argTexts.some((text) => /^-[a-zA-Z]*[rR]|^--recursive$|^--archive$/.test(text)));
   // An archive extracted into a directory the state lies in can overwrite it: `tar -x [-C dir]`,
   // `unzip [-d dir]`, `cpio -i` (into the working directory).
   if (cmd.program?.literal) {
@@ -1298,6 +1332,12 @@ function analyzeCommand(
         (context.unknownCwd && !/^[/~]/.test(text) && /acp/i.test(text)))
     )
       rules.add("policy-state");
+    // Reading the service's own files (the token above all; everything but the audit logs) is a
+    // credential read, for every reader and any glob or expansion that could reach them.
+    if (word !== cmd.program && namesStateSecret(target, context.cwds, walks)) {
+      rules.add("credential-read");
+      secretReads++;
+    }
     const relative = !text.startsWith("/") && !text.startsWith("~") && !text.startsWith("$");
     if (context.unknownCwd && relative && SETTINGS_NAMES.test(text.split("/").pop() ?? ""))
       rules.add("harness-settings");
@@ -1417,6 +1457,21 @@ function analyzeCommand(
   if (sub.text === "push" && (pushConfig || cmd.args.slice(i + 1).some((word) => word.bare)))
     rules.add("force-push");
   gitRules(sub.text, args.slice(i + 1), rules);
+  // `git checkout [<rev>] -- <paths>` and `git restore <paths>` overwrite files: one that is
+  // protected where Git runs (`-C` applied: the main checkout, say) is a protected write.
+  if (sub.text === "checkout" || sub.text === "restore") {
+    const rest = args.slice(i + 1);
+    const dashes = rest.indexOf("--");
+    const paths = (dashes >= 0 ? rest.slice(dashes + 1) : rest).filter(
+      (word) => dashes >= 0 || !word.startsWith("-"),
+    );
+    const dirs = [...context.cwds].map((dir) => {
+      const at = args.slice(0, i).lastIndexOf("-C");
+      return at >= 0 && args[at + 1] ? resolve(dir, args[at + 1] as string) : dir;
+    });
+    if (dirs.some((dir) => paths.some((path) => isProtectedPath(resolve(dir, path)))))
+      rules.add("protected");
+  }
 }
 
 /**
@@ -1474,6 +1529,15 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
       if (sensitive(slashes(target))) rules.add("credential-read");
     }
   };
+  // A tool that reads or searches a tree (Grep, Glob, LS, a notebook) on a session directory, or a
+  // directory above one, can print the session token: a credential read, as `grep -r` is.
+  if (TREE_TOOLS.has(request.tool.toLowerCase())) {
+    const path = input.path ?? input.notebook_path ?? input.file_path ?? input.dir_path;
+    const target = typeof path === "string" && path ? path : request.cwd;
+    if (target && namesStateSecret(slashes(target), cwds, true)) rules.add("credential-read");
+    if (typeof path === "string") file(path, false);
+    return;
+  }
   if (WRITE_TOOLS.has(request.tool) || ["Read", "view", "read_file"].includes(request.tool)) {
     const path = input.file_path ?? input.path ?? input.notebook_path;
     if (typeof path === "string") file(path, WRITE_TOOLS.has(request.tool));
@@ -1516,12 +1580,43 @@ export function hardRules(
   const now = Date.now();
   const hit = ruleMemo.get(key);
   if (hit && now - hit.at < 2000) return [...hit.rules];
+  const before = secretReads;
   const rules = withEvidence(() => hardRulesOnce(request, decision, scratchRoots));
   if (ruleMemo.size >= 32) ruleMemo.delete(ruleMemo.keys().next().value as string);
-  ruleMemo.set(key, { at: now, rules });
+  ruleMemo.set(key, { at: now, rules, secret: secretReads > before });
   return [...rules];
 }
-const ruleMemo = new Map<string, { at: number; rules: HardRule[] }>();
+const ruleMemo = new Map<string, { at: number; rules: HardRule[]; secret: boolean }>();
+/** Shell words that read the policy service's own secrets, counted as the scan finds them. */
+let secretReads = 0;
+/**
+ * Whether a shell request reads the policy service's secrets (the session token, socket, grants:
+ * anything in a session directory but its audit logs). Its rule is `credential-read`, and unlike
+ * other credential words (a `grep` pattern that mentions `id_rsa`) it is part of the floor: no
+ * step approves it.
+ */
+export function readsPolicySecret(request: Request, scratchRoots: string[] = []): boolean {
+  const decision: Decision = {
+    decision: "human",
+    category: "unknown",
+    reason: "",
+    requestHash: "",
+    cache: "none",
+    cached: false,
+  };
+  const before = secretReads;
+  hardRules(request, decision, scratchRoots);
+  const key = JSON.stringify([
+    request.tool,
+    request.cwd,
+    request.input,
+    decision.reason,
+    decision.category,
+    false,
+    scratchRoots,
+  ]);
+  return ruleMemo.get(key)?.secret ?? secretReads > before;
+}
 function hardRulesOnce(request: Request, decision: Decision, scratchRoots: string[]): HardRule[] {
   const rules = new Set<HardRule>();
   if (decision.userOnly || decision.reason === APPROVE_GUARD) rules.add("self-approve");

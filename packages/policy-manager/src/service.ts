@@ -11,7 +11,17 @@ import type { Classification, OutcomeReport, Request } from "./types.js";
 
 interface Message {
   token: string;
-  action: "ping" | "review" | "classify" | "record" | "grant" | "pending" | "stop";
+  action:
+    | "ping"
+    | "review"
+    | "classify"
+    | "record"
+    | "grant"
+    | "refuse"
+    | "await"
+    | "harness"
+    | "pending"
+    | "stop";
   request?: Request;
   classification?: Classification;
   report?: OutcomeReport;
@@ -19,6 +29,10 @@ interface Message {
   grant?: { requestHash: string; confirm: boolean; session?: boolean };
   /** Claude Code's `permission_mode` for a PreToolUse: whether an ask reaches a person. */
   permissionMode?: string;
+  /** A waiting hook's own end of the wait (`await`): no approval came in time. */
+  waitOutcome?: "timeout";
+  /** The harness process above the hook (`harness`), for approve's ancestry check. */
+  harnessPid?: number;
   /** Claude Code's `tool_use_id` for a PreToolUse or PostToolUse. */
   toolUseId?: string;
   /** A PostToolUseFailure's error text and interrupt flag, to tell a rejected prompt from a run. */
@@ -26,6 +40,43 @@ interface Message {
 }
 /** How long a hook waits for a review, which can include the AI classifier's run. */
 export const REVIEW_TIMEOUT_MS = 40_000;
+/** How often a hook waiting for the user's approval asks the service whether it came. */
+export const APPROVAL_POLL_MS = 1_000;
+export type ApprovalState = "granted" | "refused" | "pending" | "gone";
+/** Consecutive failed polls (other than a refused connection) after which the service is gone. */
+const POLL_FAILURES = 3;
+/**
+ * Waits until `deadline` (epoch ms) for the user's answer to a request that needs a person,
+ * asking `poll` every `intervalMs`. Returns `granted`, `refused`, `gone` (it can no longer be
+ * approved), `unreachable` (the service is not there: a refused connection or a missing socket at
+ * once, any other failure after POLL_FAILURES in a row) or `timeout`. A failed poll is never an
+ * answer.
+ */
+export async function waitForApproval(
+  poll: () => Promise<unknown>,
+  deadline: number,
+  intervalMs = APPROVAL_POLL_MS,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((done) => setTimeout(done, ms)),
+): Promise<Exclude<ApprovalState, "pending"> | "timeout" | "unreachable"> {
+  let failures = 0;
+  while (Date.now() < deadline) {
+    let state: unknown;
+    try {
+      state = await poll();
+      failures = 0;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ECONNREFUSED" || code === "ENOENT" || ++failures >= POLL_FAILURES)
+        return "unreachable";
+      state = "pending";
+    }
+    if (state === "granted" || state === "refused" || state === "gone") return state;
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(intervalMs, left));
+  }
+  return "timeout";
+}
 function endpoint(directory: string): string {
   return process.platform === "win32"
     ? `\\\\.\\pipe\\acp-${hash(directory).slice(0, 32)}`
@@ -58,24 +109,35 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
       try {
         const message = JSON.parse(data.slice(0, end)) as Message;
         if (message.token !== token) throw new Error("Unauthenticated request");
-        audit(directory, {
-          event: "request-envelope",
-          payloadHash: hash(data.slice(0, end)),
-          ...(message.request
-            ? { requestHash: requestHash(message.request) }
-            : message.classification
-              ? { requestHash: message.classification.requestHash }
-              : message.report
-                ? { requestHash: message.report.requestHash }
-                : message.grant
-                  ? { requestHash: String(message.grant.requestHash) }
-                  : {}),
-          action: ["ping", "review", "classify", "record", "grant", "pending", "stop"].includes(
-            message.action,
-          )
-            ? message.action
-            : "invalid",
-        });
+        // A waiting hook polls every second: the session audits the start and end of the wait.
+        if (message.action !== "await")
+          audit(directory, {
+            event: "request-envelope",
+            payloadHash: hash(data.slice(0, end)),
+            ...(message.request
+              ? { requestHash: requestHash(message.request) }
+              : message.classification
+                ? { requestHash: message.classification.requestHash }
+                : message.report
+                  ? { requestHash: message.report.requestHash }
+                  : message.grant
+                    ? { requestHash: String(message.grant.requestHash) }
+                    : {}),
+            action: [
+              "ping",
+              "review",
+              "classify",
+              "record",
+              "grant",
+              "refuse",
+              "await",
+              "harness",
+              "pending",
+              "stop",
+            ].includes(message.action)
+              ? message.action
+              : "invalid",
+          });
         idle.refresh();
         // A review can wait for the classifier; the connection stays open until it answers.
         socket.setTimeout(REVIEW_TIMEOUT_MS + 5000);
@@ -112,6 +174,22 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
                 })
               : undefined;
           result = { recorded: true, ...(answer ? { answer } : {}) };
+        } else if (message.action === "harness") {
+          // With a pid, the hook reports its harness; without, `approve` asks for it.
+          if (typeof message.harnessPid === "number") session.noteHarness(message.harnessPid);
+          result = session.harnessPid ? { harnessPid: session.harnessPid } : {};
+        } else if (message.action === "await" && message.grant)
+          result =
+            message.waitOutcome === "timeout"
+              ? session.endWait(String(message.grant.requestHash), "timeout")
+              : session.approvalState(String(message.grant.requestHash));
+        else if (message.action === "refuse" && message.grant) {
+          try {
+            result = session.refuse(String(message.grant.requestHash));
+          } catch (error) {
+            if (!(error instanceof GrantError)) throw error;
+            result = { refused: false };
+          }
         } else if (message.action === "grant" && message.grant) {
           try {
             result = session.grant(
@@ -188,6 +266,7 @@ export async function latestHumanDecision(): Promise<
       at: number;
       harness: string;
       sessionId: string;
+      harnessPid?: number;
     }
   | undefined
 > {
@@ -200,6 +279,7 @@ export async function latestHumanDecision(): Promise<
         at: number;
         harness: string;
         sessionId: string;
+        harnessPid?: number;
       }
     | undefined;
   for (const name of readdirSync(root)) {
@@ -219,6 +299,7 @@ export async function latestHumanDecision(): Promise<
         at?: unknown;
         harness?: unknown;
         sessionId?: unknown;
+        harnessPid?: unknown;
       } | null;
       if (
         found &&
@@ -235,6 +316,7 @@ export async function latestHumanDecision(): Promise<
           at: found.at,
           harness: found.harness,
           sessionId: found.sessionId,
+          ...(typeof found.harnessPid === "number" ? { harnessPid: found.harnessPid } : {}),
         };
     } catch {
       /* A stopped or unreachable service has nothing to approve. */
@@ -242,6 +324,50 @@ export async function latestHumanDecision(): Promise<
   }
   return best;
 }
+/**
+ * The harness process of every running policy session of this user, for `approve`'s ancestry
+ * check: an agent in one session must not approve another session's request either.
+ */
+export async function harnessPids(): Promise<number[]> {
+  const found: number[] = [];
+  for (const directory of sessionDirectories()) {
+    try {
+      const answer = (await sendTo(directory, { action: "harness" }, 1500)) as {
+        harnessPid?: unknown;
+      } | null;
+      if (answer && typeof answer.harnessPid === "number") found.push(answer.harnessPid);
+    } catch {
+      /* A stopped or unreachable service has no harness running. */
+    }
+  }
+  return found;
+}
+
+/** This user's private session directories with a token, as `approve --last` trusts them. */
+function sessionDirectories(): string[] {
+  const root = tmpdir();
+  const prefix = `acp-${process.getuid?.() ?? "user"}-`;
+  const found: string[] = [];
+  for (const name of readdirSync(root)) {
+    if (!name.startsWith(prefix) || !/^[a-f0-9]{24}$/.test(name.slice(prefix.length))) continue;
+    const directory = join(root, name);
+    try {
+      const stat = lstatSync(directory);
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        (process.getuid && (stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0)) ||
+        !existsSync(join(directory, "token"))
+      )
+        continue;
+      found.push(directory);
+    } catch {
+      /* gone */
+    }
+  }
+  return found;
+}
+
 /** Sends to the service of an existing session directory (see `approve --last`). */
 export function sendTo(
   directory: string,

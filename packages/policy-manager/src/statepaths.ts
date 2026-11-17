@@ -1,6 +1,6 @@
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname } from "node:path";
+import { basename, dirname, posix } from "node:path";
 import { canonical, resolveWord, tempRoots } from "./evidence.js";
 
 /**
@@ -525,14 +525,47 @@ function callArgs(code: string, start: number, parens: boolean): string[] | unde
   return undefined;
 }
 
-/** Variables assigned exactly once, to a plain string literal: `p = '/x'`, `const p = "/x"`. */
+/**
+ * The path a literal expression names, or undefined: a plain string literal, `Path(<literal>)` or
+ * `pathlib.Path(<literal>)`, `open(<literal>[, mode])` (the file it opens), or `os.path.join` of
+ * literals only. Anything computed (a variable, `Path.cwd()`, concatenation, an f-string) is not.
+ */
+function literalPath(text: string): string | undefined {
+  const expr = text.trim();
+  // The arguments of a call that is the whole expression: `Path(x)`, not `Path(x).read_text()`.
+  const call = (pattern: RegExp) => {
+    const match = pattern.exec(expr);
+    if (!match) return undefined;
+    const args = callArgs(expr, match[0].length, true);
+    if (!args) return undefined;
+    const end = match[0].length + args.join(",").length;
+    return expr[end] === ")" && end === expr.length - 1 ? args : undefined;
+  };
+  const wrapped = call(/^(?:pathlib\s*\.\s*)?Path\s*\(/) ?? call(/^open\s*\(/);
+  if (wrapped) {
+    const [first] = wrapped;
+    return first === undefined ? undefined : plainLiteral(first);
+  }
+  const joined = call(/^os\s*\.\s*path\s*\.\s*join\s*\(/);
+  if (joined) {
+    const parts = joined.map(plainLiteral);
+    if (!parts.length || parts.some((part) => part === undefined)) return undefined;
+    return posix.join(...(parts as string[]));
+  }
+  return plainLiteral(expr);
+}
+
+/**
+ * Variables assigned exactly once, to a literal path (`literalPath`): `p = '/x'`,
+ * `const p = "/x"`, `p = Path('/x')`, `f = open('/x', 'w')`, `p = os.path.join('/tmp', 'x')`.
+ */
 function literalVariables(code: string): Map<string, string | undefined> {
   const found = new Map<string, string | undefined>();
   for (const line of code.split(/[\n;]/)) {
     const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)(.*)$/.exec(line);
     if (!match) continue;
     const [, name = "", value = ""] = match;
-    found.set(name, found.has(name) ? undefined : plainLiteral(value));
+    found.set(name, found.has(name) ? undefined : literalPath(value));
   }
   return found;
 }
@@ -549,9 +582,7 @@ function callsReachState(code: string, cwds: string[]): boolean {
   const value = (arg: string): string | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
     if (name) return vars.get(name);
-    const path = /^\s*(?:pathlib\s*\.\s*)?Path\s*\((.*)\)\s*$/.exec(arg)?.[1];
-    if (path !== undefined) return value(path);
-    return plainLiteral(arg);
+    return literalPath(arg);
   };
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
@@ -583,9 +614,14 @@ function callsReachState(code: string, cwds: string[]): boolean {
       (dotted && LOADED.test(before.slice(-200)));
     if (dotted && !moduleCall && !FILE_METHODS.test(name)) {
       if (!PATH_METHODS.test(name)) continue;
-      // `.replace(...)`/`.rename(...)` on anything but a `Path(...)` is a string or table method.
+      // `.replace(...)`/`.rename(...)` on anything but a `Path(...)` is a string or table method,
+      // and so is one with two or more arguments: `Path.replace`/`rename` take one target.
       const object = pathObject();
-      if (object === undefined && /^(?:replace|rename)$/.test(name)) continue;
+      if (/^(?:replace|rename)$/.test(name)) {
+        if (object === undefined) continue;
+        const args = callArgs(code, at, parens);
+        if (args && args.length >= 2) continue;
+      }
       if (reaches(object)) return true;
       continue;
     }
@@ -629,6 +665,25 @@ function callsReachState(code: string, cwds: string[]): boolean {
   return false;
 }
 
+/** The code with each `os.path.join` of literals only replaced by its joined path, quoted. */
+function joinedLiterals(code: string): string {
+  let out = "";
+  let from = 0;
+  for (const match of code.matchAll(/\bos\s*\.\s*path\s*\.\s*join\s*\(/g)) {
+    const at = match.index ?? 0;
+    if (at < from) continue;
+    const args = callArgs(code, at + match[0].length, true);
+    if (!args) continue;
+    const end = at + match[0].length + args.join(",").length;
+    if (code[end] !== ")") continue;
+    const path = literalPath(code.slice(at, end + 1));
+    if (path === undefined) continue;
+    out += `${code.slice(from, at)}'${path}'`;
+    from = end + 1;
+  }
+  return out + code.slice(from);
+}
+
 /**
  * Whether inline interpreter code could change the state. It names `acp`; or it deletes, moves or
  * writes files and either computes the temp directory at run time (an environment variable or an
@@ -661,12 +716,102 @@ export function codeTouchesState(code: string, cwds: Iterable<string>): boolean 
   // The temp directory computed at run time (case matters: `/tmp` in a path is not `TMP`).
   if (TEMP_LOOKUP.test(code)) return true;
   const list = [...cwds];
-  for (const match of code.matchAll(/(?:~\/|\/)[\w.*?[\]{}$%-][^\s'"`,;)(]*/g)) {
+  // `os.path.join('/tmp', 'x')` names /tmp/x, not the temp root: read literal joins as one path.
+  const text = joinedLiterals(code);
+  for (const match of text.matchAll(/(?:~\/|\/)[\w.*?[\]{}$%-][^\s'"`,;)(]*/g)) {
     // Parts filled in at run time are any name: `{x}`, `%s`, `$x`; a path that ends where code
     // goes on (`'/tmp/' + x`) keeps its trailing `/` and is read as the directory.
     if (match[0].length > MAX_TARGET) return true;
     const path = match[0].replace(/\{[^}/]*\}|%[sd]|\$\{?\w*\}?/g, "*");
     if (namesState(path, list.length ? list : ["/"], true)) return true;
+  }
+  return false;
+}
+
+/** Audit logs: the only files in a session directory a read may name. */
+const AUDIT_FILE = /^audit(?:\.\d+)?\.jsonl$/i;
+let secrets: { from: string[]; at: number; targets: string[] } | undefined;
+/**
+ * Every file in a session directory except its audit logs, folded: the token, the socket, grants
+ * and anything else there, plus a sample name for files a later version may add.
+ */
+function secretTargets(): string[] {
+  const from = stateDirs();
+  if (secrets?.from === from && Date.now() - secrets.at < 2000) return secrets.targets;
+  const targets: string[] = [];
+  for (const dir of from) {
+    const names = new Set(["token", "service.sock", "grants.json", "x"]);
+    try {
+      for (const name of readdirSync(dir)) names.add(name);
+    } catch {
+      /* a sample or unreadable directory: the known names still count */
+    }
+    for (const name of names) if (!AUDIT_FILE.test(name)) targets.push(fold(`${dir}/${name}`));
+  }
+  secrets = { from, at: Date.now(), targets };
+  return targets;
+}
+
+/**
+ * Whether reading `text` (as the shell would expand it: a glob, a variable read as `*`) could read
+ * the policy service's secrets: any file in a session directory but its audit logs, above all the
+ * session token, which authenticates grants. With `whole` (a recursive reader, or a directory
+ * read as a tree) the session directory itself and the directories above it count too.
+ */
+export function namesStateSecret(text: string, cwds: Iterable<string>, whole: boolean): boolean {
+  if (!text) return false;
+  // Too long to match in time: only a word that could expand, or names the state, fails closed.
+  if (text.length > MAX_TARGET) return /acp|[*?[{]/i.test(text);
+  if (/^-[^=]*$|^\d+$/.test(text)) return false;
+  const list = [...cwds];
+  const memo = stateLists().names;
+  const key = `secret${whole ? 1 : 0}\0${text}\0${list.join("\0")}`;
+  const known = memo.get(key);
+  if (known !== undefined) return known;
+  const answer = namesStateSecretOnce(text, list, whole);
+  if (memo.size < 20_000) memo.set(key, answer);
+  return answer;
+}
+function namesStateSecretOnce(text: string, cwds: string[], whole: boolean): boolean {
+  const { dirs, above, dirSet, aboveSet } = stateLists();
+  const forms = new Set<string>();
+  for (const cwd of cwds) {
+    let path: string;
+    try {
+      path = slashes(resolveWord(cwd, text));
+    } catch {
+      continue;
+    }
+    forms.add(trim(path));
+    const real = realOf(path);
+    if (real !== undefined) forms.add(real);
+  }
+  for (const raw of forms) {
+    const form = fold(raw);
+    if (!hasGlob(form)) {
+      // A session directory by its name, also one created since the lists were read.
+      const parts = form.split("/");
+      const at = parts.findIndex((part) => STATE_DIR.test(part));
+      if (at >= 0) {
+        const rest = parts.slice(at + 1).filter(Boolean);
+        if (rest.length === 0 ? whole : rest.length > 1 || !AUDIT_FILE.test(rest[0] ?? ""))
+          return true;
+      }
+      for (const dir of dirSet) {
+        if (form === dir) {
+          if (whole) return true;
+          continue;
+        }
+        if (!form.startsWith(`${dir}/`)) continue;
+        const rest = form.slice(dir.length + 1).split("/");
+        if (rest.length > 1 || !AUDIT_FILE.test(rest[0] ?? "")) return true;
+      }
+      if (whole && aboveSet.has(form)) return true;
+      continue;
+    }
+    if (secretTargets().some((target) => pathMatch(form, target, true))) return true;
+    if (whole && dirs.some((dir) => pathMatch(form, dir, false))) return true;
+    if (whole && above.some((dir) => pathMatch(form, dir, false))) return true;
   }
   return false;
 }

@@ -435,8 +435,11 @@ describe("permissive profile", () => {
       ).decision,
     ).toBe("human");
     expect(
-      evaluate({ ...write, input: { file_path: "AGENTS.md", content: "" } }, undefined, profile)
-        .decision,
+      evaluate(
+        { ...write, input: { file_path: ".github/CODEOWNERS", content: "" } },
+        undefined,
+        profile,
+      ).decision,
     ).toBe("human");
   });
 });
@@ -519,12 +522,12 @@ describe("profile loading", () => {
 
 describe("sort writes its output file", () => {
   test.each([
-    "sort -o AGENTS.md src/a.txt",
-    "sort -oAGENTS.md src/a.txt",
-    "sort -ro AGENTS.md src/a.txt",
-    "sort --output=AGENTS.md src/a.txt",
-    "sort --output AGENTS.md src/a.txt",
-    "sort --out=AGENTS.md src/a.txt",
+    "sort -o .github/CODEOWNERS src/a.txt",
+    "sort -o.github/CODEOWNERS src/a.txt",
+    "sort -ro .github/CODEOWNERS src/a.txt",
+    "sort --output=.github/CODEOWNERS src/a.txt",
+    "sort --output .github/CODEOWNERS src/a.txt",
+    "sort --out=.github/CODEOWNERS src/a.txt",
     "sort -T .claude src/a.txt",
   ])("a protected output target goes to a person: %s", (command) => {
     expect(decide(command).decision).toBe("human");
@@ -542,7 +545,7 @@ describe("sort writes its output file", () => {
 });
 
 describe("protected names are relative to the repository root", () => {
-  test("a worktree under .claude/worktrees is ordinary code; its own .claude is protected", () => {
+  test("a worktree under .claude/worktrees is ordinary code; its own .claude and .github are protected", () => {
     const nested = join(repo, ".claude", "worktrees", "inner");
     mkdirSync(join(repo, ".claude", "worktrees"), { recursive: true });
     git(repo, ["worktree", "add", "-b", "inner-feature", nested]);
@@ -556,7 +559,8 @@ describe("protected names are relative to the repository root", () => {
     expect(evaluate(write("src/new.ts"), undefined, profile).decision).toBe("approve");
     expect(evaluate(write("src/new.ts")).decision).toBe("approve");
     expect(evaluate(write(".claude/settings.json"), undefined, profile).decision).toBe("human");
-    expect(evaluate(write("AGENTS.md"), undefined, profile).decision).toBe("human");
+    expect(evaluate(write(".github/workflows/ci.yml"), undefined, profile).decision).toBe("human");
+    expect(evaluate(write("AGENTS.md"), undefined, profile).decision).toBe("approve");
     expect(decide("echo x > src/a.txt", nested).decision).toBe("approve");
     expect(decide("sed -i '' s/a/b/ .claude/settings.json", nested).decision).toBe("human");
   });

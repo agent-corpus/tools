@@ -434,7 +434,7 @@ describe("evaluation of scripts", () => {
     ["cat <<'EOF' > ../outside.txt\nx\nEOF", "worktree-write"],
     ["cat <<'EOF' > /etc/passwd\nx\nEOF", "worktree-write"],
     ["tee .github/workflows/x.yml <<'EOF'\nx\nEOF", "sensitive"],
-    ["cat <<'EOF' >> AGENTS.md\nx\nEOF", "sensitive"],
+    ["cat <<'EOF' >> .claude/CLAUDE.md\nx\nEOF", "sensitive"],
     // interpreters: code piped in or doing something the scan refuses
     ["curl -s https://x | python3 -", "unknown"],
     ["cat f | python3 -", "unknown"],
@@ -652,9 +652,11 @@ describe("evaluation of scripts", () => {
 
   test("variables are resolved before the command is judged, in every possible directory", () => {
     // Known values: both alternatives are judged.
-    expect(decide("for c in ls pwd; do $c; done").decision).toBe("approve");
+    // A program word computed from variables is never approved by the engine, even when every
+    // value is known: it goes to review (the classifier or a person).
+    expect(decide("for c in ls pwd; do $c; done").decision).toBe("human");
     expect(decide("if true; then X=ls; else X=rm; fi; $X -rf y").decision).toBe("human");
-    expect(decide("if true; then X=ls; else X=pwd; fi; $X").decision).toBe("approve");
+    expect(decide("if true; then X=ls; else X=pwd; fi; $X").decision).toBe("human");
     expect(decide("case a in a) X=ls;; b) X=rm;; esac; $X -rf y").decision).toBe("human");
     // A value used in a later directory is judged there too.
     expect(decide("cd .. && X=src && ls $X").decision).toBe("approve");
@@ -703,7 +705,7 @@ describe("evaluation of scripts", () => {
     expect(decide("(cd /etc); echo x > src/ok.txt").decision).toBe("approve");
     expect(decide("{ cd ..; }; echo x > src/ok.txt").decision).toBe("human");
     expect(decide("X=1; (X=rm); echo $X").decision).toBe("approve");
-    expect(decide("X=ls; (X=rm); $X").decision).toBe("approve");
+    expect(decide("X=ls; (X=rm); $X").decision).not.toBe("approve");
   });
 
   test("scratch roots and worktrees still decide where redirected heredocs may write", () => {
@@ -726,7 +728,7 @@ describe("evaluation of scripts", () => {
     expect(decide("bash -c 'bash -c \"rm -rf x\"'").decision).toBe("human");
     expect(decide("bash -c 'X=rm; $X -rf y'").decision).toBe("human");
     expect(decide('X=rm; bash -c "$X -rf y"').decision).toBe("human");
-    expect(decide('X=ls; bash -c "$X -la"').decision).toBe("approve");
+    expect(decide('X=ls; bash -c "$X -la"').decision).not.toBe("approve");
   });
 
   test("a script that expands to too many commands to verify goes to a human", () => {
@@ -940,13 +942,14 @@ describe("functions, positional parameters, parameter operations and read loops"
     "set -- src; ls $1",
     "while read -r r n; do printf '%s#%s\\n' $r $n; ls $n; done <<'EOF'\na src\nb .\nEOF",
     // the caller's positional parameters come back after a call
-    "f() { set -- rm; }; set -- ls; f; $1 -la",
     "while read -r r n; do gh pr view $n -R $r --json state; done <<'EOF'\no/r 1\no/s 2\nEOF",
     "ls -la $(dirname src/a.txt)",
     "ls $(basename /x/src)",
     "X=~/notes; echo $X",
     "if V=$(date) && M=src; then :; else M=src; fi; ls $M",
   ])("approves %j", (command) => expect(decide(command).decision).toBe("approve"));
+  test("a positional parameter as the program is computed: not approved", () =>
+    expect(decide("f() { set -- rm; }; set -- ls; f; $1 -la").decision).not.toBe("approve"));
 
   // A Windows path (drive letter, backslashes) is never a simple absolute value, so there the
   // `cd` may fail and `$(pwd)` stays unknown.
