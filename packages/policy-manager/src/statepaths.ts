@@ -789,6 +789,14 @@ function namesStateSecretOnce(text: string, cwds: string[], whole: boolean): boo
   for (const raw of forms) {
     const form = fold(raw);
     if (!hasGlob(form)) {
+      // A session directory by its name, also one created since the lists were read.
+      const parts = form.split("/");
+      const at = parts.findIndex((part) => STATE_DIR.test(part));
+      if (at >= 0) {
+        const rest = parts.slice(at + 1).filter(Boolean);
+        if (rest.length === 0 ? whole : rest.length > 1 || !AUDIT_FILE.test(rest[0] ?? ""))
+          return true;
+      }
       for (const dir of dirSet) {
         if (form === dir) {
           if (whole) return true;

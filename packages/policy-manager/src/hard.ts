@@ -97,6 +97,11 @@ const REASON_RULES: Array<[RegExp, HardRule]> = [
 ];
 
 const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell", "powershell"]);
+/** Tools that read or search a directory tree, by path (Claude Code, Codex, Copilot names). */
+const TREE_TOOLS = new Set([
+  ...["grep", "glob", "ls", "notebookread", "list_dir", "list_directory", "search", "find"],
+  ...["grep_search", "file_search", "view_image"],
+]);
 const WRITE_TOOLS = new Set([
   "Write",
   "Edit",
@@ -1524,6 +1529,15 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
       if (sensitive(slashes(target))) rules.add("credential-read");
     }
   };
+  // A tool that reads or searches a tree (Grep, Glob, LS, a notebook) on a session directory, or a
+  // directory above one, can print the session token: a credential read, as `grep -r` is.
+  if (TREE_TOOLS.has(request.tool.toLowerCase())) {
+    const path = input.path ?? input.notebook_path ?? input.file_path ?? input.dir_path;
+    const target = typeof path === "string" && path ? path : request.cwd;
+    if (target && namesStateSecret(slashes(target), cwds, true)) rules.add("credential-read");
+    if (typeof path === "string") file(path, false);
+    return;
+  }
   if (WRITE_TOOLS.has(request.tool) || ["Read", "view", "read_file"].includes(request.tool)) {
     const path = input.file_path ?? input.path ?? input.notebook_path;
     if (typeof path === "string") file(path, WRITE_TOOLS.has(request.tool));

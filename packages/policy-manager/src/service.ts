@@ -174,9 +174,10 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
                 })
               : undefined;
           result = { recorded: true, ...(answer ? { answer } : {}) };
-        } else if (message.action === "harness" && typeof message.harnessPid === "number") {
-          session.noteHarness(message.harnessPid);
-          result = { noted: true };
+        } else if (message.action === "harness") {
+          // With a pid, the hook reports its harness; without, `approve` asks for it.
+          if (typeof message.harnessPid === "number") session.noteHarness(message.harnessPid);
+          result = session.harnessPid ? { harnessPid: session.harnessPid } : {};
         } else if (message.action === "await" && message.grant)
           result =
             message.waitOutcome === "timeout"
@@ -323,6 +324,50 @@ export async function latestHumanDecision(): Promise<
   }
   return best;
 }
+/**
+ * The harness process of every running policy session of this user, for `approve`'s ancestry
+ * check: an agent in one session must not approve another session's request either.
+ */
+export async function harnessPids(): Promise<number[]> {
+  const found: number[] = [];
+  for (const directory of sessionDirectories()) {
+    try {
+      const answer = (await sendTo(directory, { action: "harness" }, 1500)) as {
+        harnessPid?: unknown;
+      } | null;
+      if (answer && typeof answer.harnessPid === "number") found.push(answer.harnessPid);
+    } catch {
+      /* A stopped or unreachable service has no harness running. */
+    }
+  }
+  return found;
+}
+
+/** This user's private session directories with a token, as `approve --last` trusts them. */
+function sessionDirectories(): string[] {
+  const root = tmpdir();
+  const prefix = `acp-${process.getuid?.() ?? "user"}-`;
+  const found: string[] = [];
+  for (const name of readdirSync(root)) {
+    if (!name.startsWith(prefix) || !/^[a-f0-9]{24}$/.test(name.slice(prefix.length))) continue;
+    const directory = join(root, name);
+    try {
+      const stat = lstatSync(directory);
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        (process.getuid && (stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0)) ||
+        !existsSync(join(directory, "token"))
+      )
+        continue;
+      found.push(directory);
+    } catch {
+      /* gone */
+    }
+  }
+  return found;
+}
+
 /** Sends to the service of an existing session directory (see `approve --last`). */
 export function sendTo(
   directory: string,

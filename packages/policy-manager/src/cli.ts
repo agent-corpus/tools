@@ -27,6 +27,7 @@ import { defaultProfilePath, loadProfile, parseProfile } from "./profile.js";
 import { replayClassified, replayTranscripts } from "./replay.js";
 import { formatReview, reviewClassifications, sessionDirectories } from "./review.js";
 import {
+  harnessPids,
   latestHumanDecision,
   send,
   sendTo,
@@ -277,7 +278,9 @@ try {
     if (preview.refused) throw new ApproveError(preview.refused);
     // A terminal below the agent harness (a PTY from the agent, `script`) is the agent's, not
     // the user's: refuse before showing or granting anything.
-    const inside = insideAgent(session.harnessPid ?? preview.harnessPid);
+    const pids = [...(await harnessPids())];
+    for (const pid of [session.harnessPid, preview.harnessPid]) if (pid) pids.push(pid);
+    const inside = insideAgent(pids);
     if (inside) throw new ApproveError(inside);
     const grantable = preview.scope === "session";
     for (const line of describeRequest(preview, session)) console.log(line);

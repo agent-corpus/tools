@@ -2,6 +2,7 @@ import { basename, dirname } from "node:path";
 import { looksLikeApproveGrant, looksLikeClassifyRecord } from "./adapters.js";
 import { audit, requestSummary } from "./audit.js";
 import { type ClassifierResult, classifyWithCli } from "./classifier.js";
+import { runsPolicyCli } from "./clirun.js";
 import {
   type CreatedFiles,
   creationTargets,
@@ -199,13 +200,16 @@ export class PolicySession {
     };
   }
   /**
-   * Only the user approves a request once, from their own terminal. A shell command that runs a
-   * policy-manager `approve`, in any form or nesting, is never approved for the agent.
+   * Only the user approves a request, from their own terminal. A shell command that runs the
+   * policy-manager CLI by any name, in any form or nesting (`runsPolicyCli`), or names `approve`
+   * with it (`looksLikeApproveGrant`), is never approved for the agent. The exceptions are a few
+   * read-only subcommands written literally, and this session's own classification record.
    */
   private approveGrant(request: Request): Decision | undefined {
     const command = request.input.command ?? request.input.cmd;
     if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string") return undefined;
-    if (!looksLikeApproveGrant(command)) return undefined;
+    // Classification records (`classify`, literally) are judged by `classifyRecord`.
+    if (!looksLikeApproveGrant(command) && !runsPolicyCli(command, this.cliPath)) return undefined;
     return { ...result(request, "sensitive", APPROVE_GUARD), hard: "self-approve" };
   }
   /**

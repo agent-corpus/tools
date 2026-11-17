@@ -101,6 +101,61 @@ describe("an agent command that runs approve, under any name, goes to a person",
   );
 });
 
+describe("any agent command that runs the CLI is self-approve, however the subcommand is spelled", () => {
+  test.each([
+    "x=appr; pm ${x}ove --last --once",
+    "a=ove; pm appr$a --last --once",
+    "( script -q /dev/null pm approve --last --once & ); sleep 3",
+    '( script -q /dev/null node /opt/pm/node_modules/@agent-corpus/policy-manager/dist/cli.js "$s" --last & )',
+    "p=pm; $p approve --last",
+    "$(command -v pm) --last --once",
+    "pm $(printf appr)ove --last",
+    "pm review-classifications --since $X",
+    "pm stop codex s1",
+    "nohup pm serve codex s1 &",
+    "node /usr/local/lib/node_modules/@agent-corpus/policy-manager/dist/cli.js anything",
+    "npx -y @agent-corpus/policy-manager@0.11.2 record codex s1",
+    "pnpm dlx @agent-corpus/policy-manager approve",
+    "bash -c 'pm $1' _ approve",
+    "cat <<'EOF' | sh\npm approve --last --once\nEOF",
+    "sh <<'EOF'\npm approve --last\nEOF",
+    "expect -c 'spawn pm app$x; send o'",
+    "tmux new -d 'pm approve --last --once'",
+    "setsid pm approve --last --once",
+  ])("%s", async (command) => {
+    const s = session();
+    const d = await s.decide(shell(command), "PreToolUse");
+    expect(d.decision).toBe("human");
+    expect(d.reason).toBe(APPROVE_GUARD);
+    expect(d.hard).toBe("self-approve");
+    expect(d.sessionGrantable).toBe(false);
+    expect(() => s.grant(d.requestHash, false)).toThrow(GrantError);
+  });
+
+  test.each([
+    "pm --help",
+    "pm --version",
+    "pm review-classifications",
+    "pm review-classifications --since 2026-11-01T00:00:00Z",
+    "policy-manager setup-hook-codex --dry-run",
+    "pm setup-hook codex --dry-run",
+    "pm profile validate policy.json",
+  ])("a literal read-only subcommand is not self-approve: %s", async (command) => {
+    const s = session();
+    const d = await s.decide(shell(command), "PreToolUse");
+    expect(d.reason).not.toBe(APPROVE_GUARD);
+  });
+
+  test.each(["npm run pm", "grep -rn pm src", "echo pm", "pnpm install", "git log -- pm"])(
+    "naming pm as data is not running it: %s",
+    async (command) => {
+      const s = session();
+      const d = await s.decide(shell(command), "PreToolUse");
+      expect(d.reason).not.toBe(APPROVE_GUARD);
+    },
+  );
+});
+
 describe("approve refuses a terminal below an agent harness", () => {
   const table = (rows: Array<[number, number, string]>) =>
     new Map<number, ProcessInfo>(rows.map(([pid, ppid, command]) => [pid, { ppid, command }]));
@@ -127,28 +182,46 @@ describe("approve refuses a terminal below an agent harness", () => {
     [54, 53, "node pm approve"],
   ]);
   test("an agent's own PTY (script inside codex) is refused", () => {
-    expect(insideAgent(undefined, 24, tree)).toMatch(/inside an agent session/);
+    expect(insideAgent([], 24, tree)).toMatch(/inside an agent session/);
   });
   test("an npm-installed harness is recognised too", () => {
-    expect(insideAgent(undefined, 42, tree)).toMatch(/inside an agent session/);
+    expect(insideAgent([], 42, tree)).toMatch(/inside an agent session/);
   });
-  test("the session's recorded harness process is refused whatever its name", () => {
-    expect(harnessOf(52, tree)).toBe(50);
-    expect(insideAgent(50, 54, tree)).toMatch(/inside an agent session/);
-    expect(insideAgent(undefined, 54, tree)).toBeUndefined();
+  test("a live session's recorded harness process is refused whatever its name", () => {
+    // The hook records only a process that is a harness; an unnamed host is not guessed.
+    expect(harnessOf(52, tree)).toBeUndefined();
+    expect(insideAgent([50], 54, tree)).toMatch(/inside an agent session/);
+    expect(insideAgent([], 54, tree)).toBeUndefined();
+  });
+  test("every live session counts, not only the one being approved", () => {
+    expect(insideAgent([99, 50], 54, tree)).toMatch(/inside an agent session/);
   });
   test("the user's own terminal is allowed", () => {
-    expect(insideAgent(20, 31, tree)).toBeUndefined();
+    expect(insideAgent([20, 40, 50], 31, tree)).toBeUndefined();
   });
   test("an unreadable process table fails closed", () => {
-    expect(insideAgent(20, 31, null as unknown as undefined)).toBeDefined();
+    expect(insideAgent([20], 31, null as unknown as undefined)).toBeDefined();
   });
-  test("harness names: program or package, not any mention", () => {
+  test("harness names: argv[0], or argv[1] under node, up to a path boundary", () => {
     expect(harnessCommand("codex")).toBe(true);
     expect(harnessCommand("/Users/me/.local/bin/claude --resume")).toBe(true);
+    expect(harnessCommand("node /opt/homebrew/bin/claude")).toBe(true);
+    expect(harnessCommand("node /x/node_modules/@openai/codex/bin/codex.js")).toBe(true);
     expect(harnessCommand("node /x/node_modules/@github/copilot/index.js")).toBe(true);
+    expect(harnessCommand("/Applications/Claude.app/Contents/MacOS/Claude")).toBe(true);
+    expect(harnessCommand("node /x/node_modules/@github/copilot-sdk/index.js")).toBe(false);
+    expect(harnessCommand("/bin/zsh -c cd /x/@openai/codex/ && ls")).toBe(false);
     expect(harnessCommand("tmux new -s claude")).toBe(false);
     expect(harnessCommand("-zsh")).toBe(false);
+  });
+  test("Windows: a parent created after its child is a reused PID and ends the chain", () => {
+    const reused = new Map<number, ProcessInfo>([
+      [5, { ppid: 0, command: "explorer.exe", created: 1 }],
+      [7, { ppid: 5, command: "C:\\x\\claude.exe", created: 900 }],
+      [8, { ppid: 7, command: "pwsh.exe", created: 100 }],
+      [9, { ppid: 8, command: "pm.cmd approve --last", created: 200 }],
+    ]);
+    expect(insideAgent([], 9, reused)).toBeUndefined();
   });
 });
 
@@ -165,6 +238,13 @@ describe("the policy service's files are a credential read, except the audit log
   // Shell commands name paths with forward slashes, as a Windows shell (Git Bash) needs them.
   const slashed = (path: string) => path.replace(/\\/g, "/");
   const temp = () => slashed(tmpdir());
+  const tool = (name: string, input: Record<string, unknown>): Request => ({
+    sessionId: "s1",
+    harness: "codex",
+    cwd: feature,
+    tool: name,
+    input,
+  });
   const sdir = () => slashed(dir);
   const read = (file: string): Request => ({
     sessionId: "s1",
@@ -186,6 +266,12 @@ describe("the policy service's files are a credential read, except the audit log
     () => shell(`rg secret ${sdir()}`),
     () => shell(`cp -r ${sdir()} /tmp/copy`),
     () => shell(`tail -f ${sdir()}/grants.json`),
+    () => tool("Grep", { pattern: ".", path: dir, output_mode: "content" }),
+    () => tool("Grep", { pattern: "[a-f0-9]{32}", path: tmpdir(), output_mode: "content" }),
+    () => tool("Glob", { pattern: "**/*", path: dir }),
+    () => tool("LS", { path: dir }),
+    () => tool("NotebookRead", { notebook_path: join(dir, "token") }),
+    () => tool("grep", { pattern: ".", path: dir }),
   ])("%#: never approved, a hard credential read", async (make) => {
     const request = make();
     for (const profile of [permissive, strictProfile]) {
@@ -200,6 +286,12 @@ describe("the policy service's files are a credential read, except the audit log
       expect(["credential-read", "policy-state"]).toContain(decided.hard);
       expect(decided.sessionGrantable).toBe(false);
     }
+  });
+  test("Grep in a checkout is not a credential read", () => {
+    const request = tool("Grep", { pattern: "x", path: feature });
+    expect(hardRules(request, { ...evaluate(request), decision: "human" })).not.toContain(
+      "credential-read",
+    );
   });
   test.each([
     () => read(join(dir, "audit.jsonl")),
