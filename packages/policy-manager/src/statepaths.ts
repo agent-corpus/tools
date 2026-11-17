@@ -1,5 +1,6 @@
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { basename, dirname } from "node:path";
 import { canonical, resolveWord, tempRoots } from "./evidence.js";
 
 /**
@@ -66,7 +67,8 @@ let cache: { at: number; temp: string; dirs: string[] } | undefined;
  * (`/private/var/folders/...`), so a pattern written against either form matches.
  */
 export function stateDirs(): string[] {
-  if (cache && cache.temp === tmpdir() && Date.now() - cache.at < 2000) return cache.dirs;
+  const temp = `${process.env.TMPDIR}|${process.env.TMP}|${process.env.TEMP}`;
+  if (cache && cache.temp === temp && Date.now() - cache.at < 2000) return cache.dirs;
   const uid = String(process.getuid?.() ?? "user");
   const sample = `acp-${uid}-0123456789abcdef01234567`;
   const logical = trim(slashes(tmpdir()));
@@ -93,8 +95,65 @@ export function stateDirs(): string[] {
       if (base === logical && logical !== real) dirs.add(`${real}/${name}`);
     }
   }
-  cache = { at: Date.now(), temp: tmpdir(), dirs: [...dirs] };
+  cache = { at: Date.now(), temp, dirs: [...dirs] };
   return cache.dirs;
+}
+
+const fold = (path: string) => (WINDOWS ? path.toLowerCase() : path);
+let lists:
+  | {
+      from: string[];
+      dirs: string[];
+      above: string[];
+      real: Map<string, string | null>;
+      names: Map<string, boolean>;
+      dirSet: Set<string>;
+      aboveSet: Set<string>;
+    }
+  | undefined;
+/**
+ * The state directories and the directories above them, folded for comparison, with a cache of
+ * real paths. Rebuilt whenever `stateDirs` is (every 2 seconds at most), so a long-running service
+ * never judges with stale filesystem facts for longer than that.
+ */
+function stateLists(): NonNullable<typeof lists> {
+  const from = stateDirs();
+  if (lists?.from !== from)
+    lists = {
+      from,
+      dirs: from.map(fold),
+      above: stateAncestors().map(fold),
+      real: new Map(),
+      names: new Map(),
+      dirSet: new Set(from.map(fold)),
+      aboveSet: new Set(stateAncestors().map(fold)),
+    };
+  return lists;
+}
+/**
+ * The real path of `path` as `/` text, or undefined: its directory's real path (memoized for the
+ * current state lists, so words in one directory cost one lookup) and its own name. A symlink as
+ * the last name is not followed: making one that points at the state names the state, which the
+ * rule already catches.
+ */
+function realOf(path: string): string | undefined {
+  const parent = dirname(path);
+  if (parent === path) return trim(path);
+  const base = realDir(parent);
+  return base === undefined ? undefined : `${base === "/" ? "" : base}/${basename(path)}`;
+}
+function realDir(dir: string): string | undefined {
+  const cache = stateLists().real;
+  const known = cache.get(dir);
+  if (known !== undefined) return known ?? undefined;
+  let real: string | null = null;
+  try {
+    real = trim(slashes(canonical(dir)));
+  } catch {
+    /* judged as written */
+  }
+  if (cache.size < 10_000) cache.set(dir, real);
+  return real ?? undefined;
 }
 
 /** Every directory a state directory lies in, from the filesystem root down. */
@@ -117,7 +176,16 @@ type Token =
  * A shell glob as tokens: `*`, `?`, `[...]` with `!`/`^` negation and ranges, and `\` escapes.
  * Undefined for a brace expansion (`{a,b}`, `{1..3}`), which callers treat as matching.
  */
+const tokenCache = new Map<string, Token[] | undefined>();
+/** `tokenize`, memoized (a script names the same patterns many times). */
 function tokenize(pattern: string): Token[] | undefined {
+  if (tokenCache.has(pattern)) return tokenCache.get(pattern);
+  const tokens = tokenizeOnce(pattern);
+  if (tokenCache.size > 4096) tokenCache.clear();
+  tokenCache.set(pattern, tokens);
+  return tokens;
+}
+function tokenizeOnce(pattern: string): Token[] | undefined {
   if (pattern.length > MAX_TARGET || hasBrace(pattern)) return undefined;
   const out: Token[] = [];
   for (let i = 0; i < pattern.length; i++) {
@@ -193,9 +261,14 @@ export const hasGlob = (text: string) => /[*?[]/.test(text) || tokenize(text) ==
 function pathMatch(pattern: string, target: string, inside: boolean): boolean {
   const ps = trim(pattern).split("/");
   const ts = trim(target).split("/");
+  // Memoized on (pattern segment, target segment), so any number of `**` stays polynomial.
+  const seen = new Set<number>();
   const go = (a: number, b: number): boolean => {
     if (b === ts.length) return a === ps.length || (inside && a > 0) || ps[a] === "**";
     if (a === ps.length) return false;
+    const key = a * (ts.length + 1) + b;
+    if (seen.has(key)) return false;
+    seen.add(key);
     if (ps[a] === "**") return go(a + 1, b) || go(a, b + 1);
     return globMatch(ps[a] as string, ts[b] as string) && go(a + 1, b + 1);
   };
@@ -242,9 +315,21 @@ export function stateText(text: string, literal: boolean): string {
 export function namesState(text: string, cwds: Iterable<string>, removes: boolean): boolean {
   if (!text) return false;
   if (text.length > MAX_TARGET) return true;
-  const fold = (path: string) => (WINDOWS ? path.toLowerCase() : path);
-  const dirs = stateDirs().map(fold);
-  const above = removes ? stateAncestors().map(fold) : [];
+  // An option or a number names no file.
+  if (/^-[^=]*$|^\d+$/.test(text)) return false;
+  // The same word in the same directories is asked many times: memoized with the state lists.
+  const list = [...cwds];
+  const memo = stateLists().names;
+  const key = `${removes ? 1 : 0}\0${text}\0${list.join("\0")}`;
+  const known = memo.get(key);
+  if (known !== undefined) return known;
+  const answer = namesStateOnce(text, list, removes);
+  if (memo.size < 20_000) memo.set(key, answer);
+  return answer;
+}
+function namesStateOnce(text: string, cwds: string[], removes: boolean): boolean {
+  const { dirs, above: ancestors } = stateLists();
+  const above = removes ? ancestors : [];
   const forms = new Set<string>();
   for (const cwd of cwds) {
     let path: string;
@@ -254,18 +339,20 @@ export function namesState(text: string, cwds: Iterable<string>, removes: boolea
       continue;
     }
     forms.add(trim(path));
-    try {
-      forms.add(trim(slashes(canonical(path))));
-    } catch {
-      /* judged as written */
-    }
+    const real = realOf(path);
+    if (real !== undefined) forms.add(real);
   }
   for (const raw of forms) {
     const form = fold(raw);
     if (!hasGlob(form)) {
       // A literal path: a state directory, anything in one, or (for a delete) a directory above.
-      if (dirs.some((dir) => form === dir || form.startsWith(`${dir}/`))) return true;
-      if (above.includes(form)) return true;
+      // Set lookups on each prefix: linear in the path, whatever the number of state directories.
+      const { dirSet, aboveSet } = stateLists();
+      for (let at = form.indexOf("/", 1); ; at = form.indexOf("/", at + 1)) {
+        if (dirSet.has(at < 0 ? form : form.slice(0, at))) return true;
+        if (at < 0) break;
+      }
+      if (removes && aboveSet.has(form)) return true;
       continue;
     }
     // A glob: only directories its literal start leads to can match.

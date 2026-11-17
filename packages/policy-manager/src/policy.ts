@@ -1,7 +1,15 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
-import { branchEvidence, canonical, git, inside, pathEvidence, resolveWord } from "./evidence.js";
+import {
+  branchEvidence,
+  canonical,
+  git,
+  inside,
+  pathEvidence,
+  resolveWord,
+  withEvidence,
+} from "./evidence.js";
 import { hardRule, hardRules } from "./hard.js";
 
 /** Tools that write a file (a shell command is judged by the engine itself). */
@@ -391,6 +399,14 @@ export function evaluate(
   request: Request,
   ai?: Classification,
   profile: Profile = strictProfile,
+): Decision {
+  return withEvidence(() => evaluateOnce(request, ai, profile));
+}
+
+function evaluateOnce(
+  request: Request,
+  ai: Classification | undefined,
+  profile: Profile,
 ): Decision {
   // A shell command with more words than the engine judges in time asks, before any judging.
   const command = request.input?.command ?? request.input?.cmd;

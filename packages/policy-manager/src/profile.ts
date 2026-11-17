@@ -88,9 +88,15 @@ function parseToolsDeny(raw: unknown): Profile["toolsDeny"] {
   return result;
 }
 
+let profilePathMemo: { key: string; path: string } | undefined;
+/** The default profile path (memoized on the variables it depends on: it is asked per word). */
 export function defaultProfilePath(): string {
+  const key = `${process.env.XDG_CONFIG_HOME}|${process.env.HOME}|${process.env.USERPROFILE}`;
+  if (profilePathMemo?.key === key) return profilePathMemo.path;
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(base, "agent-corpus", "policy-manager", "policy.json");
+  const path = join(base, "agent-corpus", "policy-manager", "policy.json");
+  profilePathMemo = { key, path };
+  return path;
 }
 
 export class ProfileError extends Error {}

@@ -19,6 +19,10 @@ export interface Word {
   herestring?: boolean;
   /** The first word of a command whose standard input is the previous command's output (`a | b`). */
   piped?: boolean;
+  /** How many groups (`( )`, `{ }`, `if`, `while`, `for`, `case`...) the word is inside. */
+  depth?: number;
+  /** On a `piped` word: the group depth of the pipe, so the stage it feeds can be found. */
+  pipedAt?: number;
   /** Holds an unquoted expansion or substitution, which can split into words and options. */
   bare?: boolean;
   /** The body of a here-document fed to this command's standard input (also `redirect`). */
@@ -63,6 +67,9 @@ export function scan(script: string, heredoc = false): Scan {
   let redirectWrites = false;
   let redirectHere = false;
   let pipeNext = false;
+  /** Open groups, innermost last, and the group depth where the last pipe was. */
+  const groups: string[] = [];
+  let pipeDepth = 0;
   /** The next word is a here-document delimiter (`<<` or `<<-`). */
   let delimiterNext: "" | "<<" | "<<-" = "";
   /** Here-documents whose bodies start after the next newline, with the command they feed. */
@@ -73,13 +80,22 @@ export function scan(script: string, heredoc = false): Scan {
   let quote: "" | "'" | '"' | "h" = heredoc ? "h" : "";
   const endWord = () => {
     if (active) {
+      // A group keyword in command position opens or closes a group.
+      const command =
+        !redirectNext &&
+        literal &&
+        segment.every((word) => word.literal && GROUP_LEAD.has(word.text));
+      if (command && CLOSERS[text]?.includes(groups[groups.length - 1] ?? "")) groups.pop();
+      const depth = groups.length;
+      if (command && OPENERS.has(text)) groups.push(text);
       segment.push({
         text,
         literal,
         ...(redirectNext ? { redirect: true } : {}),
         ...(redirectNext && redirectWrites ? { writes: true } : {}),
         ...(redirectNext && redirectHere ? { herestring: true } : {}),
-        ...(pipeNext && !segment.length ? { piped: true } : {}),
+        ...(pipeNext && !segment.length ? { piped: true, pipedAt: pipeDepth } : {}),
+        depth,
         ...(bare ? { bare: true } : {}),
       });
       if (!redirectNext) pipeNext = false;
@@ -283,10 +299,12 @@ export function scan(script: string, heredoc = false): Scan {
     if (/[;&|()\n]/.test(c)) {
       endSegment();
       // `a | b` and `a |& b`, not `a || b`; `a | (b)` pipes into the subshell's first command.
+      const pipe = c === "|" && next !== "|" && script[i - 1] !== "|";
+      if (pipe) pipeDepth = groups.length;
       pipeNext =
-        (c === "|" && next !== "|" && script[i - 1] !== "|") ||
-        (c === "&" && script[i - 1] === "|" && pipeNext) ||
-        (c === "(" && pipeNext);
+        pipe || (c === "&" && script[i - 1] === "|" && pipeNext) || (c === "(" && pipeNext);
+      if (c === "(") groups.push("(");
+      else if (c === ")" && groups[groups.length - 1] === "(") groups.pop();
       continue;
     }
     if (/\s/.test(c)) {
@@ -322,6 +340,16 @@ const WRAPPERS: Record<string, string[]> = {
   noglob: [],
   watch: ["-n", "--interval", "-q", "--equexit"],
 };
+/** Group keywords and what each closer closes. */
+const OPENERS = new Set(["{", "if", "while", "until", "for", "case", "select"]);
+const CLOSERS: Record<string, string[]> = {
+  "}": ["{"],
+  fi: ["if"],
+  done: ["while", "until", "for", "select"],
+  esac: ["case"],
+};
+/** Words that may come before a command in its segment (`then sh`, `do sh`, `! sh`). */
+const GROUP_LEAD = new Set(["then", "do", "else", "elif", "!", "{", "if", "while", "until"]);
 const KEYWORDS = new Set(["then", "do", "else", "elif", "if", "while", "until", "!", "{", "}"]);
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;

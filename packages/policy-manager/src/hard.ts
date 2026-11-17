@@ -1,7 +1,15 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { canonical, git, inside, resolveWord, sensitive, tempRoots } from "./evidence.js";
+import {
+  canonical,
+  git,
+  inside,
+  resolveWord,
+  sensitive,
+  tempRoots,
+  withEvidence,
+} from "./evidence.js";
 import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
 import { defaultProfilePath } from "./profile.js";
 import { readOnly } from "./reads.js";
@@ -142,9 +150,20 @@ function configuredSettings(path: string): boolean {
   const target = slashes(path);
   return dirs.some(([dir, name]) => {
     if (!dir) return false;
-    const root = `${slashes(resolve(dir))}/`;
+    const root = resolvedRoot(dir);
     return target.startsWith(root) && name.test(target.slice(root.length));
   });
+}
+const roots = new Map<string, string>();
+/** `dir` resolved with `/` separators and a trailing `/` (memoized: asked once per word). */
+function resolvedRoot(dir: string): string {
+  let root = roots.get(dir);
+  if (root === undefined) {
+    root = `${slashes(resolve(dir))}/`;
+    if (roots.size > 64) roots.clear();
+    roots.set(dir, root);
+  }
+  return root;
 }
 
 /** A policy service state directory (`acp-<uid>-...`, any user's) or a path inside one. */
@@ -153,13 +172,23 @@ export const policyStatePath = (path: string) => POLICY_STATE.test(normalize(pat
 
 /** The hard rules a path names. */
 function pathRules(path: string, rules: Set<HardRule>, credentials: boolean): void {
-  const target = normalize(path);
-  if (target === slashes(defaultProfilePath()) || PROFILE_NAME.test(target))
-    rules.add("policy-profile");
-  if (HARNESS_SETTINGS.some((pattern) => pattern.test(target)) || configuredSettings(target))
-    rules.add("harness-settings");
-  if (credentials && sensitive(target)) rules.add("credential-read");
+  // Pure for a given environment, and asked for the same words many times: memoized.
+  const key = `${credentials ? 1 : 0}${process.env.CLAUDE_CONFIG_DIR}|${process.env.CODEX_HOME}|${process.env.COPILOT_HOME}|${path}`;
+  let found = pathMemo.get(key);
+  if (!found) {
+    found = [];
+    const target = normalize(path);
+    if (target === slashes(defaultProfilePath()) || PROFILE_NAME.test(target))
+      found.push("policy-profile");
+    if (HARNESS_SETTINGS.some((pattern) => pattern.test(target)) || configuredSettings(target))
+      found.push("harness-settings");
+    if (credentials && sensitive(target)) found.push("credential-read");
+    if (pathMemo.size > 8192) pathMemo.clear();
+    pathMemo.set(key, found);
+  }
+  for (const rule of found) rules.add(rule);
 }
+const pathMemo = new Map<string, HardRule[]>();
 
 /** Absolute forms of a shell word in each directory it could be resolved in. */
 function resolutions(word: string, cwds: Set<string>): string[] {
@@ -712,6 +741,8 @@ interface Context {
 }
 
 /** Programs that delete or move their operands: a directory above the state counts for them. */
+/** Most directories a script is judged in before its directory counts as unknown. */
+const MAX_CWDS = 16;
 const REMOVERS = new Set(["rm", "rmdir", "unlink", "shred", "mv", "trash", "srm", "rsync"]);
 const SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "source", "."]);
 /** Programs that run text they are given (inline code, a here-document, standard input). */
@@ -766,9 +797,20 @@ function split(word: Word): string[] {
  * `"cmd" | getline`) and whether any is not a literal string. One pass that skips strings and
  * regular expressions, so a `|` inside `/a|b/` is not a pipe.
  */
-function awkCommands(program: string): { literal: string[]; opaque: boolean } {
+function awkCommands(program: string): {
+  literal: string[];
+  opaque: boolean;
+  writes: string[];
+  writesOpaque: boolean;
+} {
   const literal: string[] = [];
   let opaque = false;
+  /** Files `print > "f"` and `printf >> "f"` write, and whether a target is not a literal. */
+  const writes: string[] = [];
+  let writesOpaque = false;
+  /** The first word of the statement so far (`print`, `printf`, `if`...) and the paren depth. */
+  let statement = "";
+  let parens = 0;
   let last = ""; // the previous significant character
   let lastString: string | undefined; // the string literal just before, if the last token was one
   /** A string from `from`: its text, where it ends, and whether it has escapes (not judged). */
@@ -839,6 +881,25 @@ function awkCommands(program: string): { literal: string[]; opaque: boolean } {
       lastString = undefined;
       continue;
     }
+    if ("{};\n".includes(c)) statement = "";
+    else if (c === "(") parens++;
+    else if (c === ")") parens = Math.max(0, parens - 1);
+    else if (/[A-Za-z_]/.test(c) && statement === "" && !/\w/.test(program[i - 1] ?? ""))
+      statement = /^\w+/.exec(program.slice(i, i + 16))?.[0] ?? "";
+    // Output redirection, `print ... > "file"` or `>>`, outside parentheses (a comparison). A
+    // target that is not one string literal (a variable, a concatenation) is not judged.
+    if (c === ">" && parens === 0 && /^printf?$/.test(statement)) {
+      const at = skipSpace(i + (program[i + 1] === ">" ? 2 : 1));
+      const read = program[at] === '"' ? readString(at) : undefined;
+      const after = read ? program[skipSpace(read[1] + 1)] : undefined;
+      if (read && !read[2] && (after === undefined || ";})|\n".includes(after)))
+        writes.push(read[0]);
+      else writesOpaque = true;
+      if (read) i = read[1];
+      last = '"';
+      lastString = undefined;
+      continue;
+    }
     if (program.startsWith("system", i) && !/\w/.test(program[i - 1] ?? "")) {
       const open = skipSpace(i + 6);
       if (program[open] === "(") {
@@ -851,11 +912,10 @@ function awkCommands(program: string): { literal: string[]; opaque: boolean } {
     last = c;
     lastString = undefined;
   }
-  return { literal, opaque };
+  return { literal, opaque, writes, writesOpaque };
 }
 
 /** Shells whose script can come from standard input; PowerShell's is never read here. */
-const STDIN_SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh"]);
 const POWERSHELLS = new Set(["pwsh", "powershell", "pwsh.exe", "powershell.exe"]);
 /** Interpreter options whose value is the code to run (`python3 -c`, `node -e`, `php -r`). */
 const CODE_FLAG = /^(?:-c|-e|-E|-p|-r|--eval|--print)$/;
@@ -885,11 +945,114 @@ function producedText(segment: Word[]): string | undefined {
   return undefined;
 }
 
+/** The file a program's own command text writes, per program (the target in group 1 or 2). */
+const SED_WRITES = /(?:^|[;\n{}]|\/[gpIiMme0-9]*|\d|\$)\s*[wW]\s+([^\n;}]+)/g;
+const EX_WRITES =
+  /(?:^|[|\n:+])[ \t]*(?:\d+(?:,\d+)?|%)?(?:w(?:rite)?|wq|x(?:it)?|sav(?:eas)?|up(?:date)?)!?[ \t]+(?:>>[ \t]*)?([^\s|]+)/g;
+const ED_WRITES = /(?:^|\n)[ \t]*[\d,.$]*[wW]q?[ \t]+(\S+)/g;
+const SQLITE_WRITES = /\.(?:output|once|save)\s+(\S+)|\.backup\s+(?:\w+\s+)?(\S+)/g;
+const EDITOR_WRITES: Record<string, RegExp> = {
+  sed: SED_WRITES,
+  gsed: SED_WRITES,
+  ex: EX_WRITES,
+  vi: EX_WRITES,
+  vim: EX_WRITES,
+  nvim: EX_WRITES,
+  view: EX_WRITES,
+  ed: ED_WRITES,
+  sqlite3: SQLITE_WRITES,
+};
+
 /**
- * A shell or interpreter in segment `k` that reads its script from standard input: from a
- * here-string, or piped from the segment before. Literal text is judged as the script it is (the
- * floor and every hard rule for a shell, the interpreter rule for code); anything else, a file
- * (`sh < x.sh`), a process substitution (`. <(curl ...)`) or PowerShell, is `opaque-script`.
+ * Files a program's own text writes (an awk redirection, a sed `w`, an editor's `w`, a sqlite3
+ * `.output`) get the checks a shell redirection does: the policy state, protected configuration.
+ * A target that is not a literal (a variable, a concatenation) is `opaque-script`, and text that
+ * writes somewhere and names `acp` counts as the policy state.
+ */
+function writeTargets(
+  targets: string[],
+  opaque: boolean,
+  text: string,
+  context: Context,
+  rules: Set<HardRule>,
+): void {
+  if (opaque) rules.add("opaque-script");
+  if (!targets.length && !opaque) return;
+  if (/\bacp/i.test(text)) rules.add("policy-state");
+  for (const target of targets) {
+    pathRules(target, rules, false);
+    const resolved = resolutions(target, context.cwds);
+    for (const path of resolved) pathRules(path, rules, false);
+    if ([target, ...resolved].some(policyStatePath) || namesState(target, context.cwds, false))
+      rules.add("policy-state");
+  }
+}
+
+/** Shells whose script can come from standard input. Non-POSIX ones are read with sh's rules. */
+const ANY_SHELLS = new Set([
+  ...["sh", "bash", "zsh", "dash", "ksh", "mksh", "yash", "ash", "rbash", "fish", "csh", "tcsh"],
+  ...["nu", "elvish", "xonsh", "busybox"],
+]);
+
+/**
+ * How a command reads a script from its standard input: `shell` (a shell with no script operand,
+ * or `-s`; `source /dev/stdin`), `code` (an interpreter with no code flag or script), `opaque`
+ * (PowerShell, `xargs <shell>`, `sh -c "$var"`, a process substitution), or undefined when it does
+ * not. A shell's `-c` script is searched for such a command too (`bash -c 'sh'`).
+ */
+function readsScript(segment: Word[], depth = 0): "shell" | "code" | "opaque" | undefined {
+  const cmd = command(segment);
+  if (!cmd.program?.literal) return undefined;
+  let name = cmd.program.text.split(/[\\/]/).pop() ?? "";
+  let words = cmd.args;
+  if (name === "busybox") {
+    name = words[0]?.text ?? "";
+    words = words.slice(1);
+  }
+  const args = words.map((word) => word.text);
+  const operands = args.filter((arg) => !arg.startsWith("-"));
+  const programAt = segment.indexOf(cmd.program);
+  const viaXargs = segment.some(
+    (word, k) => k < programAt && word.literal && /(?:^|\/)xargs$/.test(word.text),
+  );
+  if (ANY_SHELLS.has(name) || POWERSHELLS.has(name.toLowerCase())) {
+    if (viaXargs || POWERSHELLS.has(name.toLowerCase())) return "opaque";
+    const flag = args.findIndex((arg) => /^-[a-zA-Z]*c[a-zA-Z]*$|^--command$/.test(arg));
+    if (flag >= 0) {
+      const body = words[flag + 1];
+      if (!body || !body.literal) return "opaque";
+      if (depth >= 3) return "opaque";
+      for (const inner of scan(body.text).segments) {
+        const kind = readsScript(inner, depth + 1);
+        if (kind) return kind;
+      }
+      return undefined;
+    }
+    if (operands.length && !args.includes("-s")) return undefined; // `bash script.sh`
+    return "shell";
+  }
+  if (name === "source" || name === ".") {
+    const target = words[0];
+    if (!target) return undefined;
+    if (!target.literal) return "opaque"; // `. <(curl ...)`, `source $f`
+    return /^\/dev\/(?:stdin|fd\/0)$|^-$/.test(target.text) ? "shell" : undefined;
+  }
+  if (INTERPRETERS.has(name)) {
+    if (viaXargs) return "opaque";
+    if (words.some((_, i) => i > 0 && CODE_FLAG.test(args[i - 1] ?? ""))) return undefined;
+    if (operands.some((arg) => arg !== "-")) return undefined; // `python3 script.py`
+    return "code";
+  }
+  return undefined;
+}
+
+/**
+ * A script fed to a shell or interpreter. The stage a pipe feeds is the piped command and, when
+ * it opens a group (`( ... )`, `{ ...; }`, `if`, `while`, `for`, `case`), everything inside the
+ * group; a here-string or a redirected standard input feeds its own command. When any command
+ * there reads its script from standard input (`readsScript`), a literal `echo`, `printf`, quoted
+ * here-document or here-string is judged as the script it is (the floor and every hard rule for a
+ * shell, the interpreter rule for code); anything else is `opaque-script`.
  */
 function stdinScript(
   segments: Word[][],
@@ -899,64 +1062,45 @@ function stdinScript(
   depth: number,
 ): void {
   const segment = segments[k] as Word[];
-  const cmd = command(segment);
-  if (!cmd.program?.literal) return;
-  const name = cmd.program.text.split(/[\\/]/).pop() ?? "";
-  const args = cmd.args.map((word) => word.text);
-  const operands = args.filter((arg) => !arg.startsWith("-"));
-  let kind: "shell" | "code" | "opaque" | undefined;
-  if (STDIN_SHELLS.has(name)) {
-    if (args.some((arg) => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg))) return; // `sh -c`: innerScript
-    if (operands.length && !args.includes("-s")) return; // `bash script.sh`
-    kind = "shell";
-  } else if (POWERSHELLS.has(name.toLowerCase())) {
-    const command = args.findIndex((arg) => /^-(?:c|command)$/i.test(arg));
-    if (command >= 0 && args[command + 1] !== "-") return;
-    if (args.some((arg) => /^-(?:f|file)$/i.test(arg))) return;
-    kind = "opaque";
-  } else if (name === "source" || name === ".") {
-    const target = cmd.args[0];
-    if (!target) return;
-    if (!target.literal)
-      kind = "opaque"; // `. <(curl ...)`, `source $f`
-    else if (/^\/dev\/(?:stdin|fd\/0)$|^-$/.test(target.text)) kind = "shell";
-    else return;
-  } else if (INTERPRETERS.has(name)) {
-    if (cmd.args.some((word, i) => i > 0 && CODE_FLAG.test(args[i - 1] ?? ""))) return;
-    if (operands.some((arg) => arg !== "-")) return; // `python3 script.py`
-    kind = "code";
-  } else return;
+  const first = segment[0];
+  const piped = segment.find((word) => word.piped);
   const here = segment.filter((word) => word.herestring);
   const docs = segment.filter((word) => word.heredoc);
+  const cmd = command(segment);
   const fromFile = cmd.redirects.some(
     (word) => !word.heredoc && !word.herestring && !word.writes && !/^\d*$/.test(word.text),
   );
-  const piped = segment.some((word) => word.piped);
+  let kind: "shell" | "code" | "opaque" | undefined;
   let text: string | undefined;
-  let known = true;
-  if (here.length) {
-    const word = here[here.length - 1] as Word;
-    if (word.literal) text = word.text;
-    else known = false;
-  } else if (docs.length)
-    return; // a here-document: judged as code where it is read
-  else if (fromFile) known = false;
-  else if (piped) {
+  if (piped) {
+    // The stage: this command, and the rest of a group it opens.
+    const at = piped.pipedAt ?? first?.depth ?? 0;
+    for (let j = k; j < segments.length; j++) {
+      const stage = segments[j] as Word[];
+      if (j > k && (stage[0]?.depth ?? 0) <= at) break;
+      kind ??= readsScript(stage);
+      if (kind) break;
+    }
+    if (!kind) return;
     text = producedText(segments[k - 1] ?? []);
-    if (text === undefined) known = false;
-  } else if (kind !== "opaque") return; // nothing is fed in (an interactive shell)
-  if (kind === "opaque" || !known || text === undefined) {
+  } else {
+    kind = readsScript(segment);
+    if (!kind) return;
+    if (here.length) {
+      const word = here[here.length - 1] as Word;
+      if (word.literal) text = word.text;
+    } else if (docs.length)
+      return; // a here-document: judged as code where it is read
+    else if (!fromFile && kind !== "opaque") return; // nothing is fed in (an interactive shell)
+  }
+  if (kind === "opaque" || text === undefined) {
     rules.add("opaque-script");
     return;
   }
   context.runsText = true;
-  if (kind === "shell") {
-    if (depth < 4) analyzeScript(text, context, rules, depth + 1);
-    textRules(text, [...context.cwds][0] ?? "", rules);
-  } else {
-    if (codeTouchesState(text, context.cwds)) rules.add("policy-state");
-    textRules(text, [...context.cwds][0] ?? "", rules);
-  }
+  if (kind === "shell" && depth < 4) analyzeScript(text, context, rules, depth + 1);
+  if (kind === "code" && codeTouchesState(text, context.cwds)) rules.add("policy-state");
+  textRules(text, [...context.cwds][0] ?? "", rules);
 }
 
 function analyzeScript(
@@ -995,7 +1139,9 @@ function analyzeScript(
       let openers = 0;
       for (const match of doc.text.matchAll(/\$\(|`/g)) {
         if (++openers > 32) break;
-        const rest = doc.text.slice((match.index ?? 0) + match[0].length);
+        // What a misread could hide starts at the opener; 4,096 characters bound each rescan.
+        const from = (match.index ?? 0) + match[0].length;
+        const rest = doc.text.slice(from, from + 4096);
         analyzeScript(rest, context, rules, depth + 1);
       }
     }
@@ -1105,7 +1251,25 @@ function analyzeCommand(
           analyzeScript(script, context, rules, depth + 1);
           textRules(script, [...context.cwds][0] ?? "", rules);
         }
+      writeTargets(run.writes, run.writesOpaque, program, context, rules);
     }
+  }
+  // Editors and tools that write files named inside their own command text: sed `w`, `W` and
+  // `s///w`, ex/vim `-c 'w file'`, ed's `w`, sqlite3 `.output`/`.once`/`.save`/`.backup`.
+  if (cmd.program?.literal && EDITOR_WRITES[programName]) {
+    const texts = cmd.args.map((word) => word.text);
+    const inputs = segment.filter((word) => word.heredoc || word.herestring);
+    const scripts = [...texts, ...inputs.map((word) => word.text)];
+    const targets: string[] = [];
+    let opaque = inputs.some((word) => !word.literal && !(word.heredoc && word.quoted));
+    for (const script of scripts)
+      for (const match of script.matchAll(EDITOR_WRITES[programName] as RegExp)) {
+        const target = (match[1] ?? match[2] ?? "").replace(/^(["'])(.*)\1$/, "$2");
+        if (!target) continue;
+        if (/[$`]/.test(target)) opaque = true;
+        else targets.push(target);
+      }
+    writeTargets(targets, opaque, scripts.join("\n"), context, rules);
   }
   for (const word of segment) {
     if (word.heredoc) continue;
@@ -1142,8 +1306,10 @@ function analyzeCommand(
     else if (!target.literal) context.unknownCwd = true;
     else {
       const found = resolutions(target.text, context.cwds);
-      if (found.length) for (const path of found) context.cwds.add(path);
-      else context.unknownCwd = true;
+      // Every `cd` can double the directories a later word is judged in; past a few the script's
+      // directory is unknown (relative targets then fail closed) instead of judged in thousands.
+      if (!found.length || context.cwds.size + found.length > MAX_CWDS) context.unknownCwd = true;
+      else for (const path of found) context.cwds.add(path);
     }
     return;
   }
@@ -1331,6 +1497,26 @@ export function hardRules(
   decision: Decision,
   scratchRoots: string[] = [],
 ): HardRule[] {
+  // The engine and the session ask about the same request in turn: answer from a short memo.
+  const key = JSON.stringify([
+    request.tool,
+    request.cwd,
+    request.input,
+    decision.reason,
+    decision.category,
+    decision.userOnly ?? false,
+    scratchRoots,
+  ]);
+  const now = Date.now();
+  const hit = ruleMemo.get(key);
+  if (hit && now - hit.at < 2000) return [...hit.rules];
+  const rules = withEvidence(() => hardRulesOnce(request, decision, scratchRoots));
+  if (ruleMemo.size >= 32) ruleMemo.delete(ruleMemo.keys().next().value as string);
+  ruleMemo.set(key, { at: now, rules });
+  return [...rules];
+}
+const ruleMemo = new Map<string, { at: number; rules: HardRule[] }>();
+function hardRulesOnce(request: Request, decision: Decision, scratchRoots: string[]): HardRule[] {
   const rules = new Set<HardRule>();
   if (decision.userOnly || decision.reason === APPROVE_GUARD) rules.add("self-approve");
   if (FOREIGN_RECORD_REASON.test(decision.reason)) rules.add("foreign-classification-record");
