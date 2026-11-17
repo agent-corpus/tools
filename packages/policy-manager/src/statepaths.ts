@@ -665,6 +665,25 @@ function callsReachState(code: string, cwds: string[]): boolean {
   return false;
 }
 
+/** The code with each `os.path.join` of literals only replaced by its joined path, quoted. */
+function joinedLiterals(code: string): string {
+  let out = "";
+  let from = 0;
+  for (const match of code.matchAll(/\bos\s*\.\s*path\s*\.\s*join\s*\(/g)) {
+    const at = match.index ?? 0;
+    if (at < from) continue;
+    const args = callArgs(code, at + match[0].length, true);
+    if (!args) continue;
+    const end = at + match[0].length + args.join(",").length;
+    if (code[end] !== ")") continue;
+    const path = literalPath(code.slice(at, end + 1));
+    if (path === undefined) continue;
+    out += `${code.slice(from, at)}'${path}'`;
+    from = end + 1;
+  }
+  return out + code.slice(from);
+}
+
 /**
  * Whether inline interpreter code could change the state. It names `acp`; or it deletes, moves or
  * writes files and either computes the temp directory at run time (an environment variable or an
@@ -697,7 +716,9 @@ export function codeTouchesState(code: string, cwds: Iterable<string>): boolean 
   // The temp directory computed at run time (case matters: `/tmp` in a path is not `TMP`).
   if (TEMP_LOOKUP.test(code)) return true;
   const list = [...cwds];
-  for (const match of code.matchAll(/(?:~\/|\/)[\w.*?[\]{}$%-][^\s'"`,;)(]*/g)) {
+  // `os.path.join('/tmp', 'x')` names /tmp/x, not the temp root: read literal joins as one path.
+  const text = joinedLiterals(code);
+  for (const match of text.matchAll(/(?:~\/|\/)[\w.*?[\]{}$%-][^\s'"`,;)(]*/g)) {
     // Parts filled in at run time are any name: `{x}`, `%s`, `$x`; a path that ends where code
     // goes on (`'/tmp/' + x`) keeps its trailing `/` and is read as the directory.
     if (match[0].length > MAX_TARGET) return true;
