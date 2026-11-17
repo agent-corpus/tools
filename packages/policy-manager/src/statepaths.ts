@@ -1,6 +1,6 @@
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname } from "node:path";
+import { basename, dirname, posix } from "node:path";
 import { canonical, resolveWord, tempRoots } from "./evidence.js";
 
 /**
@@ -525,14 +525,47 @@ function callArgs(code: string, start: number, parens: boolean): string[] | unde
   return undefined;
 }
 
-/** Variables assigned exactly once, to a plain string literal: `p = '/x'`, `const p = "/x"`. */
+/**
+ * The path a literal expression names, or undefined: a plain string literal, `Path(<literal>)` or
+ * `pathlib.Path(<literal>)`, `open(<literal>[, mode])` (the file it opens), or `os.path.join` of
+ * literals only. Anything computed (a variable, `Path.cwd()`, concatenation, an f-string) is not.
+ */
+function literalPath(text: string): string | undefined {
+  const expr = text.trim();
+  // The arguments of a call that is the whole expression: `Path(x)`, not `Path(x).read_text()`.
+  const call = (pattern: RegExp) => {
+    const match = pattern.exec(expr);
+    if (!match) return undefined;
+    const args = callArgs(expr, match[0].length, true);
+    if (!args) return undefined;
+    const end = match[0].length + args.join(",").length;
+    return expr[end] === ")" && end === expr.length - 1 ? args : undefined;
+  };
+  const wrapped = call(/^(?:pathlib\s*\.\s*)?Path\s*\(/) ?? call(/^open\s*\(/);
+  if (wrapped) {
+    const [first] = wrapped;
+    return first === undefined ? undefined : plainLiteral(first);
+  }
+  const joined = call(/^os\s*\.\s*path\s*\.\s*join\s*\(/);
+  if (joined) {
+    const parts = joined.map(plainLiteral);
+    if (!parts.length || parts.some((part) => part === undefined)) return undefined;
+    return posix.join(...(parts as string[]));
+  }
+  return plainLiteral(expr);
+}
+
+/**
+ * Variables assigned exactly once, to a literal path (`literalPath`): `p = '/x'`,
+ * `const p = "/x"`, `p = Path('/x')`, `f = open('/x', 'w')`, `p = os.path.join('/tmp', 'x')`.
+ */
 function literalVariables(code: string): Map<string, string | undefined> {
   const found = new Map<string, string | undefined>();
   for (const line of code.split(/[\n;]/)) {
     const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)(.*)$/.exec(line);
     if (!match) continue;
     const [, name = "", value = ""] = match;
-    found.set(name, found.has(name) ? undefined : plainLiteral(value));
+    found.set(name, found.has(name) ? undefined : literalPath(value));
   }
   return found;
 }
@@ -549,9 +582,7 @@ function callsReachState(code: string, cwds: string[]): boolean {
   const value = (arg: string): string | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
     if (name) return vars.get(name);
-    const path = /^\s*(?:pathlib\s*\.\s*)?Path\s*\((.*)\)\s*$/.exec(arg)?.[1];
-    if (path !== undefined) return value(path);
-    return plainLiteral(arg);
+    return literalPath(arg);
   };
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
@@ -583,9 +614,14 @@ function callsReachState(code: string, cwds: string[]): boolean {
       (dotted && LOADED.test(before.slice(-200)));
     if (dotted && !moduleCall && !FILE_METHODS.test(name)) {
       if (!PATH_METHODS.test(name)) continue;
-      // `.replace(...)`/`.rename(...)` on anything but a `Path(...)` is a string or table method.
+      // `.replace(...)`/`.rename(...)` on anything but a `Path(...)` is a string or table method,
+      // and so is one with two or more arguments: `Path.replace`/`rename` take one target.
       const object = pathObject();
-      if (object === undefined && /^(?:replace|rename)$/.test(name)) continue;
+      if (/^(?:replace|rename)$/.test(name)) {
+        if (object === undefined) continue;
+        const args = callArgs(code, at, parens);
+        if (args && args.length >= 2) continue;
+      }
       if (reaches(object)) return true;
       continue;
     }

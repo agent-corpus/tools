@@ -390,6 +390,9 @@ function tooManyWords(command: string): boolean {
 const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside", "policy-state"]);
 export const FLOOR_REASON =
   "A cloud, repository, publishing or deletion command outside disposable roots needs a person";
+/** Why a request that could change the policy manager's own files needs a person. */
+export const POLICY_STATE_REASON =
+  "Could change the policy manager's own files (its session state in the temp directory); needs a person";
 /**
  * The decision for a request. The floor runs after the engine: a cloud or infrastructure write, a
  * repository deletion, a publish or a recursive delete outside disposable roots is never approved,
@@ -419,7 +422,15 @@ function evaluateOnce(
     // engine still asks for cloud deletion there.
     (rule) => FLOOR.has(rule) && !(rule === "cloud-write" && profile.cloudWrites === "allow"),
   );
-  if (floor) return { ...result(request, "destructive", FLOOR_REASON), hard: floor };
+  if (floor)
+    return {
+      ...result(
+        request,
+        floor === "policy-state" ? "sensitive" : "destructive",
+        floor === "policy-state" ? POLICY_STATE_REASON : FLOOR_REASON,
+      ),
+      hard: floor,
+    };
   // The session token authenticates grants: reading it, or anything beside it but the audit logs,
   // is a credential read no step approves.
   if (readsPolicySecret(request, profile.scratchRoots))
@@ -462,7 +473,13 @@ function evaluateSteps(
     );
     if (tamper)
       return {
-        ...result(request, "sensitive", "Harness settings and the policy profile require a person"),
+        ...result(
+          request,
+          "sensitive",
+          tamper === "policy-state"
+            ? POLICY_STATE_REASON
+            : "Harness settings and the policy profile require a person",
+        ),
         hard: tamper,
       };
   }
