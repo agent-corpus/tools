@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import { executionReport, hookOutput, hookResponse } from "../src/adapters.js";
+import { CLASSIFIER_TIMEOUT_MS } from "../src/classifier.js";
 import { hookConfig } from "../src/config.js";
+import { REVIEW_TIMEOUT_MS } from "../src/service.js";
 import { PolicySession } from "../src/session.js";
 import { setupHook } from "../src/setup.js";
 import type { Category, Decision } from "../src/types.js";
@@ -63,16 +65,17 @@ describe("Codex PreToolUse", () => {
     expect(reason).not.toMatch(/ask the user to approve/i);
     expect(reason).not.toMatch(/classif/i);
   });
-  test("an ambiguous cloud request keeps the classification route", () => {
+  test("a request the classifier did not settle gets the approve command, never a classify request", () => {
     const reason = (
       hookResponse("codex", "PreToolUse", {
         ...decision("human", "cloud-read"),
         needsClassification: true,
+        classifierNote: "The AI classifier did not approve it",
       }).hookSpecificOutput as { permissionDecisionReason: string }
     ).permissionDecisionReason;
-    expect(reason).toContain("Classify it with the session policy-manager agent and retry");
-    expect(reason).toContain("command the user runs to approve it");
-    expect(reason).not.toContain("does not unblock it");
+    expect(reason).not.toContain("Classify it");
+    expect(reason).toContain("approve --last");
+    expect(reason).toContain("The AI classifier did not approve it.");
   });
   // Codex 0.167 rejects `permissionDecision: "allow"` without `updatedInput` ("PreToolUse hook
   // returned unsupported permissionDecision:allow") and marks the hook failed on every call. An
@@ -148,7 +151,7 @@ describe("exact hook output per harness", () => {
       "claude",
       "PreToolUse",
       "human",
-      '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Destructive operation requires human approval"}}',
+      '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Policy manager: Destructive operation requires human approval."}}',
     ],
     [
       "claude",
@@ -162,7 +165,7 @@ describe("exact hook output per harness", () => {
       "copilot",
       "PreToolUse",
       "human",
-      '{"permissionDecision":"ask","permissionDecisionReason":"Destructive operation requires human approval"}',
+      '{"permissionDecision":"ask","permissionDecisionReason":"Policy manager: Destructive operation requires human approval."}',
     ],
     ["copilot", "PermissionRequest", "approve", '{"behavior":"allow"}'],
     ["copilot", "PermissionRequest", "human", "{}"],
@@ -187,7 +190,7 @@ describe("Claude and Copilot output is pinned", () => {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "ask",
-        permissionDecisionReason: "Destructive operation requires human approval",
+        permissionDecisionReason: "Policy manager: Destructive operation requires human approval.",
       },
     });
     expect(hookResponse("claude", "PreToolUse", decision("approve"))).toEqual({
@@ -201,7 +204,7 @@ describe("Claude and Copilot output is pinned", () => {
   test("Copilot", () => {
     expect(hookResponse("copilot", "PreToolUse", decision("human"))).toEqual({
       permissionDecision: "ask",
-      permissionDecisionReason: "Destructive operation requires human approval",
+      permissionDecisionReason: "Policy manager: Destructive operation requires human approval.",
     });
     expect(hookResponse("copilot", "PreToolUse", decision("approve"))).toEqual({
       permissionDecision: "allow",
@@ -226,15 +229,31 @@ describe("hook timeouts", () => {
     );
   };
   // Codex limits SessionEnd to 1 to 3 seconds and warns about anything longer.
-  test("Codex SessionEnd is 3 seconds and the other Codex hooks are unchanged", () => {
+  // Every other managed hook outlasts the classifier (at most 20 s) and the service's review wait.
+  test("Codex SessionEnd is 3 seconds and the other Codex hooks are 45", () => {
     const t = timeouts("codex");
     expect(t.SessionEnd).toBe(3);
     for (const phase of ["SessionStart", "PreToolUse", "PermissionRequest", "PostToolUse"])
-      expect(t[phase]).toBe(8);
+      expect(t[phase]).toBe(45);
   });
-  test("Claude and Copilot keep 8 seconds everywhere", () => {
+  test("Claude and Copilot hooks are 45 seconds everywhere", () => {
     for (const harness of ["claude", "copilot"] as const)
-      for (const value of Object.values(timeouts(harness))) expect(value).toBe(8);
+      for (const value of Object.values(timeouts(harness))) expect(value).toBe(45);
+  });
+  test("every hook timeout exceeds the classifier timeout and the review wait", () => {
+    for (const harness of ["claude", "codex", "copilot"] as const)
+      for (const [phase, value] of Object.entries(timeouts(harness)))
+        if (!(harness === "codex" && phase === "SessionEnd")) {
+          expect((value ?? 0) * 1000).toBeGreaterThan(CLASSIFIER_TIMEOUT_MS[harness] + 5000);
+          expect((value ?? 0) * 1000).toBeGreaterThan(REVIEW_TIMEOUT_MS + 2000);
+        }
+  });
+  test("Copilot hooks use timeoutSec, above its fail-open default of 30 seconds", () => {
+    const hooks = hookConfig("copilot", cli).hooks as Record<
+      string,
+      Array<{ timeoutSec?: number }>
+    >;
+    for (const entries of Object.values(hooks)) expect(entries[0]?.timeoutSec).toBeGreaterThan(30);
   });
 });
 

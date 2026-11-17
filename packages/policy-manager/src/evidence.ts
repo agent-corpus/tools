@@ -56,7 +56,47 @@ export function resolveWord(cwd: string, word: string): string {
   return current;
 }
 
+/**
+ * Git answers memoized for the length of one decision (`withEvidence`): a script that names the
+ * same checkout many times asks Git once per question. Outside a decision nothing is cached, so a
+ * long-running service never reuses an answer across requests.
+ */
+let gitMemo: Map<string, { out?: string; error?: unknown }> | undefined;
+let gitDepth = 0;
+/** `canonical` answers for the length of one decision, like `gitMemo`. */
+let realMemo: Map<string, { out?: string; error?: unknown }> | undefined;
+export function withEvidence<T>(run: () => T): T {
+  if (gitDepth++ === 0) {
+    gitMemo = new Map();
+    realMemo = new Map();
+  }
+  try {
+    return run();
+  } finally {
+    if (--gitDepth === 0) {
+      gitMemo = undefined;
+      realMemo = undefined;
+    }
+  }
+}
+
 export function git(cwd: string, args: string[]): string {
+  if (!gitMemo) return gitOnce(cwd, args);
+  const key = JSON.stringify([cwd, args]);
+  let hit = gitMemo.get(key);
+  if (!hit) {
+    try {
+      hit = { out: gitOnce(cwd, args) };
+    } catch (error) {
+      hit = { error };
+    }
+    gitMemo.set(key, hit);
+  }
+  if ("error" in hit) throw hit.error;
+  return hit.out as string;
+}
+
+function gitOnce(cwd: string, args: string[]): string {
   return execFileSync("git", ["-c", "core.fsmonitor=false", "-C", cwd, ...args], {
     encoding: "utf8",
     timeout: 3000,
@@ -66,6 +106,21 @@ export function git(cwd: string, args: string[]): string {
   }).trim();
 }
 export function canonical(path: string, links = 0): string {
+  if (!realMemo || links) return canonicalOnce(path, links);
+  let hit = realMemo.get(path);
+  if (!hit) {
+    try {
+      hit = { out: canonicalOnce(path, 0) };
+    } catch (error) {
+      hit = { error };
+    }
+    if (realMemo.size < 20_000) realMemo.set(path, hit);
+  }
+  if ("error" in hit) throw hit.error;
+  return hit.out as string;
+}
+
+function canonicalOnce(path: string, links: number): string {
   // Native resolution expands Windows 8.3 aliases as well as symlinks, so
   // paths supplied by Node and Git describe the same repository boundaries.
   if (existsSync(path)) return realpathSync.native(path);

@@ -45,7 +45,25 @@ export interface Decision {
   tier?: "ambiguous";
   classification?: ClassificationStage;
   /** Why a human was asked after classification could not decide. */
-  fallbackReason?: "unavailable" | "invalid-result" | "limit";
+  fallbackReason?:
+    | "unavailable"
+    | "invalid-result"
+    | "disabled"
+    | "too-long"
+    | "missing"
+    | "not-logged-in"
+    | "exit"
+    | "timeout"
+    | "bad-json"
+    | "schema";
+  /** A hard human item: never classified, and no classification approves it. The rule it hit. */
+  hard?: string;
+  /** What the classifier said when it did not approve, shown to the person who is asked. */
+  classifierNote?: string;
+  /** Approved by the user's own harness permission rule: the rule, as written. */
+  userAllowRule?: string;
+  /** No decision because the user's own deny or ask rule matched: the rule, as written. */
+  userRule?: string;
   ai?: Classification;
   /** A human decision the user may approve for the rest of the session (`approve --session`). */
   sessionGrantable?: boolean;

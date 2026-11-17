@@ -1,6 +1,5 @@
 import { requestHash } from "./policy.js";
-import { HUMAN_REVIEW_PRINCIPLE } from "./principle.js";
-import { CATEGORIES, type Decision, type OutcomeReport, type Request } from "./types.js";
+import type { Decision, OutcomeReport, Request } from "./types.js";
 export function normalize(harness: Request["harness"], payload: Record<string, unknown>): Request {
   let input: unknown = payload.tool_input ?? payload.toolInput ?? payload.toolArgs ?? {};
   if (typeof input === "string") input = JSON.parse(input);
@@ -134,6 +133,7 @@ export function approveLastCommand(context?: HookContext): string {
 export function approveInstruction(decision: Decision, context?: HookContext): string {
   return [
     `⏸ Waiting for your approval. Not run: ${decision.reason}.`,
+    ...(askWhy(decision) ? [`${askWhy(decision)}.`] : []),
     'Run in your own terminal, then say "retry":',
     `  ${approveLastCommand(context)}`,
     ...(decision.sessionGrantable
@@ -145,14 +145,36 @@ export function approveInstruction(decision: Decision, context?: HookContext): s
     `Request ${decision.requestHash}.`,
   ].join("\n");
 }
-/** What a blocked ambiguous request tells the model to do. Never ask for human approval here. */
-function classifyInstruction(
-  harness: Request["harness"],
-  decision: Decision,
-  context?: HookContext,
-): string {
-  const command = classifyCommand(harness, context);
-  return `Needs classification (not an error): not run yet. Ask the session's policy-manager agent whether this exact command is recoverable and non-sensitive, record its answer, then retry the same command unchanged. Rule: ${HUMAN_REVIEW_PRINCIPLE} Request ${decision.requestHash}: ${decision.reason}. Answer shape: {"requestHash":"${decision.requestHash}","category":"${CATEGORIES.join("|")}","confidence":0.0-1.0,"recoverable":true|false,"rationale":"one short sentence without quotes"}. Record it by replacing <json> in this command, with no single quotes in the answer: ${command} If no classification is available, retry once and the user will be asked.`;
+const FALLBACK_TEXT: Partial<Record<NonNullable<Decision["fallbackReason"]>, string>> = {
+  disabled: "the AI classifier is turned off in the profile",
+  "too-long": "the command is too long to classify",
+  missing: "the classifier CLI is not installed",
+  "not-logged-in": "the classifier CLI is not logged in",
+  exit: "the classifier CLI failed",
+  timeout: "the classifier timed out",
+  "bad-json": "the classifier's answer was not JSON",
+  schema: "the classifier's answer did not match the schema",
+};
+
+/** Why the classifier did not settle a request, or undefined. */
+function askWhy(decision: Decision): string | undefined {
+  const why = decision.hard
+    ? "it needs a person by rule (credentials, protected configuration, unrecoverable loss or a profile pattern), so it was not sent to the AI classifier"
+    : decision.classifierNote
+      ? decision.classifierNote
+      : decision.fallbackReason && FALLBACK_TEXT[decision.fallbackReason]
+        ? `no AI classification: ${FALLBACK_TEXT[decision.fallbackReason]}`
+        : undefined;
+  return why && `${why[0]?.toUpperCase()}${why.slice(1)}`;
+}
+/** Why a person is asked, as the harness's prompt shows it. */
+export function askReason(decision: Decision, remembers = false): string {
+  const why = askWhy(decision);
+  const remembered =
+    remembers && decision.sessionGrantable && decision.sessionScopeLabel
+      ? ` If you allow it, ${decision.sessionScopeLabel} is allowed for the rest of this session.`
+      : "";
+  return `Policy manager: ${decision.reason}${why ? `. ${why}` : ""}.${remembered}`;
 }
 export function hookResponse(
   harness: Request["harness"],
@@ -162,10 +184,7 @@ export function hookResponse(
 ): Record<string, unknown> {
   if (decision.decision === "native") return {};
   if (decision.decision === "deny") {
-    const reason =
-      decision.classification === "requested"
-        ? classifyInstruction(harness, decision, context)
-        : decision.reason;
+    const reason = decision.reason;
     if (phase === "PermissionRequest")
       return harness === "copilot"
         ? {}
@@ -192,7 +211,7 @@ export function hookResponse(
       ? { permissionDecision: "allow" }
       : {
           permissionDecision: "ask",
-          permissionDecisionReason: decision.reason,
+          permissionDecisionReason: askReason(decision),
         };
   }
   if (phase === "PermissionRequest")
@@ -219,20 +238,14 @@ export function hookResponse(
   // Codex parses permissionDecision "ask" but does not support it: it marks the hook failed and
   // runs the tool anyway (https://developers.openai.com/codex/hooks). Only "deny" stops a command,
   // so a decision that needs a human is a deny. Approving it in chat does not change the decision;
-  // the user approves it from their own terminal (`approve`, once or for the session), or an
-  // ambiguous request (needsClassification) is classified, and a retry then sees the approval.
+  // the user approves it from their own terminal (`approve`, once or for the session), and a
+  // retry then sees the approval. This comes only after the AI classifier or a hard rule said a
+  // person is needed.
   // Codex's own approval prompt (PermissionRequest, above) still handles the requests it asks about.
   if (harness === "codex") {
-    const classify =
-      decision.needsClassification === true && decision.classification !== "fallback";
-    const reason =
-      !classify && !decision.userOnly
-        ? approveInstruction(decision, context)
-        : `Policy manager: ${decision.reason}. This needs a human decision and was not run. ${
-            classify
-              ? "Classify it with the session policy-manager agent and retry. If it is not classified as approved, the retry is blocked with the command the user runs to approve it."
-              : "Do not run approve yourself: ask the user to approve the original request from their own terminal."
-          } Request ${decision.requestHash}.`;
+    const reason = !decision.userOnly
+      ? approveInstruction(decision, context)
+      : `Policy manager: ${decision.reason}. This needs a human decision and was not run. Do not run approve yourself: ask the user to approve the original request from their own terminal. Request ${decision.requestHash}.`;
     return {
       hookSpecificOutput: {
         hookEventName: phase,
@@ -245,7 +258,7 @@ export function hookResponse(
     hookSpecificOutput: {
       hookEventName: phase,
       permissionDecision: "ask",
-      permissionDecisionReason: decision.reason,
+      permissionDecisionReason: askReason(decision, harness === "claude"),
     },
   };
 }

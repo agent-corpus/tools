@@ -70,9 +70,11 @@ describe("single-quoted literals", () => {
     expect(decide("gh api graphql -f b='Fixed in `abc`'").decision).toBe("approve");
   });
   test('a variable holding a single-quoted literal with $ is usable as "$Q"', () => {
-    expect(decide("Q='mutation($t:ID!){x}'; gh api graphql -f query=\"$Q\" -f t=1").decision).toBe(
-      "approve",
-    );
+    expect(
+      decide(
+        "Q='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{id}}}'; gh api graphql -f query=\"$Q\" -f t=1",
+      ).decision,
+    ).toBe("approve");
   });
   test("the same variable unquoted, or run as a script, keeps its checks", () => {
     expect(decide("Q='rm -rf ~/x'; $Q").decision).toBe("human");
@@ -82,7 +84,7 @@ describe("single-quoted literals", () => {
 });
 
 describe("session scope for shell redirect writes", () => {
-  test("a redirect write is session-grantable and covers later writes under the same root", () => {
+  test("a redirect write is session-grantable for that exact file only", () => {
     const { s } = session();
     const first = s.review(
       shell("printf test >> .agent-config/README.md"),
@@ -91,14 +93,17 @@ describe("session scope for shell redirect writes", () => {
     );
     expect(first.decision).toBe("human");
     expect(first.sessionGrantable).toBe(true);
-    expect(first.sessionScopeLabel).toMatch(/^writes under .*\.agent-config$/);
+    expect(first.sessionScopeLabel).toMatch(/^writes to .*\.agent-config[\\/]README\.md$/);
     s.grant(first.requestHash, true, true);
+    expect(
+      s.review(shell("printf other >> .agent-config/README.md"), undefined, "PreToolUse").decision,
+    ).toBe("approve");
     for (const later of [
       shell("printf x > .agent-config/agents/a.md"),
       shell("tee -a .agent-config/skills/b.md"),
       patch(join(worktree, ".agent-config", "c.md")),
     ])
-      expect(s.review(later, undefined, "PreToolUse").decision).toBe("approve");
+      expect(s.review(later, undefined, "PreToolUse").decision).toBe("human");
   });
   test.each([
     "printf x >> AGENTS.md",

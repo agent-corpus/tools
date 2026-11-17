@@ -97,58 +97,150 @@ test.each(["claude", "codex", "copilot"] as const)(
   },
   30000,
 );
-test("the hook's record command is approved, and the retry of the original then runs", () => {
+// A stub `claude` on PATH stands in for the classifier CLI: it prints the answer file it is given.
+test.skipIf(process.platform === "win32")(
+  "the hook classifies with the CLI, asks when it does not approve, and remembers the answer",
+  () => {
+    const sessionId = `classify-${randomUUID()}`;
+    const directory = sessionDirectory("claude", sessionId);
+    const config = mkdtempSync(join(tmpdir(), "pm-config-"));
+    const bin = join(config, "bin");
+    mkdirSync(bin);
+    const answer = join(config, "answer.json");
+    const args = join(config, "args.txt");
+    writeFileSync(
+      join(bin, "claude"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" > "${args}"\ncat "${answer}"\n`,
+      { mode: 0o755 },
+    );
+    const profileDirectory = join(config, "agent-corpus", "policy-manager");
+    mkdirSync(profileDirectory, { recursive: true });
+    writeFileSync(join(profileDirectory, "policy.json"), '{"version":1,"mode":"permissive"}', {
+      mode: 0o600,
+    });
+    const env = {
+      ...process.env,
+      XDG_CONFIG_HOME: config,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    };
+    const verdict = (category: string, recoverable: boolean, confidence: number) =>
+      writeFileSync(
+        answer,
+        JSON.stringify({
+          type: "result",
+          is_error: false,
+          structured_output: { category, confidence, recoverable, rationale: "stub verdict" },
+        }),
+      );
+    const hook = (event: string, command: string, extra: Record<string, unknown> = {}) =>
+      execFileSync(process.execPath, [cli, "hook", "claude", event], {
+        encoding: "utf8",
+        env,
+        timeout: 30000,
+        input: JSON.stringify({
+          session_id: sessionId,
+          cwd: process.cwd(),
+          tool_name: "Bash",
+          tool_input: { command },
+          ...extra,
+        }),
+      });
+    const pre = (command: string, extra: Record<string, unknown> = {}) =>
+      JSON.parse(hook("PreToolUse", command, extra)).hookSpecificOutput;
+    try {
+      verdict("code-read", true, 0.97);
+      expect(pre("echo $HOOK_CLASSIFIED").permissionDecision).toBe("allow");
+      const passed = readFileSync(args, "utf8");
+      expect(passed).toContain("--json-schema");
+      expect(passed).toContain("disableAllHooks");
+      verdict("impactful-write", false, 0.97);
+      const asked = pre("echo $HOOK_ASKED", {
+        tool_use_id: "toolu_test_1",
+        permission_mode: "default",
+      });
+      expect(asked.permissionDecision).toBe("ask");
+      expect(asked.permissionDecisionReason).toContain("did not approve");
+      expect(asked.permissionDecisionReason).toContain("stub verdict");
+      // The person said yes in the prompt; the tool ran.
+      hook("PostToolUse", "echo $HOOK_ASKED", {
+        tool_use_id: "toolu_test_1",
+        tool_response: { exit_code: 0 },
+      });
+      const entries = readFileSync(join(directory, "audit.jsonl"), "utf8");
+      expect(entries).toContain("User approved the harness prompt");
+      expect(entries).toContain('"eventName":"ai-classification"');
+      expect(entries).toContain('"model":"haiku"');
+      expect(entries).not.toContain("Decide whether");
+      // The cached verdict is reused: no second run for the same request.
+      writeFileSync(args, "");
+      expect(pre("echo $HOOK_CLASSIFIED").permissionDecision).toBe("allow");
+      expect(readFileSync(args, "utf8")).toBe("");
+      // A hard human item never reaches the classifier.
+      verdict("code-read", true, 0.99);
+      expect(pre("git push --force origin feature-x").permissionDecision).toBe("ask");
+      expect(readFileSync(args, "utf8")).toBe("");
+    } finally {
+      try {
+        execFileSync(process.execPath, [cli, "stop", "claude", sessionId], { env });
+      } catch {
+        /* The service may not have started. */
+      }
+      rmSync(directory, { recursive: true, force: true });
+      rmSync(config, { recursive: true, force: true });
+    }
+  },
+  60000,
+);
+
+test("the compatibility classify command cannot settle a request the classifier did not", () => {
   const sessionId = `record-${randomUUID()}`;
   const directory = sessionDirectory("claude", sessionId);
   const config = mkdtempSync(join(tmpdir(), "pm-config-"));
   const profileDirectory = join(config, "agent-corpus", "policy-manager");
   mkdirSync(profileDirectory, { recursive: true });
-  writeFileSync(join(profileDirectory, "policy.json"), '{"version":1,"mode":"permissive"}', {
-    mode: 0o600,
-  });
+  writeFileSync(
+    join(profileDirectory, "policy.json"),
+    '{"version":1,"mode":"permissive","classifier":{"enabled":false}}',
+    { mode: 0o600 },
+  );
   const env = { ...process.env, XDG_CONFIG_HOME: config };
-  const hook = (command: string, description: string) =>
+  const payload = {
+    session_id: sessionId,
+    cwd: process.cwd(),
+    tool_name: "Bash",
+    tool_input: { command: "echo $RECORD_ROUND_TRIP" },
+  };
+  const hook = () =>
     JSON.parse(
       execFileSync(process.execPath, [cli, "hook", "claude", "PreToolUse"], {
         encoding: "utf8",
         env,
         timeout: 15000,
-        input: JSON.stringify({
-          session_id: sessionId,
-          cwd: process.cwd(),
-          tool_name: "Bash",
-          tool_input: { command, description },
-        }),
+        input: JSON.stringify(payload),
       }),
     ).hookSpecificOutput;
   try {
-    const blocked = hook("echo $RECORD_ROUND_TRIP", "first");
-    expect(blocked.permissionDecision).toBe("deny");
-    const reason: string = blocked.permissionDecisionReason;
-    const requestHash = /Request ([a-f0-9]{64}):/.exec(reason)?.[1] ?? "";
-    const template = /in the answer: (node .*<json>') If no/.exec(reason)?.[1] ?? "";
-    expect(template).toContain(`classify claude ${sessionId} <<< '<json>'`);
+    const asked = hook();
+    expect(asked.permissionDecision).toBe("ask");
+    expect(asked.permissionDecisionReason).toContain("turned off");
+    expect(asked.permissionDecisionReason).not.toContain("classify claude");
     const json = JSON.stringify({
-      requestHash,
+      requestHash: hash(normalize("claude", payload)),
       category: "code-read",
       confidence: 0.97,
       recoverable: true,
       rationale: "prints a variable",
     });
-    expect(hook(template.replace("<json>", json), "record").permissionDecision).toBe("allow");
-    expect(hook(`${template.replace("<json>", json)}; echo x`, "record").permissionDecision).toBe(
-      "ask",
-    );
-    // What the record command does when it runs.
-    const recorded = JSON.parse(
+    // A request the classifier could not settle is the person's: a recorded verdict is refused.
+    expect(() =>
       execFileSync(process.execPath, [cli, "classify", "claude", sessionId], {
         encoding: "utf8",
         env,
         input: json,
+        stdio: ["pipe", "pipe", "pipe"],
       }),
-    );
-    expect(recorded.decision).toBe("approve");
-    expect(hook("echo $RECORD_ROUND_TRIP", "retry").permissionDecision).toBe("allow");
+    ).toThrow();
+    expect(hook().permissionDecision).toBe("ask");
   } finally {
     try {
       execFileSync(process.execPath, [cli, "stop", "claude", sessionId], { env });

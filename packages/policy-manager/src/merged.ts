@@ -107,3 +107,27 @@ export function remoteTipMatches(cwd: string, branch: string): boolean {
     return false;
   }
 }
+
+/**
+ * Whether deleting local branch `branch` loses no commit: its tip is reachable from a
+ * remote-tracking ref (which covers a tip equal to its upstream). The commits stay recoverable
+ * from that ref. A tip that exists only locally is not.
+ */
+export function onRemote(cwd: string, branch: string): boolean {
+  if (!BRANCH_NAME.test(branch) || /^(?:main|master|HEAD)$/.test(branch)) return false;
+  try {
+    const tip = git(cwd, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
+    return (
+      git(cwd, [
+        "for-each-ref",
+        "--count=1",
+        "--contains",
+        tip,
+        "--format=%(refname)",
+        "refs/remotes/",
+      ]) !== ""
+    );
+  } catch {
+    return false;
+  }
+}

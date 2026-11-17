@@ -227,7 +227,9 @@ describe("cd into a worktree", SLOW, () => {
   test.skipIf(!links)("`cd <worktree> && rm` is judged only in the worktree", () => {
     expect(decide(`cd ${wt} && rm a.txt`, repo)).toBe("approve");
     expect(decide(`cd ${wt} && rm -r dir && rm a.txt`, repo)).toBe("approve");
-    expect(decide(`cd ${wt}; rm a.txt`, repo)).toBe("human"); // runs in the main clone if cd fails
+    // The first command, a `cd` into an existing absolute directory, does not fail.
+    expect(decide(`cd ${wt}; rm a.txt`, repo)).toBe("approve");
+    expect(decide(`ls; cd ${wt}; rm a.txt`, repo)).toBe("human"); // not first: it may fail
     expect(decide(`cd ${wt} && ls || rm a.txt`, repo)).toBe("human");
     expect(decide(`cd ${wt} || rm a.txt`, repo)).toBe("human");
   });
@@ -296,7 +298,7 @@ describe("files this session created", SLOW, () => {
     create(s, "probe.mjs");
     try {
       const other = rm(session(), "rm probe.mjs");
-      expect(other).toMatchObject({ decision: "deny", classification: "requested" });
+      expect(other).toMatchObject({ decision: "human", needsClassification: true });
       expect(rm(s, "rm -r probe.mjs").decision).not.toBe("approve");
       appendFileSync(join(wt, "probe.mjs"), "changed elsewhere");
       expect(rm(s, "rm probe.mjs")).toMatchObject({ tier: "ambiguous" });
@@ -398,12 +400,16 @@ describe("files this session created", SLOW, () => {
     ] as const) {
       const s = session();
       const r = bash(s, "rm new.txt");
-      expect(s.review(r, undefined, "PreToolUse")).toMatchObject({ classification: "requested" });
+      expect(s.review(r, undefined, "PreToolUse")).toMatchObject({ needsClassification: true });
       expect(s.classify(verdict(r, recoverable, confidence)).decision).toBe(expected);
     }
-    // Outside the worktree, and history or remote destruction inside it, stay with a person.
+    // Unrecoverable history or remote destruction stays with a person, whatever the verdict.
+    // A deletion in the main checkout is the classifier's to judge.
+    const main = session();
+    expect(main.review(bash(main, "rm a.txt", repo), undefined, "PreToolUse").tier).toBe(
+      "ambiguous",
+    );
     for (const [command, cwd] of [
-      ["rm a.txt", repo],
       ["git clean -fdx", wt],
       ["git branch -D withf", wt],
       ["git push --force origin feature", wt],
@@ -731,7 +737,7 @@ describe("files this session created", SLOW, () => {
     expect(decide("rm ./=node")).toBe("approve");
     expect(decide("git rm -f ./=node")).toBe("approve");
     const c = session();
-    expect(rm(c, "rm =git").tier).toBeUndefined(); // not a worktree deletion for the classifier
+    expect(rm(c, "rm =git").reason).not.toBe("Deleting files inside a linked feature worktree");
     expect(rm(c, "rm ./=git").tier).toBe("ambiguous");
   });
 
@@ -764,6 +770,13 @@ describe("files this session created", SLOW, () => {
       "cd dir || rm new.txt",
     ];
     if (links) masked.push(`cd ${repo}; rm new.txt`);
+    // Hard human items: no verdict approves them.
+    const hard = new Set([
+      "rm new.txt && git push --force origin feature",
+      "rm new.txt; git clean -fdx",
+      "rm new.txt; git branch -D withf",
+      "rm new.txt; cat ~/.ssh/id_rsa",
+    ]);
     for (const command of masked) {
       expect(classified(command), command).toBe(false);
       const r = bash(session(), command);
@@ -771,9 +784,13 @@ describe("files this session created", SLOW, () => {
         requestHash: hash(r),
         category: "destructive" as const,
         confidence: 0.99,
-        recoverable: true,
+        recoverable: false,
       };
       expect(evaluate(r, verdict, profile).decision, command).not.toBe("approve");
+      if (hard.has(command))
+        expect(evaluate(r, { ...verdict, recoverable: true }, profile).decision, command).not.toBe(
+          "approve",
+        );
     }
   });
 
@@ -835,7 +852,7 @@ describe("git reset --hard, checkout and restore", SLOW, () => {
     "git restore '*.txt'",
     "A=1 git reset --hard",
     "git -C . reset --hard",
-    "git status && git reset --hard",
+    "touch b.txt && git reset --hard",
     "bash -c 'git reset --hard'",
   ])("sends %s to a human", (command) => expect(decide(command)).toBe("human"));
 

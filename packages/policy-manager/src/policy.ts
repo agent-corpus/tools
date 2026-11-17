@@ -1,15 +1,36 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
-import { branchEvidence, canonical, git, inside, pathEvidence } from "./evidence.js";
 import {
-  commandDecision,
-  permissiveRead,
-  permissiveWrite,
-  WORKTREE_DELETION,
-} from "./permissive.js";
+  branchEvidence,
+  canonical,
+  git,
+  inside,
+  pathEvidence,
+  resolveWord,
+  withEvidence,
+} from "./evidence.js";
+import { hardRule, hardRules } from "./hard.js";
+
+/** Tools that write a file (a shell command is judged by the engine itself). */
+const WRITE_TOOLS = new Set([
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  "create",
+  "edit",
+  "write_file",
+  "apply_patch",
+]);
+
+import { onRemote } from "./merged.js";
+import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
+import { enterable, plainRead, readOnly, unsafeGlob } from "./reads.js";
 import { redactText } from "./redact.js";
+import { parseShell } from "./shell.js";
+import { scan } from "./shellscan.js";
 import { defaultAllowed } from "./tools.js";
 import {
   CATEGORIES,
@@ -197,14 +218,14 @@ export function result(
 }
 /** Self-reported confidence needed for the AI to approve an ambiguous request. */
 export const AMBIGUOUS_CONFIDENCE = 0.95;
+/** The reason a plain read of non-secret files is approved, protected configuration included. */
+export const PLAIN_READ = "Plain read of non-secret files";
 /**
- * Escalations that stay with a human in every profile. Category `sensitive` (credentials,
- * secrets, protected paths and configuration) is excluded by category; these are the remaining
- * boundaries: the request itself cannot be trusted, an organization or the profile asked for a
- * human, or a repository rule forbids the write. Of `destructive`, only deletion inside a linked
- * feature worktree is classified: recoverable is approved, anything else goes to a person.
+ * Escalations the classifier is never asked about because the request itself cannot be judged
+ * from what it is shown: an incomplete or malformed request, a working directory other than the
+ * reviewed one, an unreadable patch, or a custom environment the classifier does not see.
  */
-const HUMAN_BOUNDARIES: RegExp[] = [
+const NOT_CLASSIFIABLE: RegExp[] = [
   /^Incomplete request/,
   /^Invalid tool input/,
   /^Execution directory differs/,
@@ -212,70 +233,230 @@ const HUMAN_BOUNDARIES: RegExp[] = [
   /^Patch has no verified target paths/,
   /^Environment override requires human review/,
   /^Custom execution environment requires human review/,
-  /^Matches an organization human-approval pattern/,
-  /^Write requires a linked worktree on a feature branch/,
-  /^Cloud operation is outside the verified inspection catalog/,
 ];
 /**
- * Under the permissive profile, every escalation that is not a boundary is ambiguous: the
- * deterministic engine cannot decide it, so the session's AI classifier does. Strict mode is
- * unchanged.
+ * Every escalation the engine cannot decide goes to the AI classifier, in every profile, unless it
+ * is a hard human item (credentials, protected configuration, unrecoverable loss, humanPatterns),
+ * which goes straight to a person, or cannot be judged from what the classifier is shown.
  */
-function markAmbiguous(decision: Decision, profile: Profile): Decision {
-  if (
-    profile.mode !== "permissive" ||
-    decision.decision !== "human" ||
-    decision.needsClassification ||
-    decision.category === "sensitive" ||
-    // Git history, remote, cloud, publish and HTTP deletions are not provably recoverable, and the
-    // classifier is not independent; only local deletion inside a feature worktree is classified.
-    (decision.category === "destructive" && decision.reason !== WORKTREE_DELETION) ||
-    HUMAN_BOUNDARIES.some((pattern) => pattern.test(decision.reason))
-  )
-    return decision;
+function markAmbiguous(request: Request, decision: Decision, profile: Profile): Decision {
+  if (decision.decision !== "human") return decision;
+  const hard = hardRule(request, decision, profile.scratchRoots);
+  if (hard) return { ...decision, needsClassification: false, tier: undefined, hard };
+  if (NOT_CLASSIFIABLE.some((pattern) => pattern.test(decision.reason))) return decision;
   return { ...decision, needsClassification: true, tier: "ambiguous" };
 }
+/**
+ * Approves iff `recoverable && confidence >= 0.95 && category not in {sensitive, unknown}`.
+ * Anything else is a person's decision; the engine's reason is kept (session grants key on it)
+ * and the classifier's answer is shown beside it.
+ */
 function resolveAmbiguous(decision: Decision, ai: Classification): Decision {
-  // A `destructive` verdict approves only what the engine proved is a deletion inside a feature
-  // worktree; on anything else (an unparsable `rm -rf ~/{a,b}`) the label alone means a person.
-  const destructiveOk = ai.category !== "destructive" || decision.reason === WORKTREE_DELETION;
   const safe =
     ai.recoverable === true &&
     ai.confidence >= AMBIGUOUS_CONFIDENCE &&
-    destructiveOk &&
     !["sensitive", "unknown"].includes(ai.category);
-  const base = { ...decision, needsClassification: false, cache: "session" as const, ai };
+  const base = { ...decision, needsClassification: false, ai };
   if (safe)
     return {
       ...base,
       decision: "approve",
+      cache: "session",
       category: ai.category,
       classification: "approved",
-      reason: "Ambiguous request judged recoverable and non-sensitive by the same-session AI",
+      reason: "Judged recoverable and non-sensitive by the AI classifier",
     };
-  const why = ai.rationale ? ` Rationale: ${redactText(ai.rationale, 200)}` : "";
-  // Possible unrecoverable loss is a person's decision, not a deny the model works around.
-  if (decision.category === "destructive" || ai.category === "destructive")
-    return {
-      ...base,
-      decision: "human",
-      cache: "none",
-      classification: "denied",
-      reason: `Destructive request not judged recoverable by the classifier (confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"}); a person decides.${why}`,
-    };
+  const why = ai.rationale ? `: ${redactText(ai.rationale, 200)}` : "";
   return {
     ...base,
-    decision: "deny",
+    decision: "human",
+    cache: "none",
     classification: "denied",
-    reason: `Not run: the classifier did not approve this request (category ${ai.category}, confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"}).${why} Use a recoverable, non-sensitive alternative, or explain to the user what is needed.`,
+    classifierNote: `The AI classifier did not approve it (category ${ai.category}, confidence ${ai.confidence}, recoverable ${ai.recoverable ?? "not stated"})${why}`,
   };
 }
+export const CHAIN_APPROVED = "A read-only prefix followed by a command approved on its own";
+/** A word as a single-quoted shell word. */
+const quote = (word: string) =>
+  /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
+/**
+ * A chain (`a && b; c`) whose commands before the last only read (or `cd` into an existing
+ * directory), and whose last command the engine approves on its own in every directory the `cd`s
+ * could leave it in. Earlier commands change nothing the last one could see, so judging it alone
+ * is judging it in place. Rejected outright: substitutions, variables, assignments, globs,
+ * here-documents, background jobs, `CDPATH`, and pipes (unless every stage only reads). The last
+ * command still gets every check, hard human items included.
+ */
+function chainApproved(request: Request, profile: Profile): boolean {
+  const command = request.input.command ?? request.input.cmd;
+  if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string" || command.length > 20_000)
+    return false;
+  const pipelines = parseShell(command);
+  if (!pipelines || pipelines.length < 2 || pipelines.length > 24) return false;
+  const cwds = new Set([request.cwd]);
+  for (const [index, pipeline] of pipelines.entries()) {
+    const last = index === pipelines.length - 1;
+    for (const cmd of pipeline) {
+      if (cmd.env.length || cmd.subs.length || cmd.stdin !== undefined) return false;
+      if (cmd.loose?.some(Boolean) || unsafeGlob(cmd.argv, cmd.glob)) return false;
+    }
+    if (pipeline.length > 1 && !pipeline.every((cmd) => readOnly(cmd.argv))) return false;
+    const [cmd] = pipeline;
+    if (!cmd) return false;
+    if (cmd.argv[0] === "cd") {
+      const target = cmd.argv[1];
+      if (
+        last ||
+        pipeline.length > 1 ||
+        cmd.argv.length !== 2 ||
+        !target ||
+        target.startsWith("-") ||
+        cmd.redirects.length ||
+        (process.env.CDPATH && !/^[/~.]/.test(target))
+      )
+        return false;
+      // As the script's first command, a `cd` that cannot fail leaves only its target.
+      // After `||` the next command runs exactly when it fails, so `||` anywhere keeps the old one.
+      const sure = index === 0 && !command.includes("||") ? enterable(target) : undefined;
+      if (sure) {
+        cwds.clear();
+        cwds.add(sure);
+        continue;
+      }
+      const next = new Set<string>();
+      for (const dir of cwds) {
+        try {
+          const to = resolveWord(dir, target);
+          if (!existsSync(to)) return false;
+          next.add(to);
+        } catch {
+          return false;
+        }
+      }
+      // `cd x || y` may leave the old directory; keep every place the next command could run.
+      for (const dir of next) cwds.add(dir);
+      if (cwds.size > 4) return false;
+      continue;
+    }
+    if (!last) {
+      // Output may only go nowhere: a read-only command that writes a file is not read-only.
+      const quiet = cmd.redirects.every(
+        (r) => (r.op === ">&" && r.target === "1") || (r.op === ">" && r.target === "/dev/null"),
+      );
+      if (!quiet) return false;
+      // Only reads, and only of what a plain read may name (`readable`): the prefix's output
+      // reaches the agent too. Every stage gets the full plain-read check, file readers and
+      // filters (`jq`, `cut`, `wc`, `diff`, `sort`) alike.
+      for (const stage of pipeline) {
+        if (!readOnly(stage.argv)) return false;
+        const text = stage.argv.map(quote).join(" ");
+        for (const cwd of cwds)
+          if (!plainRead({ ...request, cwd, input: { command: text } }, profile.scratchRoots))
+            return false;
+      }
+      continue;
+    }
+    const text = pipeline
+      .map((stage) =>
+        [
+          ...stage.argv.map(quote),
+          ...stage.redirects.map(
+            (r) => `${r.fd}${r.op}${r.op === ">&" ? r.target : quote(r.target)}`,
+          ),
+        ].join(" "),
+      )
+      .join(" | ");
+    for (const cwd of cwds) {
+      const input = { ...request.input, command: text };
+      if ("workdir" in input) input.workdir = cwd;
+      if ("cwd" in input) input.cwd = cwd;
+      if (evaluate({ ...request, cwd, input }, undefined, profile).decision !== "approve")
+        return false;
+    }
+  }
+  return true;
+}
+/** Most words of a shell command the engine judges; here-document bodies do not count. */
+export const MAX_WORDS = 1_000;
+export const TOO_MANY_WORDS = "Command has too many words to check";
+/** Whether a script has more than MAX_WORDS words outside here-documents (one linear scan). */
+function tooManyWords(command: string): boolean {
+  let count = 0;
+  for (const segment of scan(command).segments)
+    for (const word of segment) if (!word.heredoc && ++count > MAX_WORDS) return true;
+  return false;
+}
+/** Hard items no step approves, the engine's included: the deterministic floor. */
+const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside", "policy-state"]);
+export const FLOOR_REASON =
+  "A cloud, repository, publishing or deletion command outside disposable roots needs a person";
+/**
+ * The decision for a request. The floor runs after the engine: a cloud or infrastructure write, a
+ * repository deletion, a publish or a recursive delete outside disposable roots is never approved,
+ * whatever rule approved it, and asks instead.
+ */
 export function evaluate(
   request: Request,
   ai?: Classification,
   profile: Profile = strictProfile,
 ): Decision {
-  const decision = markAmbiguous(evaluateCore(request, profile), profile);
+  return withEvidence(() => evaluateOnce(request, ai, profile));
+}
+
+function evaluateOnce(
+  request: Request,
+  ai: Classification | undefined,
+  profile: Profile,
+): Decision {
+  // A shell command with more words than the engine judges in time asks, before any judging.
+  const command = request.input?.command ?? request.input?.cmd;
+  if (SHELL_TOOLS.has(request.tool) && typeof command === "string" && tooManyWords(command))
+    return result(request, "unknown", TOO_MANY_WORDS);
+  const decision = evaluateSteps(request, ai, profile);
+  if (decision.decision !== "approve" || !SHELL_TOOLS.has(request.tool)) return decision;
+  const floor = hardRules(request, { ...decision, decision: "human" }, profile.scratchRoots).find(
+    // A profile with `cloudWrites: "allow"` chose to automate non-destructive cloud writes; the
+    // engine still asks for cloud deletion there.
+    (rule) => FLOOR.has(rule) && !(rule === "cloud-write" && profile.cloudWrites === "allow"),
+  );
+  return floor ? { ...result(request, "destructive", FLOOR_REASON), hard: floor } : decision;
+}
+
+function evaluateSteps(
+  request: Request,
+  ai?: Classification,
+  profile: Profile = strictProfile,
+): Decision {
+  const core = evaluateCore(request, profile);
+  // A plain read of non-secret files, protected configuration included, changes nothing.
+  if (
+    core.decision === "human" &&
+    !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
+    plainRead(request, profile.scratchRoots)
+  )
+    return result(request, "code-read", PLAIN_READ, true);
+  if (
+    core.decision === "human" &&
+    !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
+    chainApproved(request, profile)
+  )
+    return result(request, "worktree-write", CHAIN_APPROVED, true);
+  // What the harness lets run (its settings, hooks, permission rules) and the policy profile are
+  // never approved by any step, the engine's included: wherever they live (`CLAUDE_CONFIG_DIR` in
+  // a temp directory, say), a write to them asks.
+  if (core.decision === "approve" && WRITE_TOOLS.has(request.tool)) {
+    const tamper = hardRules(request, { ...core, decision: "human" }, profile.scratchRoots).find(
+      (rule) => rule === "harness-settings" || rule === "policy-profile" || rule === "policy-state",
+    );
+    if (tamper)
+      return {
+        ...result(request, "sensitive", "Harness settings and the policy profile require a person"),
+        hard: tamper,
+      };
+  }
+  const decision = markAmbiguous(request, core, profile);
+  // A hard human item is a person's: no classification, however confident, approves it.
+  if (decision.hard) return decision;
   if (ai) {
     // Self-reported confidence is not a probability or a substitute for verified effects.
     if (
@@ -356,7 +537,8 @@ function evaluateCore(request: Request, profile: Profile): Decision {
   const cwd = input.workdir ?? input.cwd ?? request.cwd;
   if (typeof cwd !== "string" || cwd !== request.cwd)
     return result(request, "unknown", "Execution directory differs from the reviewed directory");
-  const file = input.file_path ?? input.path;
+  // Only the target decides a file tool: `content`, `old_string` and `new_string` are data.
+  const file = input.file_path ?? input.notebook_path ?? input.path;
   if (request.tool === "apply_patch" && typeof input.command === "string") {
     const lines = input.command.split("\n");
     if (lines[0] !== "*** Begin Patch" || lines.at(-1)?.trim() !== "*** End Patch")
@@ -383,9 +565,10 @@ function evaluateCore(request: Request, profile: Profile): Decision {
     );
   }
   if (
-    ["Read", "view", "read_file", "Edit", "Write", "edit", "create", "write_file"].includes(
-      request.tool,
-    ) &&
+    [
+      ...["Read", "view", "read_file", "Edit", "Write", "edit", "create", "write_file"],
+      ...["MultiEdit", "NotebookEdit"],
+    ].includes(request.tool) &&
     typeof file === "string"
   ) {
     const write = !["Read", "view", "read_file"].includes(request.tool);
@@ -514,8 +697,18 @@ export function evaluateArgv(request: Request, argv: string[]): Decision {
       }
       return result(request, "worktree-write", "Cannot verify worktree creation targets");
     }
-    if (args[0] === "branch" && args.some((a) => a === "-d" || a === "-D" || a === "--delete"))
+    if (args[0] === "branch" && args.some((a) => a === "-d" || a === "-D" || a === "--delete")) {
+      const names = args.slice(1).filter((a) => !a.startsWith("-"));
+      const flags = args.slice(1).filter((a) => a.startsWith("-"));
+      // A branch whose tip is on a remote-tracking ref loses nothing when deleted.
+      if (
+        names.length &&
+        flags.every((f) => ["-d", "-D", "--delete", "-q", "--quiet"].includes(f)) &&
+        names.every((name) => onRemote(gitCwd, name))
+      )
+        return result(request, "git-read", "Deleted branches' tips are on a remote ref", true);
       return result(request, "destructive", branchEvidence(gitCwd, args.at(-1) ?? ""));
+    }
     if (args.length === 1 && ["status", "diff", "log"].includes(args[0] ?? ""))
       return result(request, "git-read", "Verified Git inspection command", true);
     if (args.join(" ") === "branch --show-current" || args.join(" ") === "rev-parse HEAD")

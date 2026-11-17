@@ -563,6 +563,6 @@ describe("session scope wording", () => {
     const file = s.review(shell("printf x >> AGENTS.md"), undefined, "PreToolUse");
     expect(file.sessionScopeLabel).toMatch(/^writes to .*AGENTS\.md$/);
     const dir = s.review(shell("printf x >> .agent-config/README.md"), undefined, "PreToolUse");
-    expect(dir.sessionScopeLabel).toMatch(/^writes under .*\.agent-config$/);
+    expect(dir.sessionScopeLabel).toMatch(/^writes to .*README\.md$/);
   });
 });

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { type ClassifierConfig, DEFAULT_CLASSIFIER, parseClassifierConfig } from "./classifier.js";
 import { canonical, git } from "./evidence.js";
 import { type CredentialHelper, HelperError, parseCredentialHelpers } from "./helpers.js";
 import { TOOL_NAME } from "./tools.js";
@@ -31,6 +32,8 @@ export interface Profile {
   toolsDeny: { claude: string[]; codex: string[]; copilot: string[] };
   /** Scripts that may read a credential for one narrow job, as committed on the default branch. */
   credentialHelpers: CredentialHelper[];
+  /** The AI classifier each harness runs for what the engine escalates: CLI models and a kill switch. */
+  classifier: ClassifierConfig;
   /** SHA-256 of the file the profile came from, for the audit log. */
   digest?: string;
 }
@@ -43,6 +46,7 @@ export const strictProfile: Profile = {
   mcpReadOnly: [],
   toolsDeny: { claude: [], codex: [], copilot: [] },
   credentialHelpers: [],
+  classifier: DEFAULT_CLASSIFIER,
 };
 
 export const MAX_MCP_READ_ONLY = 200;
@@ -84,9 +88,15 @@ function parseToolsDeny(raw: unknown): Profile["toolsDeny"] {
   return result;
 }
 
+let profilePathMemo: { key: string; path: string } | undefined;
+/** The default profile path (memoized on the variables it depends on: it is asked per word). */
 export function defaultProfilePath(): string {
+  const key = `${process.env.XDG_CONFIG_HOME}|${process.env.HOME}|${process.env.USERPROFILE}`;
+  if (profilePathMemo?.key === key) return profilePathMemo.path;
   const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(base, "agent-corpus", "policy-manager", "policy.json");
+  const path = join(base, "agent-corpus", "policy-manager", "policy.json");
+  profilePathMemo = { key, path };
+  return path;
 }
 
 export class ProfileError extends Error {}
@@ -132,6 +142,7 @@ export function parseProfile(text: string): Profile {
     "mcpReadOnly",
     "toolsDeny",
     "credentialHelpers",
+    "classifier",
     "description",
   ]);
   for (const key of Object.keys(value))
@@ -158,6 +169,12 @@ export function parseProfile(text: string): Profile {
       `mcpReadOnly must list at most ${MAX_MCP_READ_ONLY} names like mcp__server__tool, optionally ending in *`,
     );
   const toolsDeny = parseToolsDeny(value.toolsDeny);
+  let classifier: ClassifierConfig;
+  try {
+    classifier = parseClassifierConfig(value.classifier);
+  } catch (error) {
+    throw new ProfileError((error as Error).message);
+  }
   let credentialHelpers: CredentialHelper[];
   try {
     credentialHelpers = parseCredentialHelpers(value.credentialHelpers);
@@ -187,6 +204,7 @@ export function parseProfile(text: string): Profile {
     mcpReadOnly: [...new Set(mcp as string[])],
     toolsDeny,
     credentialHelpers: value.mode === "permissive" ? credentialHelpers : [],
+    classifier,
     digest: createHash("sha256").update(text).digest("hex"),
   };
 }
