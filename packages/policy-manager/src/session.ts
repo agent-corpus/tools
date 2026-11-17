@@ -137,6 +137,10 @@ export class PolicySession {
   private sessionGrants = new Set<string>();
   /** Requests the user turned down from their terminal, so a waiting hook stops waiting. */
   private refused = new Set<string>();
+  /** The harness process this session's hooks run under, as the hook reported it. */
+  harnessPid: number | undefined;
+  /** Requests a hook started waiting on: each wait is audited once at its start and its end. */
+  private waitStarted = new Set<string>();
   /** When a hook last polled for each request it is waiting on (`approvalState`). */
   private waiting = new Map<string, number>();
   /** Harness prompts waiting for their answer, by `tool_use_id` (or `request:<hash>`). */
@@ -241,15 +245,26 @@ export class PolicySession {
       ...result(request, decision.category, "Approved for this session by the user", true),
     };
   }
+  /** Records the harness process a hook found above it, for `approve`'s ancestry check. */
+  noteHarness(pid: number): void {
+    if (Number.isSafeInteger(pid) && pid > 1) this.harnessPid = pid;
+  }
   /** The newest request this session sent to a person that the user may still approve. */
   latestHumanDecision():
-    | { requestHash: string; at: number; harness: string; sessionId: string }
+    | { requestHash: string; at: number; harness: string; sessionId: string; harnessPid?: number }
     | undefined {
     let latest: { requestHash: string; at: number } | undefined;
     for (const [requestHash, entry] of this.humanDecisions)
       if (Date.now() - entry.at <= GRANT_WINDOW_MS && (!latest || entry.at >= latest.at))
         latest = { requestHash, at: entry.at };
-    return latest && { ...latest, harness: this.harness, sessionId: this.sessionId };
+    return (
+      latest && {
+        ...latest,
+        harness: this.harness,
+        sessionId: this.sessionId,
+        ...(this.harnessPid ? { harnessPid: this.harnessPid } : {}),
+      }
+    );
   }
   private addSessionGrant(reason: string, scope: string): string {
     if (this.sessionGrants.size >= 64) this.sessionGrants.clear();
@@ -268,7 +283,12 @@ export class PolicySession {
     requestHash: string,
     confirm: boolean,
     session = false,
-  ): GrantPreview & { granted: boolean; scope: "once" | "session"; waiting?: boolean } {
+  ): GrantPreview & {
+    granted: boolean;
+    scope: "once" | "session";
+    waiting?: boolean;
+    harnessPid?: number;
+  } {
     if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new GrantError("Not a request hash");
     const pending = this.humanDecisions.get(requestHash);
     if (!pending || Date.now() - pending.at > GRANT_WINDOW_MS) {
@@ -285,7 +305,13 @@ export class PolicySession {
         ? { sessionScope: scopeLabel(sessionScope, this.profile) }
         : {}),
     };
-    if (!confirm) return { ...preview, granted: false, scope };
+    if (!confirm)
+      return {
+        ...preview,
+        granted: false,
+        scope,
+        ...(this.harnessPid ? { harnessPid: this.harnessPid } : {}),
+      };
     this.humanDecisions.delete(requestHash);
     if (scope === "session" && sessionScope !== undefined)
       this.addSessionGrant(preview.reason, sessionScope);
@@ -343,6 +369,26 @@ export class PolicySession {
    */
   approvalState(requestHash: string): "granted" | "refused" | "pending" | "gone" {
     if (!/^[a-f0-9]{64}$/.test(requestHash)) return "gone";
+    const state = this.pollState(requestHash);
+    if (state !== "pending") this.endWait(requestHash, state);
+    return state;
+  }
+  /** Ends a wait: audited once, with its outcome. */
+  endWait(
+    requestHash: string,
+    outcome: "granted" | "refused" | "gone" | "timeout",
+  ): { ended: boolean } {
+    if (!this.waitStarted.delete(requestHash)) return { ended: false };
+    this.waiting.delete(requestHash);
+    audit(this.directory, { event: "approval-wait", requestHash, outcome });
+    return { ended: true };
+  }
+  private pollState(requestHash: string): "granted" | "refused" | "pending" | "gone" {
+    if (!this.waitStarted.has(requestHash)) {
+      if (this.waitStarted.size >= 64) this.waitStarted.clear();
+      this.waitStarted.add(requestHash);
+      audit(this.directory, { event: "approval-wait", requestHash, outcome: "started" });
+    }
     if (this.waiting.size >= 64 && !this.waiting.has(requestHash))
       this.waiting.delete(this.waiting.keys().next().value ?? "");
     this.waiting.set(requestHash, Date.now());

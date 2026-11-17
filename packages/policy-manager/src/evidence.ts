@@ -145,8 +145,21 @@ export function inside(root: string, path: string): boolean {
 }
 const CREDENTIAL_CONFIG_DIRS = /(?:^|[\\/])\.config[\\/](?:gh|gcloud|op|hub)(?:[\\/]|$)/i;
 
+/**
+ * A file in a policy service session directory (`acp-<uid>-*`) other than its audit logs: the
+ * session token authenticates grants, so it and everything beside it (socket, grants) is a secret.
+ */
+function stateSecret(path: string): boolean {
+  const parts = path.split(/[\\/]/);
+  const at = parts.findIndex((part) => /^acp-(?:\d+|user)-/i.test(part));
+  if (at < 0) return false;
+  const rest = parts.slice(at + 1).filter(Boolean);
+  return rest.length > 1 || (rest.length === 1 && !/^audit(?:\.\d+)?\.jsonl$/i.test(rest[0] ?? ""));
+}
+
 export function sensitive(path: string): boolean {
   return (
+    stateSecret(path) ||
     CREDENTIAL_CONFIG_DIRS.test(path) ||
     path
       .split(/[\\/]/)
@@ -179,7 +192,8 @@ export function protectedPath(path: string, featureWorktree = false): boolean {
 }
 /**
  * The top level of the linked worktree that contains `dir`, when it is on a feature branch: not
- * the main checkout, not detached, and not main, master or origin's default branch.
+ * the main checkout, not detached, and not main, master or origin's default branch. When the
+ * default branch is unknown (no `origin/HEAD`, and no main or master), it is not one.
  */
 export function featureCheckout(dir: string): string | undefined {
   try {
@@ -195,6 +209,24 @@ export function featureCheckout(dir: string): string | undefined {
       /* no remote default recorded */
     }
     if (fallback && fallback.replace(/^origin\//, "") === branch) return undefined;
+    // With no origin default recorded, the default branch is known only by its usual names: a
+    // repository with neither main nor master has an unknown default, and fails closed.
+    if (!fallback) {
+      const named = [
+        "refs/heads/main",
+        "refs/heads/master",
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+      ].some((ref) => {
+        try {
+          git(dir, ["rev-parse", "--verify", "--quiet", ref]);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (!named) return undefined;
+    }
     return root;
   } catch {
     return undefined;

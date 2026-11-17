@@ -670,3 +670,83 @@ export function codeTouchesState(code: string, cwds: Iterable<string>): boolean 
   }
   return false;
 }
+
+/** Audit logs: the only files in a session directory a read may name. */
+const AUDIT_FILE = /^audit(?:\.\d+)?\.jsonl$/i;
+let secrets: { from: string[]; at: number; targets: string[] } | undefined;
+/**
+ * Every file in a session directory except its audit logs, folded: the token, the socket, grants
+ * and anything else there, plus a sample name for files a later version may add.
+ */
+function secretTargets(): string[] {
+  const from = stateDirs();
+  if (secrets?.from === from && Date.now() - secrets.at < 2000) return secrets.targets;
+  const targets: string[] = [];
+  for (const dir of from) {
+    const names = new Set(["token", "service.sock", "grants.json", "x"]);
+    try {
+      for (const name of readdirSync(dir)) names.add(name);
+    } catch {
+      /* a sample or unreadable directory: the known names still count */
+    }
+    for (const name of names) if (!AUDIT_FILE.test(name)) targets.push(fold(`${dir}/${name}`));
+  }
+  secrets = { from, at: Date.now(), targets };
+  return targets;
+}
+
+/**
+ * Whether reading `text` (as the shell would expand it: a glob, a variable read as `*`) could read
+ * the policy service's secrets: any file in a session directory but its audit logs, above all the
+ * session token, which authenticates grants. With `whole` (a recursive reader, or a directory
+ * read as a tree) the session directory itself and the directories above it count too.
+ */
+export function namesStateSecret(text: string, cwds: Iterable<string>, whole: boolean): boolean {
+  if (!text) return false;
+  // Too long to match in time: only a word that could expand, or names the state, fails closed.
+  if (text.length > MAX_TARGET) return /acp|[*?[{]/i.test(text);
+  if (/^-[^=]*$|^\d+$/.test(text)) return false;
+  const list = [...cwds];
+  const memo = stateLists().names;
+  const key = `secret${whole ? 1 : 0}\0${text}\0${list.join("\0")}`;
+  const known = memo.get(key);
+  if (known !== undefined) return known;
+  const answer = namesStateSecretOnce(text, list, whole);
+  if (memo.size < 20_000) memo.set(key, answer);
+  return answer;
+}
+function namesStateSecretOnce(text: string, cwds: string[], whole: boolean): boolean {
+  const { dirs, above, dirSet, aboveSet } = stateLists();
+  const forms = new Set<string>();
+  for (const cwd of cwds) {
+    let path: string;
+    try {
+      path = slashes(resolveWord(cwd, text));
+    } catch {
+      continue;
+    }
+    forms.add(trim(path));
+    const real = realOf(path);
+    if (real !== undefined) forms.add(real);
+  }
+  for (const raw of forms) {
+    const form = fold(raw);
+    if (!hasGlob(form)) {
+      for (const dir of dirSet) {
+        if (form === dir) {
+          if (whole) return true;
+          continue;
+        }
+        if (!form.startsWith(`${dir}/`)) continue;
+        const rest = form.slice(dir.length + 1).split("/");
+        if (rest.length > 1 || !AUDIT_FILE.test(rest[0] ?? "")) return true;
+      }
+      if (whole && aboveSet.has(form)) return true;
+      continue;
+    }
+    if (secretTargets().some((target) => pathMatch(form, target, true))) return true;
+    if (whole && dirs.some((dir) => pathMatch(form, dir, false))) return true;
+    if (whole && above.some((dir) => pathMatch(form, dir, false))) return true;
+  }
+  return false;
+}

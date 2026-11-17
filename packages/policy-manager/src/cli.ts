@@ -5,6 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { executionReport, type HookContext, hookOutput, normalize } from "./adapters.js";
+import { harnessOf, insideAgent, processTable } from "./ancestry.js";
 import {
   type ApproveScope,
   approvedMessage,
@@ -64,6 +65,7 @@ class ApproveError extends Error {}
 type GrantResult = Partial<GrantPreview> & {
   granted: boolean;
   waiting?: boolean;
+  harnessPid?: number;
   scope?: "once" | "session";
   refused?: string;
 };
@@ -233,7 +235,7 @@ try {
     if (values.session && values.once) throw new ApproveError(usageText);
     let directory: string;
     let requestHash: string;
-    let session: { harness: string; sessionId: string };
+    let session: { harness: string; sessionId: string; harnessPid?: number };
     if (values.last) {
       if (positionals.length) throw new ApproveError(usageText);
       if (!process.stdin.isTTY || !process.stdout.isTTY)
@@ -273,6 +275,10 @@ try {
     // A session preview: its scope says whether the request can be approved for the session.
     const preview = await ask(false, "session");
     if (preview.refused) throw new ApproveError(preview.refused);
+    // A terminal below the agent harness (a PTY from the agent, `script`) is the agent's, not
+    // the user's: refuse before showing or granting anything.
+    const inside = insideAgent(session.harnessPid ?? preview.harnessPid);
+    if (inside) throw new ApproveError(inside);
     const grantable = preview.scope === "session";
     for (const line of describeRequest(preview, session)) console.log(line);
     let scope: ApproveScope | undefined = values.once
@@ -370,7 +376,8 @@ try {
         });
         console.log("{}");
       } else if (phase === "PreToolUse" || phase === "PermissionRequest") {
-        const started = Date.now();
+        // The wait is measured from this process's start, so service start-up counts too.
+        const started = Math.floor(performance.timeOrigin);
         const review = () =>
           send(harness, request.sessionId, {
             action: "review",
@@ -382,6 +389,17 @@ try {
               : {}),
           }) as Promise<Decision>;
         let decision = await review();
+        // Tell the service which process this session's harness is, so `approve` can refuse to
+        // run below it. Only for a decision a person must make: reading the process table costs.
+        if (decision.decision === "human") {
+          // Best effort and bounded: the hook's own timeout must still cover the review.
+          const table = processTable(3_000);
+          const harnessPid = table && harnessOf(process.pid, table);
+          if (harnessPid)
+            await send(harness, request.sessionId, { action: "harness", harnessPid }).catch(
+              () => undefined,
+            );
+        }
         let waited: HookContext["waited"];
         // Codex cannot ask: a request that needs a person waits here for the user's approval
         // from their own terminal, when setup gave this hook a wait and a matching timeout.
@@ -403,7 +421,15 @@ try {
             started + wait * 1000,
           );
           if (outcome === "granted") decision = await review();
-          else waited = { seconds: wait, outcome };
+          else {
+            waited = { seconds: wait, outcome };
+            if (outcome === "timeout")
+              await send(harness, request.sessionId, {
+                action: "await",
+                grant: { requestHash, confirm: false },
+                waitOutcome: "timeout",
+              }).catch(() => undefined);
+          }
         }
         const output = hookOutput(harness, phase, decision, {
           cliPath,

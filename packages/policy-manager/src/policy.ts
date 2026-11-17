@@ -10,7 +10,7 @@ import {
   resolveWord,
   withEvidence,
 } from "./evidence.js";
-import { hardRule, hardRules } from "./hard.js";
+import { hardRule, hardRules, readsPolicySecret } from "./hard.js";
 
 /** Tools that write a file (a shell command is judged by the engine itself). */
 const WRITE_TOOLS = new Set([
@@ -419,7 +419,19 @@ function evaluateOnce(
     // engine still asks for cloud deletion there.
     (rule) => FLOOR.has(rule) && !(rule === "cloud-write" && profile.cloudWrites === "allow"),
   );
-  return floor ? { ...result(request, "destructive", FLOOR_REASON), hard: floor } : decision;
+  if (floor) return { ...result(request, "destructive", FLOOR_REASON), hard: floor };
+  // The session token authenticates grants: reading it, or anything beside it but the audit logs,
+  // is a credential read no step approves.
+  if (readsPolicySecret(request, profile.scratchRoots))
+    return {
+      ...result(
+        request,
+        "sensitive",
+        "Reading the policy service's session credentials requires a person",
+      ),
+      hard: "credential-read",
+    };
+  return decision;
 }
 
 function evaluateSteps(

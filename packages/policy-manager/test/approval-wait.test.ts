@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,15 +179,77 @@ describe("a Codex hook waits for the user's approval", () => {
     expect(s.approvalState(b.requestHash)).toBe("refused");
   });
 
-  test("a failed poll is not an answer", async () => {
+  test("a failed poll is never an answer; one blip waits on", async () => {
+    let polls = 0;
     const outcome = await waitForApproval(
       async () => {
-        throw new Error("service gone");
+        if (++polls === 1) throw new Error("timeout");
+        return "pending";
       },
-      Date.now() + 20,
+      Date.now() + 30,
       5,
     );
     expect(outcome).toBe("timeout");
+  });
+
+  test.each(["ECONNREFUSED", "ENOENT"])(
+    "a service that is not there (%s) ends the wait at once",
+    async (code) => {
+      const started = Date.now();
+      const outcome = await waitForApproval(
+        async () => {
+          throw Object.assign(new Error("connect"), { code });
+        },
+        Date.now() + 60_000,
+        5,
+      );
+      expect(outcome).toBe("unreachable");
+      expect(Date.now() - started).toBeLessThan(1000);
+    },
+  );
+
+  test("three failed polls in a row end the wait", async () => {
+    const outcome = await waitForApproval(
+      async () => {
+        throw new Error("Policy service timeout");
+      },
+      Date.now() + 60_000,
+      1,
+    );
+    expect(outcome).toBe("unreachable");
+  });
+
+  test("an unreachable service is denied with a reason that says so", async () => {
+    const s = session();
+    const asked = await s.decide(shell(PROTECTED), "PreToolUse");
+    const reason = (
+      hookResponse("codex", "PreToolUse", asked, {
+        cliPath: "/opt/pm/dist/cli.js",
+        sessionId: "s1",
+        waited: { seconds: 600, outcome: "unreachable" },
+      }).hookSpecificOutput as { permissionDecisionReason: string }
+    ).permissionDecisionReason;
+    expect(reason.split("\n")[0]).toContain("The policy service stopped answering");
+    expect(reason).not.toContain("No approval came");
+  });
+
+  test("a wait is audited once at its start and once at its end, not per poll", async () => {
+    const s = session();
+    const asked = await s.decide(shell(PROTECTED), "PreToolUse");
+    for (let i = 0; i < 5; i++) expect(s.approvalState(asked.requestHash)).toBe("pending");
+    s.grant(asked.requestHash, true);
+    expect(s.approvalState(asked.requestHash)).toBe("granted");
+    const lines = readFileSync(join(s.directory, "audit.jsonl"), "utf8")
+      .split("\n")
+      .filter((line) => line.includes("approval-wait"));
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('"outcome":"started"');
+    expect(lines[1]).toContain('"outcome":"granted"');
+    // A timeout is ended by the hook.
+    const other = await s.decide(shell("printf q >> .github/OTHER"), "PreToolUse");
+    s.approvalState(other.requestHash);
+    expect(s.endWait(other.requestHash, "timeout")).toEqual({ ended: true });
+    expect(s.endWait(other.requestHash, "timeout")).toEqual({ ended: false });
   });
 
   test("a grant result says whether a hook is waiting for it", async () => {
@@ -368,6 +430,10 @@ describe("the real Codex PreToolUse hook waits for the user", () => {
       const { code, stdout } = await running;
       expect(code).toBe(0);
       expect(stdout).toBe("");
+      // Polls are not audited one by one: one line at the start of the wait, one at its end.
+      const audit = readFileSync(join(directory, "audit.jsonl"), "utf8");
+      expect(audit).not.toContain('"action":"await"');
+      expect(audit.match(/"eventName":"approval-wait"/g)).toHaveLength(2);
     } finally {
       stop(id);
     }

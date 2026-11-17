@@ -19,6 +19,7 @@ interface Message {
     | "grant"
     | "refuse"
     | "await"
+    | "harness"
     | "pending"
     | "stop";
   request?: Request;
@@ -28,6 +29,10 @@ interface Message {
   grant?: { requestHash: string; confirm: boolean; session?: boolean };
   /** Claude Code's `permission_mode` for a PreToolUse: whether an ask reaches a person. */
   permissionMode?: string;
+  /** A waiting hook's own end of the wait (`await`): no approval came in time. */
+  waitOutcome?: "timeout";
+  /** The harness process above the hook (`harness`), for approve's ancestry check. */
+  harnessPid?: number;
   /** Claude Code's `tool_use_id` for a PreToolUse or PostToolUse. */
   toolUseId?: string;
   /** A PostToolUseFailure's error text and interrupt flag, to tell a rejected prompt from a run. */
@@ -38,22 +43,31 @@ export const REVIEW_TIMEOUT_MS = 40_000;
 /** How often a hook waiting for the user's approval asks the service whether it came. */
 export const APPROVAL_POLL_MS = 1_000;
 export type ApprovalState = "granted" | "refused" | "pending" | "gone";
+/** Consecutive failed polls (other than a refused connection) after which the service is gone. */
+const POLL_FAILURES = 3;
 /**
  * Waits until `deadline` (epoch ms) for the user's answer to a request that needs a person,
  * asking `poll` every `intervalMs`. Returns `granted`, `refused`, `gone` (it can no longer be
- * approved) or `timeout`. A failed poll is not an answer: it waits on, and fails closed at the end.
+ * approved), `unreachable` (the service is not there: a refused connection or a missing socket at
+ * once, any other failure after POLL_FAILURES in a row) or `timeout`. A failed poll is never an
+ * answer.
  */
 export async function waitForApproval(
   poll: () => Promise<unknown>,
   deadline: number,
   intervalMs = APPROVAL_POLL_MS,
   sleep: (ms: number) => Promise<void> = (ms) => new Promise((done) => setTimeout(done, ms)),
-): Promise<Exclude<ApprovalState, "pending"> | "timeout"> {
+): Promise<Exclude<ApprovalState, "pending"> | "timeout" | "unreachable"> {
+  let failures = 0;
   while (Date.now() < deadline) {
     let state: unknown;
     try {
       state = await poll();
-    } catch {
+      failures = 0;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ECONNREFUSED" || code === "ENOENT" || ++failures >= POLL_FAILURES)
+        return "unreachable";
       state = "pending";
     }
     if (state === "granted" || state === "refused" || state === "gone") return state;
@@ -95,32 +109,35 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
       try {
         const message = JSON.parse(data.slice(0, end)) as Message;
         if (message.token !== token) throw new Error("Unauthenticated request");
-        audit(directory, {
-          event: "request-envelope",
-          payloadHash: hash(data.slice(0, end)),
-          ...(message.request
-            ? { requestHash: requestHash(message.request) }
-            : message.classification
-              ? { requestHash: message.classification.requestHash }
-              : message.report
-                ? { requestHash: message.report.requestHash }
-                : message.grant
-                  ? { requestHash: String(message.grant.requestHash) }
-                  : {}),
-          action: [
-            "ping",
-            "review",
-            "classify",
-            "record",
-            "grant",
-            "refuse",
-            "await",
-            "pending",
-            "stop",
-          ].includes(message.action)
-            ? message.action
-            : "invalid",
-        });
+        // A waiting hook polls every second: the session audits the start and end of the wait.
+        if (message.action !== "await")
+          audit(directory, {
+            event: "request-envelope",
+            payloadHash: hash(data.slice(0, end)),
+            ...(message.request
+              ? { requestHash: requestHash(message.request) }
+              : message.classification
+                ? { requestHash: message.classification.requestHash }
+                : message.report
+                  ? { requestHash: message.report.requestHash }
+                  : message.grant
+                    ? { requestHash: String(message.grant.requestHash) }
+                    : {}),
+            action: [
+              "ping",
+              "review",
+              "classify",
+              "record",
+              "grant",
+              "refuse",
+              "await",
+              "harness",
+              "pending",
+              "stop",
+            ].includes(message.action)
+              ? message.action
+              : "invalid",
+          });
         idle.refresh();
         // A review can wait for the classifier; the connection stays open until it answers.
         socket.setTimeout(REVIEW_TIMEOUT_MS + 5000);
@@ -157,8 +174,14 @@ export async function serve(harness: string, sessionId: string, cliPath?: string
                 })
               : undefined;
           result = { recorded: true, ...(answer ? { answer } : {}) };
+        } else if (message.action === "harness" && typeof message.harnessPid === "number") {
+          session.noteHarness(message.harnessPid);
+          result = { noted: true };
         } else if (message.action === "await" && message.grant)
-          result = session.approvalState(String(message.grant.requestHash));
+          result =
+            message.waitOutcome === "timeout"
+              ? session.endWait(String(message.grant.requestHash), "timeout")
+              : session.approvalState(String(message.grant.requestHash));
         else if (message.action === "refuse" && message.grant) {
           try {
             result = session.refuse(String(message.grant.requestHash));
@@ -242,6 +265,7 @@ export async function latestHumanDecision(): Promise<
       at: number;
       harness: string;
       sessionId: string;
+      harnessPid?: number;
     }
   | undefined
 > {
@@ -254,6 +278,7 @@ export async function latestHumanDecision(): Promise<
         at: number;
         harness: string;
         sessionId: string;
+        harnessPid?: number;
       }
     | undefined;
   for (const name of readdirSync(root)) {
@@ -273,6 +298,7 @@ export async function latestHumanDecision(): Promise<
         at?: unknown;
         harness?: unknown;
         sessionId?: unknown;
+        harnessPid?: unknown;
       } | null;
       if (
         found &&
@@ -289,6 +315,7 @@ export async function latestHumanDecision(): Promise<
           at: found.at,
           harness: found.harness,
           sessionId: found.sessionId,
+          ...(typeof found.harnessPid === "number" ? { harnessPid: found.harnessPid } : {}),
         };
     } catch {
       /* A stopped or unreachable service has nothing to approve. */

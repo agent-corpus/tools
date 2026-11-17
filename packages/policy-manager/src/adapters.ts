@@ -26,7 +26,7 @@ export interface HookContext {
    * (the wait ran out) or `gone` (the request can no longer be approved); `refused` when the
    * user turned it down from their terminal.
    */
-  waited?: { seconds: number; outcome: "timeout" | "gone" | "refused" };
+  waited?: { seconds: number; outcome: "timeout" | "gone" | "refused" | "unreachable" };
 }
 /**
  * The exact command the model is told to run to record a classification. A here-string, not a
@@ -101,14 +101,26 @@ export function looksLikeClassifyRecord(command: string): boolean {
 }
 /**
  * A command that runs, or names, a policy-manager `approve`, anywhere in the script and at any
- * nesting (`sh -c '...'`, a here-document). Unlike a classification record, the agent never runs
- * this: only the user approves, from their own terminal.
+ * nesting (`sh -c '...'`, `script -q /dev/null ...`, `env`, `xargs`, a here-document). Unlike a
+ * classification record, the agent never runs this: only the user approves, from their own
+ * terminal. Any token that names the CLI (`pm`, `pm.cmd`, a path ending in `/pm` such as the
+ * managed launcher, a `cli.js`, `policy-manager`, `@agent-corpus/policy-manager[@version]` for
+ * npx or `npm exec`) together with the word `approve` anywhere counts. Quotes and backslashes are
+ * dropped first (a backslash is also read as a path separator), so `"pm" app''rove`, `p\m approve`
+ * and `C:\\bin\\pm.cmd approve` count too. It is lexical: a command
+ * that builds the name at run time (`$(printf p)m`) is an expansion the engine asks about anyway.
  */
-const APPROVE_PROGRAM = /^(?:.*cli\.js|(?:@agent-corpus\/)?policy-manager(?:@.*)?)$/;
+const APPROVE_PROGRAM =
+  /^(?:.*cli\.js|(?:.*\/)?(?:@agent-corpus\/)?policy-manager(?:@.*)?|(?:.*[\\/])?pm(?:\.cmd|\.exe|\.bat|\.ps1)?)$/i;
+const SEPARATORS = /[\s`;&|()<>{}=]+/;
 // A token scan rather than one regular expression over the command, so its cost stays linear.
 export function looksLikeApproveGrant(command: string): boolean {
-  const tokens = command.split(/[\s"'`;&|()]+/);
-  return tokens.some((token, i) => tokens[i + 1] === "approve" && APPROVE_PROGRAM.test(token));
+  const unquoted = command.replace(/["']/g, "");
+  const tokens = [
+    ...unquoted.replace(/\\/g, "").split(SEPARATORS),
+    ...unquoted.replace(/\\/g, "/").split(SEPARATORS),
+  ];
+  return tokens.includes("approve") && tokens.some((token) => APPROVE_PROGRAM.test(token));
 }
 /** The command the user runs in their own terminal to approve a human decision. */
 export function approveCommand(
@@ -146,9 +158,13 @@ export function approveInstruction(decision: Decision, context?: HookContext): s
       "Agent: do not retry it unchanged. Stop and ask the user how to proceed.",
       `Request ${decision.requestHash}.`,
     ].join("\n");
-  const waited = context?.waited
-    ? ` No approval came within ${formatWait(context.waited.seconds)}.`
-    : "";
+  const waited = !context?.waited
+    ? ""
+    : context.waited.outcome === "unreachable"
+      ? " The policy service stopped answering while the hook waited, so nothing could be approved."
+      : context.waited.outcome === "gone"
+        ? " The policy service restarted or the approval window closed while the hook waited."
+        : ` No approval came within ${formatWait(context.waited.seconds)}.`;
   return [
     `⏸ Waiting for your approval. Not run: ${decision.reason}.${waited}`,
     ...(askWhy(decision) ? [`${askWhy(decision)}.`] : []),
