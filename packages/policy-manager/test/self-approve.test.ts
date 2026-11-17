@@ -164,7 +164,7 @@ describe("a CLI name assembled from pieces", () => {
     "p=p; $p'm' approve --last",
     "p=p; q=m; ( script -q /dev/null $p$q approve --last --once & ); sleep 3",
     'p=p; q=m; "$p$q" record codex s1',
-    "c=$(printf pm); $c stop codex s1",
+    "c=$(printf pm); $c approve --last",
   ])("is hard self-approve in both profiles: %s", async (command) => {
     for (const profile of [permissive, strictProfile]) {
       const s = session(profile);
@@ -186,6 +186,19 @@ describe("a CLI name assembled from pieces", () => {
     for (const profile of [permissive, strictProfile])
       expect(evaluate(shell(command), undefined, profile).decision).toBe("human");
   });
+
+  test.each(["$GIT config user.email", '"$DOCKER" stop web', "$KUBECTL config view"])(
+    "a computed program with a common subcommand is reviewed, not self-approve: %s",
+    async (command) => {
+      for (const profile of [permissive, strictProfile]) {
+        expect(evaluate(shell(command), undefined, profile).decision).toBe("human");
+        const s = session(profile);
+        const d = await s.decide(shell(command), "PreToolUse");
+        expect(d.reason).not.toBe(APPROVE_GUARD);
+        expect(d.hard).not.toBe("self-approve");
+      }
+    },
+  );
 
   test("it goes to the classifier, not straight to a person", async () => {
     const directory = join(root, `c${counter++}`);

@@ -32,9 +32,12 @@ const SHELL_OR_INTERPRETER =
 /** Something an argument expands at run time: a variable, a substitution, a glob or a brace. */
 const EXPANDS = /[$`*?[\]{}]/;
 const MAX_DEPTH = 6;
-/** The CLI's subcommands that write, grant or run: after a computed program word, the CLI. */
-const CLI_SUBCOMMAND =
-  /^(?:approve|record|classify|stop|serve|hook|review|config|replay|setup-hook(?:-\w+)?|setup\w*|profile)$/;
+/**
+ * The CLI's subcommands that grant or record a decision, and no common program uses: after a
+ * computed program word, they are the CLI. Other words (`$GIT config`, `"$DOCKER" stop`) fall to
+ * the computed-program rule, which sends the command to the classifier, then a person.
+ */
+const CLI_SUBCOMMAND = /^(?:approve|record|classify)$/;
 /** Whether `words` start with a computed program followed by a CLI subcommand (`$p$q approve`). */
 const computedCli = (words: Word[]) =>
   !!words[0] && !words[0].literal && !!words[1]?.literal && CLI_SUBCOMMAND.test(words[1].text);
