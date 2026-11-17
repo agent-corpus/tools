@@ -339,35 +339,51 @@ export interface ProtectedWrite {
   /** Named by `mkdir`: a directory, not a file. */
   directory: boolean;
 }
-let protectedWrites: ProtectedWrite[] | undefined;
+let noting: { writes: ProtectedWrite[]; links: boolean } | undefined;
 export const NOTED_WRITE = "Protected write noted for a session approval";
 
 /**
  * Runs `run` while each write target refused only because it names a protected path (not a
  * credential path) is noted and allowed, so the rest of the request is judged as if a person had
  * approved those writes. Session grants use it to read what a protected-path request writes.
+ * `links` reports a command that can create or replace a symlink anywhere in a script: the
+ * noted paths are read before the script runs, so they no longer say where its writes land.
  */
-export function noteProtectedWrites<T>(run: () => T): { value: T; writes: ProtectedWrite[] } {
-  const previous = protectedWrites;
-  const writes: ProtectedWrite[] = [];
-  protectedWrites = writes;
+export function noteProtectedWrites<T>(run: () => T): {
+  value: T;
+  writes: ProtectedWrite[];
+  links: boolean;
+} {
+  const previous = noting;
+  const state = { writes: [] as ProtectedWrite[], links: false };
+  noting = state;
   try {
-    return { value: run(), writes };
+    const value = run();
+    return { value, writes: state.writes, links: state.links };
   } finally {
-    protectedWrites = previous;
+    noting = previous;
   }
 }
 
-/** While noting, records a protected, non-credential write target and reports it as allowed. */
+/** While noting, records that a command in the script can create or replace a symlink. */
+export function noteLinkRisk(): void {
+  if (noting) noting.links = true;
+}
+
+/**
+ * While noting, records a protected, non-credential write target and reports it as allowed. It
+ * returns before the linked-worktree check on purpose: a person's yes for a protected file covers
+ * it in whichever checkout it is, the main one included, as it always has for a Write.
+ */
 export function notedProtectedWrite(
   word: string,
   lexical: string,
   path: string,
   directory = false,
 ): boolean {
-  if (!protectedWrites || sensitive(lexical) || sensitive(path)) return false;
+  if (!noting || sensitive(lexical) || sensitive(path)) return false;
   if (!isProtectedPath(path) && !isProtectedPath(lexical)) return false;
-  protectedWrites.push({ word, lexical, path, directory });
+  noting.writes.push({ word, lexical, path, directory });
   return true;
 }
 

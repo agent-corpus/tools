@@ -290,6 +290,23 @@ describe("a remembered yes for a protected write in a compound command", () => {
     ],
     ["writes harness settings", `${second(".agent-config")} && echo x >> .claude/settings.json`],
     ["writes the file of another checkout", second("OTHER/.agent-config")],
+    // The scope's paths are read before the script runs; a link it plants sends the write away.
+    [
+      "links the file elsewhere first",
+      "ln -sf ~/.zshrc .agent-config/test.md && echo evil >> .agent-config/test.md",
+    ],
+    ["only replaces the file with a link", "ln -sf ~/.zshrc .agent-config/test.md"],
+    [
+      "copies a link over it first",
+      "cp -s ~/.zshrc .agent-config/test.md && echo evil >> .agent-config/test.md",
+    ],
+    [
+      "moves another file over it first",
+      "mv ~/policy-manager-test-link .agent-config/test.md && echo evil >> .agent-config/test.md",
+    ],
+    ["unpacks an archive after the write", `${second(".agent-config")} && tar xf a.tar`],
+    ["runs an unknown program after the write", `${second(".agent-config")} && ./build.sh`],
+    ["creates a directory at the file's path", "mkdir -p .agent-config/test.md"],
   ])("still asks when the command %s", async (_, command) => {
     const s = await approvedFirst(".agent-config");
     expect((await s.decide(bash(real(command)), "PreToolUse")).decision).toBe("human");
@@ -306,11 +323,47 @@ describe("a remembered yes for a protected write in a compound command", () => {
       `${first(".agent-config")} && echo x >> ~/policy-manager-test-out.txt`,
     ],
     ["a credential path", `${first(".agent-config")} && cat ~/.ssh/id_rsa`],
+    ["a symlink planted first", `ln -sf ~/.zshrc .agent-config/l.md && ${second(".agent-config")}`],
+    ["a symlink planted after", `${first(".agent-config")} && ln -sf ~/.zshrc .agent-config/l.md`],
   ])("a command with %s is approved once only", (_, command) => {
     const { s } = session();
     const asked = s.review(shell(real(command)), undefined, "PreToolUse");
     expect(asked.decision).toBe("human");
     expect(asked.sessionGrantable).toBe(false);
+  });
+
+  test("a directory a script creates is named as one in the scope", () => {
+    const { s } = session();
+    const asked = s.review(shell("mkdir -p .agent-config/dirs/a"), undefined, "PreToolUse");
+    expect(asked.sessionGrantable).toBe(true);
+    expect(asked.sessionScopeLabel).toMatch(/^writes to directory .*a$/);
+  });
+});
+
+describe("a write after a command that can plant a symlink is not approved by its path", () => {
+  // `ln -s` may point any later path in the script at a file outside the worktree.
+  test.each([
+    "ln -sf ~/.zshrc x.md && echo evil >> x.md",
+    "echo evil >> x.md | ln -sf ~/.zshrc x.md",
+    "ln -s ~/policy-manager-test-out.txt out.txt && cat > out.txt < README.md",
+    "ln -s ~/policy-manager-test-out.txt out.txt && cp README.md out.txt",
+    "ln -s ~/policy-manager-test-out.txt out.txt && echo x | tee out.txt",
+    "ln -s ~/policy-manager-test-out.txt out.txt && sed -i s/a/b/ out.txt",
+    "ln -s ~/policy-manager-test-out.txt out.txt && truncate -s 0 out.txt",
+    "mv a.txt out.txt && echo evil >> out.txt",
+  ])("%s", (command) => {
+    const { s } = session();
+    expect(s.review(shell(command), undefined, "PreToolUse").decision).not.toBe("approve");
+  });
+
+  test("the same writes before any such command are still approved", () => {
+    const { s } = session();
+    for (const command of [
+      "echo ok >> x.md && cat x.md",
+      "mkdir -p notes && echo ok > notes/a.md && truncate -s 0 notes/a.md",
+      "cp README.md out.txt && sed -i s/a/b/ out.txt",
+    ])
+      expect(s.review(shell(command), undefined, "PreToolUse").decision, command).toBe("approve");
   });
 });
 

@@ -1,7 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, posix, resolve } from "node:path";
-import { canonical, type Fill, resolveWord, UNKNOWN_CWD } from "./evidence.js";
+import { canonical, type Fill, noteLinkRisk, resolveWord, UNKNOWN_CWD } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -776,9 +776,10 @@ function runSimple(
           return human(
             request,
             "unknown",
-            "A command that can create symlinks may run before an approved temp path",
+            "A command that can create symlinks may run before an approved write",
           );
         ctx.box.script.tainted = true;
+        noteLinkRisk();
       }
       for (const dir of createdDirectories(unwrap(command.argv).argv)) {
         if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;

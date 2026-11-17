@@ -36,13 +36,17 @@ function protectedRoot(path: string): string | undefined {
 
 /** A word whose text the shell could change: a variable, substitution, glob or brace. */
 const UNREADABLE = /[*?[\]{}$`]/;
+/** Marks a directory in a protected scope; an absolute path never starts with it. */
+const DIRECTORY = "dir:";
 
 /**
  * The exact protected files a request writes, read by the engine itself: it judges the request
  * with each write it would refuse only for a protected (not credential) name noted and allowed.
  * Undefined unless the engine then approves everything else in the request (reads, `mkdir -p`,
  * echo and printf, floor checks included), every noted target is a literal word, outside policy
- * state, under a protected root of one checkout, and no hard rule but "protected" applies.
+ * state, under a protected root of one checkout, and no hard rule but "protected" applies. Nothing
+ * in the script may create or replace a symlink (`ln`, `mv`, `cp -s`, `tar`, an unknown
+ * program): the paths are read before it runs, and a link would send the write elsewhere.
  */
 function protectedScope(
   request: Request,
@@ -51,8 +55,8 @@ function protectedScope(
 ): string | undefined {
   if (hardRules(request, decision, profile.scratchRoots).some((rule) => rule !== "protected"))
     return undefined;
-  const { value, writes } = noteProtectedWrites(() => evaluate(request, undefined, profile));
-  if (value.decision !== "approve" || !writes.length) return undefined;
+  const { value, writes, links } = noteProtectedWrites(() => evaluate(request, undefined, profile));
+  if (value.decision !== "approve" || links || !writes.length) return undefined;
   const files = new Set<string>();
   const directories = new Set<string>();
   let top: string | undefined;
@@ -65,11 +69,13 @@ function protectedScope(
     top = checkout;
     (write.directory ? directories : files).add(write.path);
   }
-  // `mkdir -p` of a written file's own parent directories is part of writing that file.
+  // `mkdir -p` of a written file's own parent directories is part of writing that file. Any other
+  // directory is named as one, so it never matches a write of a file at the same path.
+  const entries = [...files];
   for (const directory of directories)
     if (![...files].some((file) => file !== directory && inside(directory, file)))
-      files.add(directory);
-  return `protected:${[...files].sort().join("\u0000")}`;
+      entries.push(`${DIRECTORY}${directory}`);
+  return `protected:${entries.sort().join("\u0000")}`;
 }
 
 /** A simple command (one program, no operators, expansions or redirects) as words. */
@@ -144,7 +150,13 @@ export function grantScope(
 /** What a session scope covers, in words the user can check before approving it. */
 export function scopeLabel(scope: string, _profile: Profile): string {
   if (scope.startsWith("protected:"))
-    return `writes to ${scope.slice("protected:".length).split("\u0000").join(", ")}`;
+    return `writes to ${scope
+      .slice("protected:".length)
+      .split("\u0000")
+      .map((entry) =>
+        entry.startsWith(DIRECTORY) ? `directory ${entry.slice(DIRECTORY.length)}` : entry,
+      )
+      .join(", ")}`;
   const rest = scope.slice(scope.indexOf(":[") + 1);
   const end = rest.lastIndexOf("]:");
   const argv = JSON.parse(rest.slice(0, end + 1)) as string[];
