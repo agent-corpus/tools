@@ -18,6 +18,7 @@ let root: string,
   repo: string,
   feature: string,
   counter = 0;
+const slash = (path: string) => path.replace(/\\/g, "/");
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
 
@@ -161,7 +162,10 @@ describe("the policy service's files are a credential read, except the audit log
     writeFileSync(join(dir, "audit.jsonl"), "{}\n");
   });
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
-  const temp = () => tmpdir();
+  // Shell commands name paths with forward slashes, as a Windows shell (Git Bash) needs them.
+  const slashed = (path: string) => path.replace(/\\/g, "/");
+  const temp = () => slashed(tmpdir());
+  const sdir = () => slashed(dir);
   const read = (file: string): Request => ({
     sessionId: "s1",
     harness: "codex",
@@ -173,15 +177,15 @@ describe("the policy service's files are a credential read, except the audit log
     () => read(join(dir, "token")),
     () => read(join(dir, "service.sock")),
     () => read(join(dir, "grants.json")),
-    () => shell(`cat ${dir}/token`),
+    () => shell(`cat ${sdir()}/token`),
     () => shell("cat $TMPDIR/acp-*/token"),
     () => shell(`head ${temp()}/acp-*/t*`),
-    () => shell(`cat ${dir}/*`),
-    () => shell(`cat < ${dir}/token`),
+    () => shell(`cat ${sdir()}/*`),
+    () => shell(`cat < ${sdir()}/token`),
     () => shell(`grep -r x ${temp()}`),
-    () => shell(`rg secret ${dir}`),
-    () => shell(`cp -r ${dir} /tmp/copy`),
-    () => shell(`tail -f ${dir}/grants.json`),
+    () => shell(`rg secret ${sdir()}`),
+    () => shell(`cp -r ${sdir()} /tmp/copy`),
+    () => shell(`tail -f ${sdir()}/grants.json`),
   ])("%#: never approved, a hard credential read", async (make) => {
     const request = make();
     for (const profile of [permissive, strictProfile]) {
@@ -199,8 +203,8 @@ describe("the policy service's files are a credential read, except the audit log
   });
   test.each([
     () => read(join(dir, "audit.jsonl")),
-    () => shell(`tail -5 ${dir}/audit.jsonl`),
-    () => shell(`ls ${dir}`),
+    () => shell(`tail -5 ${sdir()}/audit.jsonl`),
+    () => shell(`ls ${sdir()}`),
     () => shell(`ls -la ${temp()}`),
   ])("%#: audit logs and listings stay approved", (make) => {
     for (const profile of [permissive, strictProfile])
@@ -210,10 +214,10 @@ describe("the policy service's files are a credential read, except the audit log
 
 describe("restoring a protected file in the main checkout is a protected write", () => {
   test.each([
-    () => `git -C ${repo} checkout -- AGENTS.md`,
-    () => `git -C ${repo} restore AGENTS.md`,
-    () => `git -C ${repo} checkout HEAD -- AGENTS.md`,
-    () => `git -C ${repo} restore --source HEAD --worktree -- AGENTS.md`,
+    () => `git -C ${slash(repo)} checkout -- AGENTS.md`,
+    () => `git -C ${slash(repo)} restore AGENTS.md`,
+    () => `git -C ${slash(repo)} checkout HEAD -- AGENTS.md`,
+    () => `git -C ${slash(repo)} restore --source HEAD --worktree -- AGENTS.md`,
   ])("%#: hard, never classified", async (make) => {
     const s = session();
     const d = await s.decide(shell(make()), "PreToolUse");

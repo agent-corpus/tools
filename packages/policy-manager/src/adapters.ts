@@ -110,8 +110,15 @@ export function looksLikeClassifyRecord(command: string): boolean {
  * and `C:\\bin\\pm.cmd approve` count too. It is lexical: a command
  * that builds the name at run time (`$(printf p)m`) is an expansion the engine asks about anyway.
  */
-const APPROVE_PROGRAM =
-  /^(?:.*cli\.js|(?:.*\/)?(?:@agent-corpus\/)?policy-manager(?:@.*)?|(?:.*[\\/])?pm(?:\.cmd|\.exe|\.bat|\.ps1)?)$/i;
+/** Whether a token names the CLI: by its last path segment, so matching stays linear. */
+function approveProgram(token: string): boolean {
+  const name = token.slice(token.lastIndexOf("/") + 1);
+  return (
+    name.toLowerCase().endsWith("cli.js") ||
+    /^policy-manager(?:@|$)/i.test(name) ||
+    /^pm(?:\.cmd|\.exe|\.bat|\.ps1)?$/i.test(name)
+  );
+}
 const SEPARATORS = /[\s`;&|()<>{}=]+/;
 // A token scan rather than one regular expression over the command, so its cost stays linear.
 export function looksLikeApproveGrant(command: string): boolean {
@@ -120,7 +127,7 @@ export function looksLikeApproveGrant(command: string): boolean {
     ...unquoted.replace(/\\/g, "").split(SEPARATORS),
     ...unquoted.replace(/\\/g, "/").split(SEPARATORS),
   ];
-  return tokens.includes("approve") && tokens.some((token) => APPROVE_PROGRAM.test(token));
+  return tokens.includes("approve") && tokens.some(approveProgram);
 }
 /** The command the user runs in their own terminal to approve a human decision. */
 export function approveCommand(

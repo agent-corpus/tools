@@ -449,6 +449,9 @@ describe("only the user approves", () => {
   test("stays fast on a long run of program names", () => {
     const start = performance.now();
     expect(looksLikeApproveGrant("policy-manager@".repeat(50_000))).toBe(false);
+    expect(looksLikeApproveGrant(`policy-manager@${"/policy-manager@".repeat(50_000)}`)).toBe(
+      false,
+    );
     expect(performance.now() - start).toBeLessThan(500);
   });
 });
