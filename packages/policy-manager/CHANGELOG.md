@@ -1,5 +1,11 @@
 # @agent-corpus/policy-manager
 
+## 0.11.1
+
+### Patch Changes
+
+- [#55](https://github.com/agent-corpus/tools/pull/55) [`892e691`](https://github.com/agent-corpus/tools/commit/892e6914c9533a32c7659636a24d4bc5c64795d2) Thanks [@charlesprakash](https://github.com/charlesprakash)! - A remembered yes for a protected-path write now covers later compound commands that write the same exact protected files in the same checkout, such as `echo "$(date)" >> .agent-config/test.md && cat .agent-config/test.md`. The engine reads the write targets itself and approves the grant only when everything else in the script is something it approves on its own, every target is a literal word, and no other hard rule applies. Claude Code's PostToolUse answer now remembers the scope shown when the person was asked.
+
 ## 0.11.0
 
 ### Minor Changes
