@@ -1,7 +1,7 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, posix, resolve } from "node:path";
-import { canonical, type Fill, resolveWord, UNKNOWN_CWD } from "./evidence.js";
+import { canonical, type Fill, noteLinkRisk, resolveWord, UNKNOWN_CWD } from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -776,9 +776,10 @@ function runSimple(
           return human(
             request,
             "unknown",
-            "A command that can create symlinks may run before an approved temp path",
+            "A command that can create symlinks may run before an approved write",
           );
         ctx.box.script.tainted = true;
+        noteLinkRisk();
       }
       for (const dir of createdDirectories(unwrap(command.argv).argv)) {
         if (cwd === UNKNOWN_CWD && !isAbsolute(dir)) continue;
@@ -840,7 +841,7 @@ const SYMLINK_FREE = new Set([
   ...["cd", "chdir", "export", "set", "shift", "unset", "read", "local"],
   ...["cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "paste", "diff", "cmp", "jq"],
   ...["grep", "egrep", "fgrep", "rg", "sed", "ls", "stat", "file", "which", "type"],
-  ...["basename", "dirname", "realpath", "readlink", "mkdir", "touch", "tee"],
+  ...["basename", "dirname", "realpath", "readlink", "mkdir", "touch", "tee", "truncate"],
   ...["rm", "rmdir", "unlink", "bash", "sh", "zsh", "dash"],
   ...["seq", "mktemp", "chmod", "find", "curl", "du", "df", "tree", "column", "nl"],
   ...["tac", "rev", "comm", "join", "fold", "od", "xxd", "shasum", "sha256sum", "md5sum", "md5"],

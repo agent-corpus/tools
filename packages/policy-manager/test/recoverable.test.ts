@@ -440,7 +440,8 @@ describe("files this session created", SLOW, () => {
       ["mv user/user1.md x.txt && tee -a x.txt < /dev/null", () => {}],
     ] as const) {
       const s = session();
-      run(s, command, () => {
+      // The rename can plant a symlink, so the engine no longer approves what follows it.
+      attempt(s, command, () => {
         renameSync(user("user1.md"), join(wt, "x.txt"));
         append();
       });
@@ -477,7 +478,7 @@ describe("files this session created", SLOW, () => {
   test("a new file filled by anything but a known creating form is not the session's", () => {
     // gzip writes the user's notes into notes.md.gz, a file born after the approval.
     const s = session();
-    run(s, "gzip user/user3.md && touch user/user3.md.gz", () => {
+    attempt(s, "gzip user/user3.md && touch user/user3.md.gz", () => {
       write(user("user3.md.gz"), "compressed user notes");
       rmSync(user("user3.md"));
     });
@@ -489,7 +490,9 @@ describe("files this session created", SLOW, () => {
     }
     // git stash pop restores a user's stashed file as a new inode.
     const t = session();
-    run(t, "git stash pop && touch stashed.txt", () => write(join(wt, "stashed.txt"), "stashed"));
+    attempt(t, "git stash pop && touch stashed.txt", () =>
+      write(join(wt, "stashed.txt"), "stashed"),
+    );
     try {
       expect(rm(t, "rm stashed.txt").decision).not.toBe("approve");
     } finally {

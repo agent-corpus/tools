@@ -8,6 +8,8 @@ import {
   git,
   inside,
   isProtectedPath,
+  NOTED_WRITE,
+  notedProtectedWrite,
   OUTSIDE_REPOSITORY,
   pathEvidence,
   policyState,
@@ -59,7 +61,6 @@ const DESTRUCTIVE = new Set([
   "mkfs",
   "diskutil",
   "fdisk",
-  "truncate",
   "eval",
   "source",
   ".",
@@ -77,6 +78,7 @@ const WRITERS = new Set([
   "touch",
   "tee",
   "ln",
+  "truncate",
   "install",
   "rsync",
   "chmod",
@@ -670,16 +672,29 @@ const DISPOSABLE_WRITES = new Set([
   "Write within a scratch directory",
   "Write within the system temp directory",
 ]);
-/** Temp and scratch writes are trusted only before anything could plant a symlink (see `Fill`). */
-export function permissiveWrite(cwd: string, input: string, profile: Profile, fill?: Fill) {
-  const check = writeEvidence(cwd, input, profile);
-  if (!check.allowed || !fill || !DISPOSABLE_WRITES.has(check.reason)) return check;
+export const WRITE_AFTER_LINK = "Write after a command that can create symlinks requires review";
+/**
+ * A write is judged by its path, which says nothing once an earlier command in the script may
+ * have planted a symlink there (`ln -sf ~/.zshrc x.md && echo x >> x.md`). Any write is trusted
+ * only before anything could plant one (see `Fill`); after that it goes to the classifier.
+ */
+export function permissiveWrite(
+  cwd: string,
+  input: string,
+  profile: Profile,
+  fill?: Fill,
+  directory = false,
+) {
+  const check = writeEvidence(cwd, input, profile, directory);
+  if (!check.allowed || !fill) return check;
   if (fill.script.tainted)
-    return {
-      allowed: false,
-      category: "temp-write" as const,
-      reason: "Temp write after a command that can create symlinks requires review",
-    };
+    return DISPOSABLE_WRITES.has(check.reason)
+      ? {
+          allowed: false,
+          category: "temp-write" as const,
+          reason: "Temp write after a command that can create symlinks requires review",
+        }
+      : { allowed: false, category: "worktree-write" as const, reason: WRITE_AFTER_LINK };
   if (fill.reorder) fill.script.approved = true;
   return check;
 }
@@ -694,12 +709,14 @@ function hardLinked(path: string): boolean {
   }
 }
 
-function writeEvidence(cwd: string, input: string, profile: Profile) {
+function writeEvidence(cwd: string, input: string, profile: Profile, directory: boolean) {
   let lexical: string | undefined;
   let path: string | undefined;
   try {
     lexical = resolveWord(cwd, input);
     path = canonical(lexical);
+    if (notedProtectedWrite(input, lexical, path, directory))
+      return { allowed: true, category: "worktree-write" as const, reason: NOTED_WRITE };
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
         allowed: false,
@@ -2047,7 +2064,7 @@ export function simpleDecision(
       if (!check.allowed) return human(request, check.category, check.reason);
     }
     for (const file of [...(split?.targets ?? operands), ...optionValues]) {
-      const check = permissiveWrite(cwd, file, profile, fill);
+      const check = permissiveWrite(cwd, file, profile, fill, program === "mkdir");
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   }

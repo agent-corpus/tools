@@ -4,19 +4,19 @@ import {
   canonical,
   git,
   inside,
+  noteProtectedWrites,
   policyState,
   protectedPath,
-  resolveWord,
   sensitive,
 } from "./evidence.js";
-import { SHELL_TOOLS, words } from "./policy.js";
+import { hardRules } from "./hard.js";
+import { evaluate, SHELL_TOOLS, words } from "./policy.js";
 import type { Profile } from "./profile.js";
-import { parseShell, SUBSTITUTION } from "./shell.js";
+import { SUBSTITUTION } from "./shell.js";
 import type { Decision, Request } from "./types.js";
 
 export const PROTECTED_PATH = "Protected path requires human approval";
 export const HUMAN_PATTERN = "Matches an organization human-approval pattern";
-const FILE_TOOLS = new Set(["Write", "create", "write_file", "Edit", "edit", "MultiEdit"]);
 
 function topLevel(path: string): string {
   let parent = existsSync(path) && statSync(path).isDirectory() ? path : dirname(path);
@@ -34,54 +34,48 @@ function protectedRoot(path: string): string | undefined {
   return index < 0 ? undefined : join(top, ...parts.slice(0, index + 1));
 }
 
-/** The paths a request names: file tool targets, patch headers, or a simple command's path words. */
-function targets(request: Request): string[] | undefined {
-  const input = request.input;
-  if (FILE_TOOLS.has(request.tool)) {
-    const file = input.file_path ?? input.path;
-    return typeof file === "string" ? [file] : undefined;
-  }
-  if (request.tool === "apply_patch") {
-    const patch = input.command ?? input.patch ?? input.input;
-    if (typeof patch !== "string") return undefined;
-    const found = patch
-      .split("\n")
-      .flatMap((line) =>
-        /^\*\*\* (?:Add File|Update File|Delete File|Move to): /.test(line)
-          ? [line.slice(line.indexOf(": ") + 2).trim()]
-          : [],
-      );
-    return found.length ? found : undefined;
-  }
-  return undefined;
-}
+/** A word whose text the shell could change: a variable, substitution, glob or brace. */
+const UNREADABLE = /[*?[\]{}$`]/;
+/** Marks a directory in a protected scope; an absolute path never starts with it. */
+const DIRECTORY = "dir:";
 
 /**
- * Every word of a single shell command that could name a file it touches: non-option arguments,
- * the value of `--option=value` or `-oVALUE`, and redirect targets (`> f`, `>> f`, `< f`). One program, no
- * operators, pipes, substitutions or variables. A word that is not a path only adds a scope, so
- * treating it as one fails closed.
+ * The exact protected files a request writes, read by the engine itself: it judges the request
+ * with each write it would refuse only for a protected (not credential) name noted and allowed.
+ * Undefined unless the engine then approves everything else in the request (reads, `mkdir -p`,
+ * echo and printf, floor checks included), every noted target is a literal word, outside policy
+ * state, under a protected root of one checkout, and no hard rule but "protected" applies. Nothing
+ * in the script may create or replace a symlink (`ln`, `mv`, `cp -s`, `tar`, an unknown
+ * program): the paths are read before it runs, and a link would send the write elsewhere.
  */
-function shellPaths(request: Request): string[] | undefined {
-  const command = request.input.command ?? request.input.cmd;
-  if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string") return undefined;
-  const pipelines = parseShell(command);
-  const only = pipelines?.length === 1 && pipelines[0]?.length === 1 ? pipelines[0][0] : undefined;
-  if (!only || only.env.length || only.subs.length || only.stdin !== undefined) return undefined;
-  const texts = [...only.argv, ...only.redirects.map((r) => r.target)];
-  if (texts.some((text) => text.includes(SUBSTITUTION))) return undefined;
-  const paths: string[] = [];
-  for (const word of only.argv.slice(1)) {
-    if (!word.startsWith("-")) paths.push(word);
-    else if (word.startsWith("--")) {
-      if (word.includes("=")) paths.push(word.slice(word.indexOf("=") + 1));
-    }
-    // `-oFILE` attaches a value to a short option; flags like `-rf` only add a harmless path.
-    else if (word.length > 2) paths.push(word.slice(2).replace(/^=/, ""));
+function protectedScope(
+  request: Request,
+  decision: Decision,
+  profile: Profile,
+): string | undefined {
+  if (hardRules(request, decision, profile.scratchRoots).some((rule) => rule !== "protected"))
+    return undefined;
+  const { value, writes, links } = noteProtectedWrites(() => evaluate(request, undefined, profile));
+  if (value.decision !== "approve" || links || !writes.length) return undefined;
+  const files = new Set<string>();
+  const directories = new Set<string>();
+  let top: string | undefined;
+  for (const write of writes) {
+    if (write.word.includes(SUBSTITUTION) || UNREADABLE.test(write.word)) return undefined;
+    if (policyState(write.lexical) || policyState(write.path)) return undefined;
+    if (!protectedRoot(write.path)) return undefined;
+    const checkout = topLevel(write.path);
+    if (top !== undefined && checkout !== top) return undefined;
+    top = checkout;
+    (write.directory ? directories : files).add(write.path);
   }
-  for (const redirect of only.redirects)
-    if (redirect.op !== ">&" && redirect.target !== "/dev/null") paths.push(redirect.target);
-  return paths.filter((path) => path.length > 0);
+  // `mkdir -p` of a written file's own parent directories is part of writing that file. Any other
+  // directory is named as one, so it never matches a write of a file at the same path.
+  const entries = [...files];
+  for (const directory of directories)
+    if (![...files].some((file) => file !== directory && inside(directory, file)))
+      entries.push(`${DIRECTORY}${directory}`);
+  return `protected:${entries.sort().join("\u0000")}`;
 }
 
 /** A simple command (one program, no operators, expansions or redirects) as words. */
@@ -118,11 +112,12 @@ const ONCE_ONLY = new Set([
 /**
  * The scope a session approval of this human decision covers, or undefined when it can only be
  * approved once. A scope is always the same rule and the same exact target:
- * - a protected-path write: the exact files it writes, in the same checkout;
+ * - a protected-path write: the exact files it writes, in the same checkout, in any script whose
+ *   every other part the engine approves on its own (see `protectedScope`);
  * - any other rule for a simple command (a humanPatterns match included): that exact command, in
  *   the same checkout.
  * Category unknown, sensitive or destructive, the ONCE_ONLY hard items, and anything whose targets
- * cannot be read from the request are approved once only. Shell scopes need a simple command, so
+ * cannot be read from the request are approved once only. Command scopes need a simple command, so
  * nothing else in the script hides behind the rule.
  */
 export function grantScope(
@@ -132,25 +127,7 @@ export function grantScope(
 ): string | undefined {
   try {
     if (decision.hard && ONCE_ONLY.has(decision.hard)) return undefined;
-    if (decision.reason === PROTECTED_PATH) {
-      const paths = targets(request) ?? shellPaths(request);
-      if (!paths?.length) return undefined;
-      const files = new Set<string>();
-      let top: string | undefined;
-      for (const path of paths) {
-        const lexical = resolveWord(request.cwd, path);
-        if (sensitive(lexical) || policyState(lexical)) return undefined;
-        const resolved = canonical(lexical);
-        if (sensitive(resolved) || policyState(resolved)) return undefined;
-        // A word that is not under a protected root (`printf test >> AGENTS.md`) is not the write.
-        if (!protectedRoot(resolved)) continue;
-        const checkout = topLevel(resolved);
-        if (top !== undefined && checkout !== top) return undefined;
-        top = checkout;
-        files.add(resolved);
-      }
-      return files.size ? `protected:${[...files].sort().join("\u0000")}` : undefined;
-    }
+    if (decision.reason === PROTECTED_PATH) return protectedScope(request, decision, profile);
     const argv = simple(request);
     if (!argv) return undefined;
     const checkout = topLevel(request.cwd);
@@ -173,7 +150,13 @@ export function grantScope(
 /** What a session scope covers, in words the user can check before approving it. */
 export function scopeLabel(scope: string, _profile: Profile): string {
   if (scope.startsWith("protected:"))
-    return `writes to ${scope.slice("protected:".length).split("\u0000").join(", ")}`;
+    return `writes to ${scope
+      .slice("protected:".length)
+      .split("\u0000")
+      .map((entry) =>
+        entry.startsWith(DIRECTORY) ? `directory ${entry.slice(DIRECTORY.length)}` : entry,
+      )
+      .join(", ")}`;
   const rest = scope.slice(scope.indexOf(":[") + 1);
   const end = rest.lastIndexOf("]:");
   const argv = JSON.parse(rest.slice(0, end + 1)) as string[];

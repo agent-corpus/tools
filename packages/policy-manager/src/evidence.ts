@@ -331,6 +331,62 @@ export interface Fill {
 
 export const OUTSIDE_REPOSITORY = "Cannot verify repository and path evidence";
 
+/** A write target the engine refused only for its protected name, as written and resolved. */
+export interface ProtectedWrite {
+  word: string;
+  lexical: string;
+  path: string;
+  /** Named by `mkdir`: a directory, not a file. */
+  directory: boolean;
+}
+let noting: { writes: ProtectedWrite[]; links: boolean } | undefined;
+export const NOTED_WRITE = "Protected write noted for a session approval";
+
+/**
+ * Runs `run` while each write target refused only because it names a protected path (not a
+ * credential path) is noted and allowed, so the rest of the request is judged as if a person had
+ * approved those writes. Session grants use it to read what a protected-path request writes.
+ * `links` reports a command that can create or replace a symlink anywhere in a script: the
+ * noted paths are read before the script runs, so they no longer say where its writes land.
+ */
+export function noteProtectedWrites<T>(run: () => T): {
+  value: T;
+  writes: ProtectedWrite[];
+  links: boolean;
+} {
+  const previous = noting;
+  const state = { writes: [] as ProtectedWrite[], links: false };
+  noting = state;
+  try {
+    const value = run();
+    return { value, writes: state.writes, links: state.links };
+  } finally {
+    noting = previous;
+  }
+}
+
+/** While noting, records that a command in the script can create or replace a symlink. */
+export function noteLinkRisk(): void {
+  if (noting) noting.links = true;
+}
+
+/**
+ * While noting, records a protected, non-credential write target and reports it as allowed. It
+ * returns before the linked-worktree check on purpose: a person's yes for a protected file covers
+ * it in whichever checkout it is, the main one included, as it always has for a Write.
+ */
+export function notedProtectedWrite(
+  word: string,
+  lexical: string,
+  path: string,
+  directory = false,
+): boolean {
+  if (!noting || sensitive(lexical) || sensitive(path)) return false;
+  if (!isProtectedPath(path) && !isProtectedPath(lexical)) return false;
+  noting.writes.push({ word, lexical, path, directory });
+  return true;
+}
+
 export function pathEvidence(
   cwd: string,
   input: string,
@@ -339,6 +395,8 @@ export function pathEvidence(
   try {
     const lexical = resolveWord(cwd, input);
     const path = canonical(lexical);
+    if (write && notedProtectedWrite(input, lexical, path))
+      return { allowed: true, category: "worktree-write", reason: NOTED_WRITE };
     if (
       sensitive(path) ||
       sensitive(lexical) ||
