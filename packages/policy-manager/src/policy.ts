@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
+import { computesProgram } from "./clirun.js";
 import {
   branchEvidence,
   canonical,
@@ -386,6 +387,9 @@ function tooManyWords(command: string): boolean {
     for (const word of segment) if (!word.heredoc && ++count > MAX_WORDS) return true;
   return false;
 }
+/** Why a command whose program name is computed at run time is not approved by the engine. */
+export const COMPUTED_PROGRAM =
+  "The program name is computed at run time, so what runs needs review";
 /** Hard items no step approves, the engine's included: the deterministic floor. */
 const FLOOR = new Set(["cloud-write", "repo-delete", "publish", "rm-outside", "policy-state"]);
 export const FLOOR_REASON =
@@ -450,15 +454,25 @@ function evaluateSteps(
   ai?: Classification,
   profile: Profile = strictProfile,
 ): Decision {
-  const core = evaluateCore(request, profile);
+  let core = evaluateCore(request, profile);
+  // A program whose name is computed at run time (`$p$q approve`) is never approved by the
+  // engine, in any profile: what runs is unknown until it runs, so the classifier or a person judges.
+  const shellScript = request.input?.command ?? request.input?.cmd;
+  const computed =
+    SHELL_TOOLS.has(request.tool) &&
+    typeof shellScript === "string" &&
+    computesProgram(shellScript);
+  if (computed && core.decision === "approve") core = result(request, "unknown", COMPUTED_PROGRAM);
   // A plain read of non-secret files, protected configuration included, changes nothing.
   if (
+    !computed &&
     core.decision === "human" &&
     !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
     plainRead(request, profile.scratchRoots)
   )
     return result(request, "code-read", PLAIN_READ, true);
   if (
+    !computed &&
     core.decision === "human" &&
     !NOT_CLASSIFIABLE.some((pattern) => pattern.test(core.reason)) &&
     chainApproved(request, profile)

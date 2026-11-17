@@ -156,6 +156,55 @@ describe("any agent command that runs the CLI is self-approve, however the subco
   );
 });
 
+describe("a CLI name assembled from pieces", () => {
+  // The reviewer's four probes: under permissive these were approved with no AI check.
+  test.each([
+    "p=p; q=m; $p$q approve --last --once",
+    "a=p; ${a}m approve --last --once",
+    "p=p; $p'm' approve --last",
+    "p=p; q=m; ( script -q /dev/null $p$q approve --last --once & ); sleep 3",
+    'p=p; q=m; "$p$q" record codex s1',
+    "c=$(printf pm); $c stop codex s1",
+  ])("is hard self-approve in both profiles: %s", async (command) => {
+    for (const profile of [permissive, strictProfile]) {
+      const s = session(profile);
+      const d = await s.decide(shell(command), "PreToolUse");
+      expect(d.decision).toBe("human");
+      expect(d.hard).toBe("self-approve");
+      expect(d.sessionGrantable).toBe(false);
+    }
+  });
+
+  test.each([
+    "X=ls; $X -la",
+    "for c in ls pwd; do $c; done",
+    "T=/usr/bin/true; $T",
+    "${TOOL:-ls} src",
+    "`echo ls` src",
+    "script -q /dev/null $X src",
+  ])("a computed program is never approved by the engine, in either profile: %s", (command) => {
+    for (const profile of [permissive, strictProfile])
+      expect(evaluate(shell(command), undefined, profile).decision).toBe("human");
+  });
+
+  test("it goes to the classifier, not straight to a person", async () => {
+    const directory = join(root, `c${counter++}`);
+    mkdirSync(directory, { mode: 0o700 });
+    const s = new PolicySession(directory, "codex", "s1", permissive, undefined, {
+      classify: async (cli) => ({
+        ok: true,
+        cli,
+        model: "m",
+        latencyMs: 1,
+        verdict: { category: "code-read", confidence: 0.99, recoverable: true, rationale: "ls" },
+      }),
+    });
+    const d = await s.decide(shell("X=ls; $X -la"), "PreToolUse");
+    expect(d.decision).toBe("approve");
+    expect(d.reason).toMatch(/AI classifier/);
+  });
+});
+
 describe("approve refuses a terminal below an agent harness", () => {
   const table = (rows: Array<[number, number, string]>) =>
     new Map<number, ProcessInfo>(rows.map(([pid, ppid, command]) => [pid, { ppid, command }]));

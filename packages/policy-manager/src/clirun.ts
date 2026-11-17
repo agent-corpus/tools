@@ -32,6 +32,12 @@ const SHELL_OR_INTERPRETER =
 /** Something an argument expands at run time: a variable, a substitution, a glob or a brace. */
 const EXPANDS = /[$`*?[\]{}]/;
 const MAX_DEPTH = 6;
+/** The CLI's subcommands that write, grant or run: after a computed program word, the CLI. */
+const CLI_SUBCOMMAND =
+  /^(?:approve|record|classify|stop|serve|hook|review|config|replay|setup-hook(?:-\w+)?|setup\w*|profile)$/;
+/** Whether `words` start with a computed program followed by a CLI subcommand (`$p$q approve`). */
+const computedCli = (words: Word[]) =>
+  !!words[0] && !words[0].literal && !!words[1]?.literal && CLI_SUBCOMMAND.test(words[1].text);
 
 const basename = (text: string) => text.split(/[\\/]/).pop() ?? text;
 
@@ -93,6 +99,7 @@ function scriptRuns(script: string, cliPath: string | undefined, depth: number):
     const cmd = command(segment);
     const program = cmd.program;
     if (program && !program.literal && NAMES_CLI.test(script)) return true;
+    if (program && computedCli([program, ...cmd.args])) return true;
     if (program && wordsRun([program, ...cmd.args], cliPath, depth)) return true;
     const inner = innerScript(cmd);
     if (inner && scriptRuns(inner.script, cliPath, depth + 1)) return true;
@@ -111,6 +118,7 @@ function scriptRuns(script: string, cliPath: string | undefined, depth: number):
  * (`expect -c 'spawn pm ...'`, `script -q /dev/null pm ...`, `tmux new 'pm ...'`).
  */
 function wordsRun(words: Word[], cliPath: string | undefined, depth: number): boolean {
+  if (computedCli(words)) return true;
   const args = cliArgs(words, cliPath);
   // A literal `classify` is a classification record: the session sends any record but its own
   // exact one to a person by that rule (`foreign-classification-record`).
@@ -122,6 +130,41 @@ function wordsRun(words: Word[], cliPath: string | undefined, depth: number): bo
     if (wordsRun(words.slice(i), cliPath, depth + 1)) return true;
     const text = words[i]?.text ?? "";
     if (/\s/.test(text) && scriptRuns(text, cliPath, depth + 1)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether a shell script runs a program whose name is computed at run time: a program word with a
+ * variable, `${...}`, `$(...)`, backticks or a quoted piece joined to one (`$p$q`, `${a}m`,
+ * `$p'm'`), behind assignments and wrappers, through a runner's remaining words (`script -q
+ * /dev/null $p$q ...`), in subshells, `sh -c`/`eval` bodies and here-documents fed to a shell.
+ * The engine never approves such a command: what runs cannot be known before it runs.
+ */
+export function computesProgram(script: string, depth = 0): boolean {
+  if (depth > MAX_DEPTH) return true;
+  const { segments } = scan(script);
+  for (const segment of segments) {
+    const cmd = command(segment);
+    const program = cmd.program;
+    // An assignment the scanner splits at a substitution (`V=$(date)`) is not a program.
+    if (!program || /^[A-Za-z_]\w*\+?=/.test(program.text)) continue;
+    if (!program.literal) return true;
+    const name = basename(program.text);
+    if (RUNS_REST.has(name) && cmd.args.some((word) => !word.literal && !word.text.startsWith("-")))
+      return true;
+    if (RUNS_REST.has(name))
+      for (const word of cmd.args)
+        if (/\s/.test(word.text) && computesProgram(word.text, depth + 1)) return true;
+    const inner = innerScript(cmd);
+    if (inner && (!inner.literal || computesProgram(inner.script, depth + 1))) return true;
+    if (SHELL_OR_INTERPRETER.test(name))
+      for (const doc of segment.filter((word) => word.heredoc || word.herestring))
+        if (
+          /^(?:sh|bash|zsh|dash|ksh|mksh|fish)(?:\.exe)?$/i.test(name) &&
+          computesProgram(doc.text, depth + 1)
+        )
+          return true;
   }
   return false;
 }
