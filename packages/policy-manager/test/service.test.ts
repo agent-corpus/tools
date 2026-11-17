@@ -161,6 +161,11 @@ test.skipIf(process.platform === "win32")(
       expect(asked.permissionDecision).toBe("ask");
       expect(asked.permissionDecisionReason).toContain("did not approve");
       expect(asked.permissionDecisionReason).toContain("stub verdict");
+      // Claude Code shows the dialog: its PermissionRequest hook runs (no tool_use_id) and leaves
+      // the request undecided.
+      expect(
+        JSON.parse(hook("PermissionRequest", "echo $HOOK_ASKED", { permission_mode: "default" })),
+      ).toEqual({});
       // The person said yes in the prompt; the tool ran.
       hook("PostToolUse", "echo $HOOK_ASKED", {
         tool_use_id: "toolu_test_1",

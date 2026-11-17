@@ -223,6 +223,8 @@ describe("a remembered yes for a protected write in a compound command", () => {
   async function approvedFirst(dir: string) {
     const s = claude();
     const asked = await s.decide(bash(first(dir)), "PreToolUse", "toolu_1", "default");
+    // Claude Code shows the dialog: its PermissionRequest hook runs for the same request.
+    await s.decide(bash(first(dir)), "PermissionRequest");
     expect([asked.decision, asked.hard, asked.reason]).toEqual([
       "human",
       "protected",

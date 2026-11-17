@@ -36,8 +36,8 @@ export { APPROVE_GUARD };
 
 /**
  * Claude Code permission modes in which a hook's ask may never reach a person: `bypassPermissions`
- * skips prompts and `dontAsk` denies what would prompt. In every other mode (`default`,
- * `acceptEdits`, `plan`, `auto`) Claude Code shows the person a hook's ask.
+ * skips prompts and `dontAsk` denies what would prompt. A second guard only: in every mode a yes
+ * also needs the PermissionRequest that shows a dialog was about to be shown (`notePrompt`).
  */
 const SILENT_MODES = new Set(["bypassPermissions", "dontAsk"]);
 /** How recently a hook must have polled for its request to count as waiting for an approval. */
@@ -142,7 +142,14 @@ export class PolicySession {
   /** Harness prompts waiting for their answer, by `tool_use_id` (or `request:<hash>`). */
   private asks = new Map<
     string,
-    { request: Request; decision: Decision; at: number; scope: string | undefined }
+    {
+      request: Request;
+      decision: Decision;
+      at: number;
+      scope: string | undefined;
+      /** Claude Code ran PermissionRequest for it: it was about to show the person a dialog. */
+      prompted?: boolean;
+    }
   >();
   /** Classifications running now, so concurrent hooks for one request share one CLI run. */
   private running = new Map<string, Promise<ClassifierResult>>();
@@ -721,6 +728,8 @@ export class PolicySession {
     decision = this.conclude(request, decision);
     if (decision.decision === "human" && phase === "PreToolUse")
       this.awaitAnswer(request, decision, toolUseId, permissionMode);
+    else if (decision.decision === "human" && phase === "PermissionRequest")
+      this.notePrompt(decision.requestHash, toolUseId);
     return decision;
   }
   /**
@@ -740,11 +749,10 @@ export class PolicySession {
     }
   }
   /**
-   * The hook asked, so the harness prompts the person. Its PostToolUse for this exact tool call
-   * means they said yes, in every Claude Code permission mode that shows a hook's ask to a person:
-   * `default`, `acceptEdits`, `plan` and `auto` (where an ask goes to the prompt, not the auto-mode
-   * classifier). Under `bypassPermissions` or `dontAsk`, or with no mode reported (Copilot reports
-   * none, so `--allow-all`/`--yolo` cannot be told apart), nothing is remembered. Codex cannot ask.
+   * The hook asked. A person said yes only if Claude Code then showed them a dialog (PermissionRequest,
+   * see `notePrompt`) and the tool ran (PostToolUse). The permission mode is a second guard only:
+   * under `bypassPermissions` or `dontAsk`, or with no mode reported, nothing is awaited. Copilot
+   * reports no mode, so `--allow-all`/`--yolo` cannot be told apart, and Codex cannot ask.
    */
   private awaitAnswer(
     request: Request,
@@ -761,8 +769,32 @@ export class PolicySession {
     this.asks.set(toolUseId, { request, decision, at: Date.now(), scope });
   }
   /**
-   * PostToolUse (or PostToolUseFailure) for a tool call the harness asked the person about: they
-   * said yes. The answer is remembered like `approve --session`: the same rule for the same scope
+   * Claude Code runs PermissionRequest only when it is about to ask the person for permission (or
+   * would auto-deny a call that cannot prompt, which then never runs). After our PreToolUse ask, a
+   * PermissionRequest for the same request that this hook leaves undecided is direct evidence that
+   * the person saw the dialog. PermissionRequest carries no `tool_use_id`, so without one it marks
+   * the newest unprompted ask for the same request hash in this session.
+   */
+  private notePrompt(requestHash: string, toolUseId: string | undefined): void {
+    if (this.harness !== "claude") return;
+    const direct = toolUseId ? this.asks.get(toolUseId) : undefined;
+    if (direct) {
+      if (direct.decision.requestHash === requestHash) direct.prompted = true;
+      return;
+    }
+    let newest: { at: number; prompted?: boolean } | undefined;
+    for (const ask of this.asks.values())
+      if (
+        ask.decision.requestHash === requestHash &&
+        !ask.prompted &&
+        (!newest || ask.at >= newest.at)
+      )
+        newest = ask;
+    if (newest) newest.prompted = true;
+  }
+  /**
+   * PostToolUse (or PostToolUseFailure) for a tool call the harness showed the person a dialog
+   * about (PreToolUse ask, then PermissionRequest): they said yes. The answer is remembered like `approve --session`: the same rule for the same scope
    * is approved for the rest of the session (a protected root, a humanPatterns entry, or the exact
    * command for other rules); unknown, sensitive and destructive requests stay once-only.
    */
@@ -790,6 +822,9 @@ export class PolicySession {
       });
       return "rejected";
     }
+    // No PermissionRequest after the ask: no dialog was shown (an auto-mode approval, a hook or
+    // rule that decided it), so the run is not a person's yes.
+    if (!ask.prompted) return undefined;
     this.humanDecisions.delete(report.requestHash);
     const scope = ask.scope;
     audit(this.directory, {
