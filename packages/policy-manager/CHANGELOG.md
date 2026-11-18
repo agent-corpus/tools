@@ -4,7 +4,7 @@
 
 ### Patch Changes
 
-- Inline interpreter code that edits files through a variable or function parameter (`def edit(path): open(b + path, "w")`, `global s`) no longer counts as reaching the policy service state when nothing in the code can produce a temp path. A path this cannot read still fails closed when the code names temp (also split across literals), reads paths from outside (argv, environment, standard input, a listing or glob), or decodes or rebuilds text at run time.
+- Inline interpreter code that edits files resolves its paths more often, so ordinary edit scripts no longer ask a person as possible policy-state changes: bindings are read outside string literals (source text being written is data), a name bound only to literals keeps every value, keyword arguments (`open(p, encoding=...)`) are not read as tuple assignments, methods on what `open(...)` returns are judged by that `open` call, a concatenation of literals and literal-bound names is read as its values, and a function parameter that every plain call passes a literal (`def edit(path): open(b + path, "w")` with `edit("src/a.ts")`) holds those values. A path still unreadable after that fails closed as before.
 
 ## 0.12.0
 

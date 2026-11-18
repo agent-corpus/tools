@@ -434,27 +434,6 @@ export function findReachesState(args: string[], cwds: Iterable<string>): boolea
 const TEMP_LOOKUP =
   /\$\{?(?:TMPDIR|TMP|TEMP)\b|environ\b[^\n]{0,40}\b(?:TMPDIR|TMP|TEMP)\b|process\.env\.(?:TMPDIR|TMP|TEMP)\b|ENV\[\s*["'](?:TMPDIR|TMP|TEMP)|getenv\(\s*["'](?:TMPDIR|TMP|TEMP)|gettempdir|tempfile\.tempdir|os\.tmpdir|tmpdir\(\)|Dir\.tmpdir|sys_get_temp_dir|GetTempPath/;
 
-/**
- * Code that can produce a temp path for a file call this cannot read: temp named outright, a
- * parent step (`..`), paths read from outside the code (argv, environment, standard input, a
- * directory listing, a glob), or text decoded or rebuilt at run time.
- */
-const TEMP_HINT =
-  /tmp|temp|\/var|\/private|folders|acp|\.\.|argv|environ|process\.env|getenv|ENV\[|\$\{?\w|stdin|\binput\s*\(|readline|listdir|scandir|walk|readdir|\bglob\b|\bchr\s*\(|fromCharCode|base64|b64|fromhex|codecs|decode|unhexlify|pack\s*\(|\\x[0-9a-f]{2}|\\u[0-9a-f]{4}|\\[0-7]{3}|%[0-9a-f]{2}|\[::-1\]|reverse|rot13|translate|maketrans|expandvars|\bbytes\s*\(|bytearray|%c|\bord\s*\(|struct|marshal|pickle|zlib|gzip|bz2|lzma|Buffer\.from|atob|unescape/i;
-
-/**
- * The path-like quoted strings in the code (short, no spaces), joined in order, so a name split
- * across literals (`'/t' + 'mp'`) reads whole. Text being written (source, messages) is left out.
- */
-function joinedStrings(code: string): string {
-  let out = "";
-  for (const match of code.matchAll(/'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|`([^`]*)`/g)) {
-    const text = match[1] ?? match[2] ?? match[3] ?? "";
-    if (text.length <= 200 && !/\s/.test(text)) out += text;
-  }
-  return out;
-}
-
 /** Longest inline code judged; longer code fails closed. */
 const MAX_CODE = 100_000;
 
@@ -631,15 +610,113 @@ function literalVariables(
     )
       found.set(name, undefined);
   }
+  const sites = new Map<string, number>();
   const bound = (list: string) => {
     for (const name of list.split(/[\s,()[\]{}*=:.]+/))
-      if (/^[A-Za-z_]\w*$/.test(name)) found.set(name, undefined);
+      if (/^[A-Za-z_]\w*$/.test(name)) {
+        found.set(name, undefined);
+        sites.set(name, (sites.get(name) ?? 0) + 1);
+      }
   };
   for (const match of masked.matchAll(
     /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|(?:^|[\n;])\s*(\w+(?:\s*,\s*\w+)+)\s*,?\s*=(?!=)/g,
   ))
     for (const group of match.slice(1)) if (group) bound(group);
+  resolveParameters(code, masked, found, sites, plain, argv);
   return found;
+}
+
+/**
+ * A function parameter called only with literal paths: `def edit(path): open(b + path, "w")` with
+ * every call `edit("src/a.ts", …)`. The parameter then holds one of those values. It counts only
+ * when the function is used nowhere but in plain calls, the parameter is bound nowhere else and
+ * never reassigned, and every call passes it as a literal or a name bound only to literals.
+ */
+function resolveParameters(
+  code: string,
+  masked: string,
+  found: Map<string, string[] | undefined>,
+  sites: Map<string, number>,
+  plain: Map<string, number>,
+  argv: Array<string | undefined>,
+): void {
+  const resolved = new Map<string, string[]>();
+  const failed = new Set<string>();
+  const defs = [
+    ...masked.matchAll(/(?:^|\n)[ \t]*(?:def|function)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/g),
+  ];
+  const perName = new Map<string, number>();
+  for (const def of defs)
+    for (const raw of (def[2] ?? "").split(",")) {
+      const name = raw.split(/[:=]/)[0]?.trim() ?? "";
+      if (/^[A-Za-z_]\w*$/.test(name)) perName.set(name, (perName.get(name) ?? 0) + 1);
+    }
+  for (const def of defs) {
+    const fn = def[1] ?? "";
+    const params = (def[2] ?? "").split(",").map((raw) => raw.split(/[:=]/)[0]?.trim() ?? "");
+    const at = def.index ?? 0;
+    const calls = [...masked.matchAll(new RegExp(`(?<![\\w.])${fn}\\s*\\(`, "g"))].filter(
+      (call) => (call.index ?? 0) > at + (def[0]?.length ?? 0) || (call.index ?? 0) < at,
+    );
+    const uses = masked.match(new RegExp(`\\b${fn}\\b`, "g"))?.length ?? 0;
+    const callArgsList = calls.map((call) =>
+      callArgs(code, (call.index ?? 0) + call[0].length, true),
+    );
+    params.forEach((param, i) => {
+      if (!/^[A-Za-z_]\w*$/.test(param) || failed.has(param)) return;
+      const ok =
+        calls.length > 0 &&
+        uses === calls.length + 1 &&
+        sites.get(param) === perName.get(param) &&
+        !plain.has(param) &&
+        !new RegExp(`\\b${param}\\s*(?:[-+*/%&|^@:]|\\*\\*|//|<<|>>)?=(?!=)`).test(masked);
+      const values: string[] = [];
+      if (ok)
+        for (const args of callArgsList) {
+          const arg = args?.[i]?.trim();
+          const name = arg && /^[A-Za-z_]\w*$/.test(arg) ? arg : undefined;
+          const known = name
+            ? found.get(name)
+            : arg
+              ? (literalPath(arg, argv) ?? plainLiteral(arg))
+              : undefined;
+          if (known === undefined) {
+            failed.add(param);
+            return;
+          }
+          values.push(...(Array.isArray(known) ? known : [known]));
+        }
+      if (!ok) {
+        failed.add(param);
+        return;
+      }
+      resolved.set(param, [...(resolved.get(param) ?? []), ...values]);
+    });
+  }
+  for (const [param, values] of resolved) if (!failed.has(param)) found.set(param, values);
+}
+
+/** The top-level `+` operands of an expression, or undefined when it has other operators or calls. */
+function splitPlus(expr: string): string[] | undefined {
+  const parts: string[] = [];
+  let quote = "";
+  let from = 0;
+  for (let i = 0; i < expr.length; i++) {
+    const c = expr[i] as string;
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "'" || c === '"') quote = c;
+    else if (c === "+") {
+      parts.push(expr.slice(from, i));
+      from = i + 1;
+    } else if (!/[\w\s]/.test(c)) return undefined;
+  }
+  if (quote) return undefined;
+  parts.push(expr.slice(from));
+  return parts;
 }
 
 /**
@@ -664,73 +741,39 @@ function callsReachState(
     argv = [];
   const vars = literalVariables(code, argv, interpreter);
   const aliases = moduleAliases(code);
-  const values = (arg: string): string[] | undefined => {
+  const single = (arg: string): string[] | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
     if (name) return vars.get(name);
     const path = literalPath(arg, argv);
     return path === undefined ? undefined : [path];
   };
-  // A path this cannot read can only lead to the state if the code can produce a temp path: it
-  // names temp (also split across literals: '/t' + 'mp'), reads paths from outside (argv, the
-  // environment, standard input, a listing), or decodes text. Without any of that, every string
-  // the path is built from is visible here and none points at temp.
-  const hinted =
-    TEMP_HINT.test(withoutStrings(code, interpreter)) ||
-    // In a string, `${name}` is template text (data) unless the name itself points at temp.
-    TEMP_HINT.test(joinedStrings(code).replace(/\$\{?(\w+)\}?/g, "$1"));
-  // A path this cannot read is safe only when it starts from a visible directory that neither
-  // holds nor lies above a session directory: `b + path` with `b = '/repo/src/'`, `f'src/{x}'`,
-  // `os.path.join('/repo', x)`, `Path('/repo') / x`. Whatever follows can only go deeper, since a
-  // `..` anywhere makes the code hinted. A prefix like `'/t'` names `/`, which lies above the
-  // state, so reordered fragments (`'/t' + 'mp' + …`) still fail closed.
-  const anchored = (arg: string): boolean => {
-    const text = arg.trim();
-    const first =
-      /^(?:os\s*\.\s*path\s*\.\s*join|path\s*\.\s*(?:join|resolve)|join)\s*\(\s*([^,()]+)/.exec(
-        text,
-      )?.[1] ??
-      /^(?:pathlib\s*\.\s*)?Path\s*\(\s*([^()]+?)\s*\)\s*\//.exec(text)?.[1] ??
-      text;
-    const lead =
-      /^\s*(?:(f|r|rf|fr|b)?(['"])((?:(?!\2)[^\\\n])*)\2|`([^`$]*)|([A-Za-z_]\w*))/i.exec(first);
-    if (!lead) return false;
-    let prefixes: string[] | undefined;
-    if (lead[5] !== undefined) prefixes = vars.get(lead[5]);
-    else {
-      const body = lead[4] ?? lead[3] ?? "";
-      prefixes = [
-        /f/i.test(lead[1] ?? "") || lead[4] !== undefined ? (body.split("{")[0] ?? "") : body,
-      ];
+  // A concatenation whose every part is a literal or a name bound only to literals: each
+  // combination of their values (`b + path` with `b = "/repo/"` and `path` from `edit("a.ts")`).
+  const values = (arg: string): string[] | undefined => {
+    const whole = single(arg);
+    if (whole !== undefined) return whole;
+    const parts = splitPlus(arg);
+    if (!parts || parts.length < 2) return undefined;
+    let out = [""];
+    for (const part of parts) {
+      const name = /^\s*([A-Za-z_]\w*)\s*$/.exec(part)?.[1];
+      const piece = name
+        ? vars.get(name)
+        : (() => {
+            const text = plainLiteral(part.trim());
+            return text === undefined ? undefined : [text];
+          })();
+      if (!piece?.length) return undefined;
+      out = out.flatMap((head) => piece.map((tail) => head + tail));
+      if (out.length > 64) return undefined;
     }
-    if (!prefixes?.length) return false;
-    const states = stateDirs().map(fold);
-    return prefixes.every((prefix) => {
-      if (prefix.includes("..")) return false;
-      const dir = prefix.slice(0, prefix.lastIndexOf("/") + 1);
-      return cwds.every((cwd) => {
-        // No `..` can occur here, so joining is resolving (also for a Windows drive path).
-        const base = slashes(dir);
-        let abs = (/^(?:\/|[A-Za-z]:\/)/.test(base) ? base : `${slashes(cwd)}/${base}`)
-          .replace(/\/(?:\.\/)+/g, "/")
-          .replace(/\/{2,}/g, "/");
-        try {
-          abs = slashes(canonical(abs));
-        } catch {
-          /* a directory not created yet keeps its lexical form */
-        }
-        const at = fold(trim(abs));
-        if (!at || at === "/") return false;
-        return !states.some(
-          (state) => state === at || state.startsWith(`${at}/`) || at.startsWith(`${state}/`),
-        );
-      });
-    });
+    return out;
   };
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
     const paths = values(arg);
     // A session directory by its name counts too, also one not created yet or another user's.
-    if (paths === undefined) return hinted || !anchored(arg);
+    if (paths === undefined) return true;
     return paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true));
   };
   // Calls are found outside string literals (a message or source text being edited is data);
