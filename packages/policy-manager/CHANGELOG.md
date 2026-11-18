@@ -1,14 +1,26 @@
 # @agent-corpus/policy-manager
 
-## 0.11.3
+## 0.12.0
 
-### Patch Changes
+### Minor Changes
 
 - Fewer false asks, from a replay of real transcripts, where the result is certain; anything uncertain keeps the 0.11.2 decision. `self-approve`: naming `approve` with the CLI still counts everywhere except inside a `git commit -m/-F` message, a `gh pr create/edit/comment --body/-b` or `gh api -f body=` body, and an `npm view`/`info`/`ls`/`install`/`outdated` of the package; `command -v pm` and `v=$(npm view ...)` no longer run the CLI, and interpreter code runs it when it imports the package or can start a process and names the CLI. `policy-state`: inline code that only calls file functions on literal non-state paths is data however much `acp` text it holds (a variable needs exactly one binding; `process.argv`/`sys.argv` words count only when nothing changes argv and node cannot read them as options); in a plain script (no pipe, background job, subshell, substitution, assigning expansion, function, `read`/`export`/`eval`/`source`/`pushd`/`cd -`) a variable bound once to a literal, or by a literal `for` list, is filled in; find's name and path patterns and `-newermt`-style predicates are read-only. `gh api graphql` with an allow-listed literal mutation and variable fields from a literal loop is not `repo-delete`, while a `query` field with an expansion now is. A path under `.claude/worktrees/<name>/` is judged inside that worktree.
+
 - Stricter: a file the script writes and then runs (`sh f`, `python3 f`, `./f`) is judged as code (a literal body gets the full rules, anything else is `policy-state`), and so is `npm pkg set scripts.*` before `npm run`; `find` output read by another command (`| xargs cat`, `cat $(find ...)`) is `credential-read` when it can reach the session files; inline code that writes a path with a session directory name counts whatever uid it names.
+
 - Writes of `*.md` files directly in Claude Code's auto-memory directory (`<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<project>/memory/`, `MEMORY.md` included) are approved, by Write, Edit, a redirection or `tee`, as Claude Code itself does not ask. No `..`, no symlink on the way, no hard-linked file, and not after a command that can create a symlink; the rest of `~/.claude` stays protected.
+
+- Credential reads are what reaches the agent, not a CLI using its own stored login. Reads of Git's own files other than `config`, `config.worktree` and credential files (a worktree's `HEAD`, `gitdir`, `commondir`, `locked`, its `.git` file, `GIT_DIR=`/`--git-dir=` naming the directory) are no longer `credential-read`; a recursive read of a Git directory, `.git/config`, token and secret commands, `env`/`printenv` and a secret passed straight into another command still are, and so is printing a variable named like a secret (`echo $GITHUB_TOKEN`).
+
+- Python or Node running inline code that calls no link, rename, move or copy function and starts nothing no longer counts as a command that can create a symlink, so a memory or temp write after it is judged normally.
+
+- Stricter: a file written and then run through a launcher (`uv run`, `npx tsx`, `deno run`, `bun`) is judged as code; a `printf` or `echo` body that the program would expand is not known, so running it counts as reaching the state; `find` output saved to a file is a credential read when it can reach the session files.
+
 - `pm --version`, `pm --help` and `pm help` print the version or the subcommands without a session service.
+
 - Codex `apply_patch` accepts every documented form: absolute, relative and Windows paths and paths with spaces in `Add`/`Update`/`Delete File` and `Move to` headers, `@@` with or without context, `*** End of File`, CRLF line endings, a trailing newline after `*** End Patch`, and the patch under `command`, `patch` or `input` (the first string holding a patch, so an argv array in `command` is skipped). Each target is judged by the worktree, protected and temp rules; a malformed patch still goes to a person.
+
+- Add `credentialUses` to the profile: a credential a command reads only to hand straight to one consumer, as a literal source command shape and consumer shapes in the `credentialHelpers` token syntax (`$SECRET` marks a header argument that carries it; otherwise it is an environment value for that one command). The command must be exactly `NAME=$(source) consumer ...` or a consumer with the one `$SECRET` argument; no other expansion, operator, redirection or here-document, and the consumer is then judged on its own. Generic defaults are on unless `credentialUseDefaults` is false: `gh auth token` into `npx changeset version`/`publish`, and `az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv` into a `curl -s` GET of `https://management.azure.com/...` with only that Authorization header. Permissive profiles only.
 
 ## 0.11.2
 

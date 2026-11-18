@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { type ClassifierConfig, DEFAULT_CLASSIFIER, parseClassifierConfig } from "./classifier.js";
+import { type CredentialUse, DEFAULT_CREDENTIAL_USES, parseCredentialUses } from "./creduse.js";
 import { canonical, git } from "./evidence.js";
 import { type CredentialHelper, HelperError, parseCredentialHelpers } from "./helpers.js";
 import { TOOL_NAME } from "./tools.js";
@@ -32,6 +33,11 @@ export interface Profile {
   toolsDeny: { claude: string[]; codex: string[]; copilot: string[] };
   /** Scripts that may read a credential for one narrow job, as committed on the default branch. */
   credentialHelpers: CredentialHelper[];
+  /**
+   * Credentials a command may read only to hand straight to one consumer (`credentialUses`, plus
+   * the generic defaults unless `credentialUseDefaults` is false). Permissive profiles only.
+   */
+  credentialUses: CredentialUse[];
   /** The AI classifier each harness runs for what the engine escalates: CLI models and a kill switch. */
   classifier: ClassifierConfig;
   /** SHA-256 of the file the profile came from, for the audit log. */
@@ -46,6 +52,7 @@ export const strictProfile: Profile = {
   mcpReadOnly: [],
   toolsDeny: { claude: [], codex: [], copilot: [] },
   credentialHelpers: [],
+  credentialUses: [],
   classifier: DEFAULT_CLASSIFIER,
 };
 
@@ -142,6 +149,8 @@ export function parseProfile(text: string): Profile {
     "mcpReadOnly",
     "toolsDeny",
     "credentialHelpers",
+    "credentialUses",
+    "credentialUseDefaults",
     "classifier",
     "description",
   ]);
@@ -182,6 +191,16 @@ export function parseProfile(text: string): Profile {
     if (error instanceof HelperError) throw new ProfileError(error.message);
     throw error;
   }
+  let credentialUses: CredentialUse[];
+  try {
+    credentialUses = parseCredentialUses(value.credentialUses);
+  } catch (error) {
+    if (error instanceof HelperError) throw new ProfileError(error.message);
+    throw error;
+  }
+  const useDefaults = value.credentialUseDefaults ?? true;
+  if (typeof useDefaults !== "boolean")
+    throw new ProfileError("credentialUseDefaults must be true or false");
   let humanPatterns: RegExp[];
   try {
     humanPatterns = (patterns as string[]).map((p) => new RegExp(p));
@@ -204,6 +223,10 @@ export function parseProfile(text: string): Profile {
     mcpReadOnly: [...new Set(mcp as string[])],
     toolsDeny,
     credentialHelpers: value.mode === "permissive" ? credentialHelpers : [],
+    credentialUses:
+      value.mode === "permissive"
+        ? [...(useDefaults ? DEFAULT_CREDENTIAL_USES : []), ...credentialUses]
+        : [],
     classifier,
     digest: createHash("sha256").update(text).digest("hex"),
   };

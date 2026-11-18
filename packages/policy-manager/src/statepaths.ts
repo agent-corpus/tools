@@ -929,3 +929,17 @@ function namesStateSecretOnce(text: string, cwds: string[], whole: boolean): boo
   }
   return false;
 }
+
+/** File calls that create, replace or move a link (or a file that may be one). */
+const LINK_CALL =
+  /\b(?:os|shutil|fs|fsp|promises|Path|pathlib)\s*\.\s*(?:symlink\w*|link\w*|rename\w*|replace|move|copy\w*|cp\w*)\b|\.(?:symlink_to|hardlink_to)\b|\b(?:symlinkSync|linkSync|renameSync|cpSync|copyFileSync|symlink|link|rename|copytree|copyfile|copy2|move)\s*\(/;
+/**
+ * Whether inline interpreter code (Python or Node) can create a symlink: it calls a link, rename,
+ * move or copy function, reaches a file function some other way, or can start a process or
+ * evaluate a string. Code that only reads and writes files cannot.
+ */
+export function codeLinkFree(code: string, interpreter: string): boolean {
+  if (code.length > MAX_CODE || !/^(?:python[\d.]*|node|nodejs)$/.test(interpreter)) return false;
+  const bare = withoutStrings(code, interpreter);
+  return !RUNS_CODE.test(bare) && !hiddenFileCall(bare) && !LINK_CALL.test(bare);
+}

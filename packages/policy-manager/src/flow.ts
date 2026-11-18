@@ -18,6 +18,7 @@ import {
   type Word,
 } from "./script.js";
 import type { Redirect, SimpleCommand } from "./shell.js";
+import { codeLinkFree } from "./statepaths.js";
 import type { Decision, Request } from "./types.js";
 
 /**
@@ -771,7 +772,11 @@ function runSimple(
         for (const helper of decision.credentialHelpers) ctx.box.helpers.add(helper);
       }
       // A listed credential helper only reads a secret and talks to its service.
-      if (!decision.credentialHelpers?.length && !symlinkFree(unwrap(command.argv).argv)) {
+      if (
+        !decision.credentialHelpers?.length &&
+        !symlinkFree(unwrap(command.argv).argv) &&
+        !inlineCodeLinkFree(unwrap(command.argv).argv, command.stdin)
+      ) {
         if (ctx.box.script.approved)
           return human(
             request,
@@ -872,6 +877,23 @@ const GH_SYMLINK_FREE: Record<string, Set<string>> = {
  * later temp paths in the script are no longer trusted. `cp` without options that copy links
  * (`-R`, `-a`, `-P`, `-d`, long options) writes a regular file.
  */
+/**
+ * Python or Node running code it was given inline (`-c`/`-e`, or `-` with a here-document) that
+ * calls no link, rename, move or copy function and starts nothing creates no symlink.
+ */
+function inlineCodeLinkFree(argv: string[], stdin: string | undefined): boolean {
+  const [path = "", ...args] = argv;
+  const program = basename(path);
+  const flag = args.findIndex((arg) => /^(?:-c|-e|--eval)$/.test(arg));
+  if (flag >= 0) {
+    if (args.slice(0, flag).some((arg) => arg.startsWith("-"))) return false;
+    const code = args[flag + 1];
+    return code !== undefined && codeLinkFree(code, program);
+  }
+  if (args[0] === "-" && stdin !== undefined) return codeLinkFree(stdin, program);
+  return false;
+}
+
 function symlinkFree(argv: string[]): boolean {
   const [path = "", ...args] = argv;
   const program = basename(path);

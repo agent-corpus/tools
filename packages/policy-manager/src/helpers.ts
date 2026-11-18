@@ -112,6 +112,8 @@ const PLACEHOLDERS: Record<string, (value: string) => boolean> = {
     !/^\/dev\//.test(v),
   // Any one argument; the caller refuses one the shell would expand.
   text: () => true,
+  // A URL path and query: no `..` segment, no user info, fragment or whitespace.
+  path: (v) => /^[A-Za-z0-9_./?=&%,:-]{1,400}$/.test(v) && !/(?:^|\/)\.\.(?:\/|$|\?)/.test(v),
 };
 
 type Part = { literal: string } | { placeholder: string };
@@ -164,6 +166,29 @@ function matchParts(list: Part[], word: string, files: string[]): boolean {
     }
   }
   return false;
+}
+
+/** Whether `args` match a shape token for token (literals, alternatives, placeholders). */
+export function matchArgs(shape: Array<string | string[]>, args: string[]): boolean {
+  if (shape.length !== args.length || args.some((word) => word.length > MAX_WORD)) return false;
+  return shape.every((token, i) => matchToken(token, args[i] ?? "", []));
+}
+/** Validates one argument shape (for profile keys that reuse the helper token syntax). */
+export function checkShape(shape: unknown, where: string): Array<string | string[]> {
+  if (!Array.isArray(shape) || shape.length === 0 || shape.length > MAX_TOKENS)
+    throw new HelperError(`each shape in ${where} must list 1 to ${MAX_TOKENS} tokens`);
+  for (const token of shape) {
+    if (Array.isArray(token)) {
+      if (
+        token.length === 0 ||
+        token.some((t) => typeof t !== "string" || t.length === 0 || t.length > 200)
+      )
+        throw new HelperError(`alternatives in ${where} must be non-empty strings`);
+    } else if (typeof token !== "string" || token.length === 0 || token.length > 300)
+      throw new HelperError(`a token in ${where} must be a non-empty string`);
+    else parts(token);
+  }
+  return shape as Array<string | string[]>;
 }
 
 function matchToken(token: string | string[], word: string, files: string[]): boolean {

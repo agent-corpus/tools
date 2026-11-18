@@ -170,6 +170,31 @@ export function sensitive(path: string): boolean {
       )
   );
 }
+/** Files in a Git directory that can hold credentials (a token in a remote URL or extra header). */
+const GIT_SECRET = /^(?:config|config\.worktree|\.?credentials?(?:\..*)?|.*\.(?:pem|key))$/i;
+/**
+ * Whether reading `path` could read a credential. A Git directory is one only for the files that
+ * can hold one (`config`, `config.worktree`, credentials), or when read as a tree (`whole`) from the
+ * directory itself, a linked worktree's or a submodule's: `HEAD`, `gitdir`, `commondir`, `locked`,
+ * refs and logs carry none, and neither does a worktree's `.git` file. Writes keep `sensitive`.
+ */
+export function readSensitive(path: string, whole = false): boolean {
+  if (!sensitive(path)) return false;
+  const parts = path.split(/[\\/]/);
+  const at = parts.findIndex((part) => part.toLowerCase() === ".git");
+  if (at < 0) return true;
+  const rest = parts.slice(at + 1).filter(Boolean);
+  // Sensitive for another reason as well (a key file, `.ssh`, the policy state, `gh` config).
+  const other = [...parts.slice(0, at), ...rest].join("/");
+  if (sensitive(other) || rest.some((part) => part.toLowerCase() === ".git")) return true;
+  if (rest.some((part) => GIT_SECRET.test(part))) return true;
+  if (!whole) return false;
+  return (
+    rest.length === 0 ||
+    (rest[0] === "worktrees" && rest.length <= 2) ||
+    (rest[0] === "modules" && !rest.some((part) => /^(?:objects|refs|logs|hooks|info)$/.test(part)))
+  );
+}
 const PROTECTED_NAME =
   /^(?:\.agent-config|\.local|\.codex|\.claude|\.agents|AGENTS\.md|CLAUDE\.md|\.github)$/i;
 /**

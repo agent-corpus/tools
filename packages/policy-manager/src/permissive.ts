@@ -16,6 +16,7 @@ import {
   pathEvidence,
   policyState,
   protectedPath,
+  readSensitive,
   resolveWord,
   sensitive,
   tempRoots,
@@ -27,7 +28,7 @@ import { helperMatch } from "./helpers.js";
 import { mergedEvidence, onRemote, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result, words as shellWords } from "./policy.js";
 import type { Profile } from "./profile.js";
-import { sedScript } from "./reads.js";
+import { readOnly, sedScript } from "./reads.js";
 import {
   deletesProtected,
   deletionScriptCwd,
@@ -650,7 +651,7 @@ export function permissiveRead(cwd: string, input: string) {
   try {
     const lexical = resolveWord(cwd, input);
     const path = canonical(lexical);
-    if (sensitive(path) || sensitive(lexical))
+    if (readSensitive(path) || readSensitive(lexical))
       return {
         allowed: false,
         category: "sensitive" as const,
@@ -1517,14 +1518,17 @@ const GLOB_ENTRIES = 5000;
  * working directory (a symlink to a key, or a cwd inside `~/.ssh`), or, for a glob in its last
  * component, by any entry it would match.
  */
-function sensitiveOperand(cwd: string, word: string): boolean {
+function sensitiveOperand(cwd: string, word: string, read?: { walk: boolean }): boolean {
   if (word === "") return false;
-  if (sensitive(word)) return true;
+  // A read is judged by `readSensitive` (Git's own files but its config are no credential); a
+  // glob still expands the strict way.
+  const check = read ? (path: string) => readSensitive(path, read.walk) : sensitive;
+  if (check(word)) return true;
   if (GLOB.test(word)) return sensitiveGlob(cwd, word);
   try {
     const lexical = resolveWord(cwd, word);
     if (!lstatExists(lexical)) return false;
-    return sensitive(lexical) || sensitive(canonical(lexical));
+    return check(lexical) || check(canonical(lexical));
   } catch {
     return false;
   }
@@ -1886,8 +1890,32 @@ export function simpleDecision(
   // files a sed script reads or writes are.
   const operands = textOperands(program, args);
   const namePatterns = operands.patterns;
+  // A program that only reads, and a word that only tells git where its directory is, read no
+  // credential in Git's own files but its config.
+  const reads =
+    readOnly([program, ...args]) ||
+    /^(?:cat|ls|head|tail|grep|egrep|fgrep|rg|wc|stat|file|tree|du|test|\[|export)$/.test(program);
+  const walk =
+    /^(?:rg|tree|du)$/.test(program) ||
+    args.some((arg) => /^-[a-zA-Z]*[rR]|^--recursive$|^--dereference-recursive$/.test(arg));
   for (const [index, word] of args.entries()) {
     if (operands.text.has(index)) continue;
+    const gitDir = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=|^--(?:git-dir|work-tree)=/.test(
+      word,
+    );
+    if (reads || gitDir) {
+      const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
+      const read = { walk: walk && !gitDir };
+      if (
+        namePatterns.has(index) || PRINTERS.has(program)
+          ? (candidate.includes("/") || candidate.startsWith(".") || namePatterns.has(index)) &&
+            readSensitive(candidate, read.walk)
+          : sensitiveOperand(cwd, candidate, read) ||
+            (candidate !== word && sensitiveOperand(cwd, word, read))
+      )
+        return human(request, "sensitive", "Protected path requires human approval");
+      continue;
+    }
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
     // echo and printf read no file, so only a path-like word is judged, by name.
     const pathLike = candidate.includes("/") || candidate.startsWith(".");

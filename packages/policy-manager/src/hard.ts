@@ -7,6 +7,7 @@ import {
   git,
   inside,
   isProtectedPath,
+  readSensitive,
   resolveWord,
   sensitive,
   tempRoots,
@@ -185,7 +186,16 @@ const POLICY_STATE = /(?:^|\/)acp-(?:\d+|user)-[^/]*(?:\/|$)/i;
 export const policyStatePath = (path: string) => POLICY_STATE.test(normalize(path));
 
 /** The hard rules a path names. */
-function pathRules(path: string, rules: Set<HardRule>, credentials: boolean): void {
+/**
+ * `credentials`: `true` judges the path as a credential the strict way (`sensitive`), as for a
+ * write or an unknown program; `"read"` and `"walk"` as a file read or a tree read
+ * (`readSensitive`), where Git's own files other than its config are not credentials.
+ */
+function pathRules(
+  path: string,
+  rules: Set<HardRule>,
+  credentials: boolean | "read" | "walk",
+): void {
   // Pure for a given environment, and asked for the same words many times: memoized.
   const key = `${credentials ? 1 : 0}${process.env.CLAUDE_CONFIG_DIR}|${process.env.CODEX_HOME}|${process.env.COPILOT_HOME}|${path}`;
   let found = pathMemo.get(key);
@@ -196,7 +206,12 @@ function pathRules(path: string, rules: Set<HardRule>, credentials: boolean): vo
       found.push("policy-profile");
     if (HARNESS_SETTINGS.some((pattern) => pattern.test(target)) || configuredSettings(target))
       found.push("harness-settings");
-    if (credentials && sensitive(target)) found.push("credential-read");
+    if (
+      credentials === true
+        ? sensitive(target)
+        : credentials && readSensitive(target, credentials === "walk")
+    )
+      found.push("credential-read");
     if (pathMemo.size > 8192) pathMemo.clear();
     pathMemo.set(key, found);
   }
@@ -745,6 +760,9 @@ function featureWorktree(path: string): boolean {
     return false;
   }
 }
+/** Variable names that hold a secret: `GITHUB_TOKEN`, `DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`. */
+const SECRET_VARIABLE =
+  /(?:TOKEN|SECRET|PASSW(?:OR)?D|PASSPHRASE|CREDENTIAL|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CLIENT_?SECRET|CONNECTION_?STRING|_PAT$|^PAT$|(?:^|_)AUTH(?:_|$))/i;
 const SECRET_WORD =
   /(?:secret|credential|password|connection[-_]?strings?|(?:^|[-_])keys?(?:$|[-_])|listKeys|access-token|get-token|kubeconfig)/i;
 
@@ -1392,7 +1410,9 @@ function analyzeScript(
     if (
       found.program?.literal &&
       /(?:^|\/)find$/.test(found.program.text) &&
-      (segments[k + 1]?.[0]?.piped || segment[0]?.after?.includes("$(")) &&
+      (segments[k + 1]?.[0]?.piped ||
+        segment[0]?.after?.includes("$(") ||
+        segment.some((word) => word.redirect && word.writes && !/^\/dev\/null$/.test(word.text))) &&
       findReachesState(
         found.args.map((word) => word.text),
         context.cwds,
@@ -1433,6 +1453,13 @@ function analyzeScript(
  * else (another program's output, a copy, a body with expansions) is `opaque-script`. So is a
  * script that sets an npm script or a Git alias and runs it.
  */
+/** Programs that run a script file named among their arguments. */
+const LAUNCHERS = new Set([
+  ...["uv", "uvx", "npx", "pnpm", "yarn", "bunx", "bun", "deno", "tsx", "ts-node", "pipx"],
+  ...["poetry", "pipenv", "conda", "rye", "hatch", "pdm", "env", "time", "nohup", "timeout"],
+  ...["xargs", "script", "setsid", "nice", "caffeinate", "watch", "make", "just", "task"],
+]);
+
 /** The literal text a `cat` here-document or a literal `echo`/`printf` writes, or undefined. */
 function fileBody(segment: Word[]): string | undefined {
   const cmd = command(segment);
@@ -1444,8 +1471,14 @@ function fileBody(segment: Word[]): string | undefined {
     if (!doc.literal || (!doc.quoted && /[$`\\]/.test(doc.text))) return undefined;
     return doc.text;
   }
-  if ((name === "echo" || name === "printf") && cmd.args.every((word) => word.literal))
-    return producedText(segment.filter((word) => !(word.redirect && word.writes)));
+  // Only text written as it stands: a printf format with no directive or escape and no further
+  // arguments, an echo with no option and no backslash. Anything the program would expand is not
+  // known here.
+  if (!cmd.args.every((word) => word.literal)) return undefined;
+  const texts = cmd.args.map((word) => word.text);
+  if (name === "printf" && texts.length === 1 && !/[%\\]/.test(texts[0] ?? "")) return texts[0];
+  if (name === "echo" && texts.every((text) => !text.startsWith("-") && !text.includes("\\")))
+    return `${texts.join(" ")}\n`;
   return undefined;
 }
 
@@ -1486,6 +1519,16 @@ function writtenThenRun(
       run = lookup(file);
       kind = SHELL_NAMES.has(name) ? "shell" : "code";
     }
+    // A launcher runs a file it is given anywhere among its words (`uv run f`, `npx tsx f`,
+    // `deno run f`, `bun f`, `pnpm exec node f`): judged as code.
+    if (!run && cmd.program?.literal && LAUNCHERS.has(name))
+      for (const word of cmd.args) {
+        run = lookup(word);
+        if (run) {
+          kind = "code";
+          break;
+        }
+      }
     if (run) {
       // Unknown code run by the script could change anything, the policy state included.
       if (run.content === undefined || depth >= 4) rules.add("policy-state");
@@ -1680,6 +1723,19 @@ function analyzeCommand(
       }
     writeTargets(targets, opaque, scripts.join("\n"), context, rules);
   }
+  // Printing a variable whose name says it holds a secret shows the secret to the agent.
+  if (
+    cmd.program?.literal &&
+    /^(?:echo|printf|print)$/.test(programName) &&
+    cmd.args.some((word) =>
+      [...word.text.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some((match) =>
+        SECRET_VARIABLE.test(match[1] as string),
+      ),
+    )
+  ) {
+    rules.add("credential-read");
+    secretReads++;
+  }
   // find's name and path patterns are matched below its start directories (`findReachesState`
   // judges what an action could reach), not paths in the working directory.
   const findPatterns = new Set<Word>();
@@ -1693,9 +1749,16 @@ function analyzeCommand(
     if (!word.redirect && !context.runsText && /\s/.test(word.text)) continue;
     const text = word.text.replace(/^[A-Za-z_]\w*=/, "").replace(/^--?[\w-]+=/, "");
     if (!text) continue;
-    pathRules(text, rules, true);
+    // A read, or a word that only names a Git directory for git (`GIT_DIR=...`, `--git-dir=...`,
+    // `--work-tree=...`), reads no credential in Git's own files but its config.
+    const namesGitDir =
+      /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=|^--(?:git-dir|work-tree)=/.test(word.text) &&
+      !word.redirect;
+    const mode: boolean | "read" | "walk" =
+      !word.writes && (reading || namesGitDir) ? (walks && !namesGitDir ? "walk" : "read") : true;
+    pathRules(text, rules, mode);
     const resolved = resolutions(text, context.cwds);
-    for (const path of resolved) pathRules(path, rules, true);
+    for (const path of resolved) pathRules(path, rules, mode);
     // A target is matched as the shell would expand it (a glob, a variable read as `*`), and for a
     // delete or move a directory above the state counts too.
     // A word that is only an expansion (`"$Q"`) counts for a delete, a move or a redirection.
@@ -1916,7 +1979,8 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
     for (const target of [path, ...resolutions(path, cwds)]) {
       if (write) pathRules(target, rules, false);
       if (write && policyStatePath(target)) rules.add("policy-state");
-      if (sensitive(slashes(target))) rules.add("credential-read");
+      if (write ? sensitive(slashes(target)) : readSensitive(slashes(target)))
+        rules.add("credential-read");
     }
   };
   // A tool that reads or searches a tree (Grep, Glob, LS, a notebook) on a session directory, or a

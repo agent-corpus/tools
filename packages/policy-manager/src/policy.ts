@@ -25,6 +25,7 @@ const WRITE_TOOLS = new Set([
   "apply_patch",
 ]);
 
+import { credentialUse } from "./creduse.js";
 import { onRemote } from "./merged.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
@@ -472,6 +473,19 @@ function evaluateOnce(
   const command = request.input?.command ?? request.input?.cmd;
   if (SHELL_TOOLS.has(request.tool) && typeof command === "string" && tooManyWords(command))
     return result(request, "unknown", TOO_MANY_WORDS);
+  // A listed credential that only flows into a listed consumer: the request is the consumer.
+  const consumer =
+    SHELL_TOOLS.has(request.tool) && typeof command === "string"
+      ? credentialUse(command, profile.credentialUses ?? [])
+      : undefined;
+  if (consumer !== undefined) {
+    const inner = evaluateOnce(
+      { ...request, input: { ...request.input, command: consumer, cmd: undefined } },
+      ai,
+      profile,
+    );
+    return { ...inner, requestHash: requestHash(request), credentialUse: true };
+  }
   const decision = evaluateSteps(request, ai, profile);
   if (decision.decision !== "approve" || !SHELL_TOOLS.has(request.tool)) return decision;
   const floor = hardRules(request, { ...decision, decision: "human" }, profile.scratchRoots).find(
