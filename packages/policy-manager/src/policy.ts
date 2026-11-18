@@ -101,8 +101,27 @@ export function hash(value: unknown): string {
 /** Shell tools whose `description` only labels the command. Elsewhere it can be content. */
 export const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell"]);
 /** The correlation hash of a request, over its effect-relevant input only. */
+/** Input fields that name a file, for deciding whether a file tool depends on its cwd. */
+const PATH_FIELDS = ["file_path", "path", "notebook_path", "dir_path"];
 export function requestHash(request: Request): string {
-  if (!SHELL_TOOLS.has(request.tool)) return hash(request);
+  if (!SHELL_TOOLS.has(request.tool)) {
+    // What a file tool does depends on its paths, not on bookkeeping (a tool-use id, a
+    // description) or, when every path is absolute, on the session's working directory.
+    const paths = PATH_FIELDS.map((key) => request.input?.[key]).filter((v) => v !== undefined);
+    // Only file tools: elsewhere a description can be content (an MCP work item body).
+    if (!paths.length) return hash(request);
+    const input = Object.fromEntries(
+      Object.entries(request.input ?? {}).filter(
+        ([key]) => !/^(?:description|tool_use_id|toolUseId)$/.test(key),
+      ),
+    );
+    const absolute =
+      paths.length > 0 &&
+      paths.every(
+        (value) => typeof value === "string" && /^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(value),
+      );
+    return hash({ ...request, input, ...(absolute ? { cwd: "" } : {}) });
+  }
   const input = Object.fromEntries(
     Object.entries(request.input ?? {}).filter(([key]) => key !== "description"),
   );

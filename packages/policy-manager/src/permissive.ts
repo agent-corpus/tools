@@ -24,7 +24,7 @@ import {
 } from "./evidence.js";
 import { commandDecision } from "./flow.js";
 import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
-import { helperMatch } from "./helpers.js";
+import { committedScript, helperMatch } from "./helpers.js";
 import { mergedEvidence, onRemote, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result, words as shellWords } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -1973,6 +1973,14 @@ export function simpleDecision(
   const helper = helperMatch(profile.credentialHelpers, cwd, argv);
   if (helper.kind === "refused") return human(request, "sensitive", helper.reason);
   if (helper.kind === "match") {
+    // An earlier command in the script that may change files (a script run, an unknown program)
+    // could rewrite the helper after it was checked.
+    if (fill?.script.tainted)
+      return human(
+        request,
+        "sensitive",
+        "A credential helper after a command that may change files requires a person",
+      );
     if (
       stageIndex > 0 ||
       command.stdin !== undefined ||
@@ -2042,6 +2050,17 @@ export function simpleDecision(
       );
     const unsafe = code === undefined ? undefined : interpreterCodeRefusal(code);
     if (unsafe) return human(request, "unknown", unsafe);
+    // A script file runs without review only as committed on the default branch: an edited or
+    // untracked script goes to the classifier.
+    if (code === undefined && !args.includes("-m")) {
+      const script = args.find((arg) => !arg.startsWith("-"));
+      if (script !== undefined && committedScript(cwd, script) === false)
+        return human(
+          request,
+          "unknown",
+          "Running a script that is not the committed default-branch version requires review",
+        );
+    }
   }
   if (
     program === "xargs" &&

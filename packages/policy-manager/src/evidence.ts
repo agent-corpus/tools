@@ -143,7 +143,8 @@ export function inside(root: string, path: string): boolean {
   const rel = relative(root, path);
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
-const CREDENTIAL_CONFIG_DIRS = /(?:^|[\\/])\.config[\\/](?:gh|gcloud|op|hub)(?:[\\/]|$)/i;
+const CREDENTIAL_CONFIG_DIRS =
+  /(?:^|[\\/])\.config[\\/](?:gh|gcloud|op|hub|curl|git|pip|yarn|npm)(?:[\\/]|$)/i;
 
 /**
  * A file in a policy service session directory (`acp-<uid>-*`) other than its audit logs: the
@@ -164,14 +165,14 @@ export function sensitive(path: string): boolean {
     path
       .split(/[\\/]/)
       .some((part) =>
-        /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gcloud|\.docker|\.gnupg|\.password-store|\.git-credentials|\.vault-token|\.pgpass|\.my\.cnf|\.pypirc|\.npmrc|\.netrc|\.kube|(?:credentials?|secrets?)(?:\.(?:json|ya?ml|toml|ini|env|txt|xml|conf|cfg|properties))?|id_rsa|id_ed25519|id_ecdsa|kubeconfig|terraform\.tfstate(?:\..*)?|.*\.(?:pem|key|pfx|p12))$/i.test(
+        /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gcloud|\.docker|\.gnupg|\.password-store|\.git-credentials|\.vault-token|\.pgpass|\.my\.cnf|\.pypirc|\.npmrc|\.netrc|\.kube|(?:credentials?|secrets?)(?:\.(?:json|ya?ml|toml|ini|env|txt|xml|conf|cfg|properties))?|id_(?:rsa|dsa|ecdsa|ed25519|ecdsa_sk|ed25519_sk|xmss)|client_secret.*\.json|\.curlrc|curlrc|\.wgetrc|\.gitconfig|\.yarnrc(?:\.yml)?|kubeconfig|terraform\.tfstate(?:\..*)?|.*\.(?:pem|key|pfx|p12|p8|jks|keystore|ppk))$/i.test(
           part,
         ),
       )
   );
 }
 /** Files in a Git directory that can hold credentials (a token in a remote URL or extra header). */
-const GIT_SECRET = /^(?:config|config\.worktree|\.?credentials?(?:\..*)?|.*\.(?:pem|key))$/i;
+const GIT_SECRET = /^(?:config.*|\.?credentials?(?:\..*)?|.*\.(?:pem|key))$/i;
 /**
  * Whether reading `path` could read a credential. A Git directory is one only for the files that
  * can hold one (`config`, `config.worktree`, credentials), or when read as a tree (`whole`) from the
@@ -180,6 +181,8 @@ const GIT_SECRET = /^(?:config|config\.worktree|\.?credentials?(?:\..*)?|.*\.(?:
  */
 export function readSensitive(path: string, whole = false): boolean {
   if (!sensitive(path)) return false;
+  // A pattern (a glob or brace expansion) can name any file there: judged the strict way.
+  if (/[*?[{]/.test(path)) return true;
   const parts = path.split(/[\\/]/);
   const at = parts.findIndex((part) => part.toLowerCase() === ".git");
   if (at < 0) return true;

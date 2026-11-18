@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
-import { evaluate, hash } from "../src/policy.js";
+import { evaluate, hash, requestHash } from "../src/policy.js";
 import { parseProfile } from "../src/profile.js";
 import { PolicySession } from "../src/session.js";
 import type { Request } from "../src/types.js";
@@ -259,7 +259,7 @@ describe("files this session created", SLOW, () => {
     };
     expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
     write(join(wt, file), text);
-    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+    s.record({ requestHash: requestHash(r), event: "execution-result", status: "succeeded" });
   }
   const rm = (s: PolicySession, command: string, cwd = wt) =>
     s.review(bash(s, command, cwd), undefined, "PreToolUse");
@@ -285,7 +285,7 @@ describe("files this session created", SLOW, () => {
     const r = bash(s, "echo hi > made.txt");
     expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
     write(join(wt, "made.txt"), "hi\n");
-    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+    s.record({ requestHash: requestHash(r), event: "execution-result", status: "succeeded" });
     try {
       expect(rm(s, "rm made.txt").decision).toBe("approve");
     } finally {
@@ -388,7 +388,7 @@ describe("files this session created", SLOW, () => {
 
   test("worktree deletion the session cannot prove is classified, and follows the verdict", () => {
     const verdict = (r: Request, recoverable: boolean, confidence = 0.95) => ({
-      requestHash: hash(r),
+      requestHash: requestHash(r),
       category: "destructive" as const,
       confidence,
       recoverable,
@@ -426,7 +426,7 @@ describe("files this session created", SLOW, () => {
     const r = bash(s, command);
     expect(s.review(r, undefined, "PreToolUse").decision).toBe("approve");
     effect();
-    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+    s.record({ requestHash: requestHash(r), event: "execution-result", status: "succeeded" });
   }
   const user = (name: string) => join(wt, "user", name);
   const restore = (name: string, from: string) => {
@@ -516,7 +516,7 @@ describe("files this session created", SLOW, () => {
     const r = bash(s, command);
     s.review(r, undefined, "PreToolUse");
     effect();
-    s.record({ requestHash: hash(r), event: "execution-result", status: "succeeded" });
+    s.record({ requestHash: requestHash(r), event: "execution-result", status: "succeeded" });
   }
 
   // Many scripts, each judged with live Git evidence, which is slow on Windows runners.
@@ -784,7 +784,7 @@ describe("files this session created", SLOW, () => {
       expect(classified(command), command).toBe(false);
       const r = bash(session(), command);
       const verdict = {
-        requestHash: hash(r),
+        requestHash: requestHash(r),
         category: "destructive" as const,
         confidence: 0.99,
         recoverable: false,

@@ -2038,7 +2038,10 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
     const path = input.path ?? input.notebook_path ?? input.file_path ?? input.dir_path;
     const target = typeof path === "string" && path ? path : request.cwd;
     if (target && namesStateSecret(slashes(target), cwds, true)) rules.add("credential-read");
-    if (typeof path === "string") file(path, false);
+    // A tree read of a Git directory reads its config: judged the strict way.
+    if (typeof path === "string")
+      for (const at of [path, ...resolutions(path, cwds)])
+        if (sensitive(slashes(at))) rules.add("credential-read");
     return;
   }
   if (WRITE_TOOLS.has(request.tool) || ["Read", "view", "read_file"].includes(request.tool)) {
