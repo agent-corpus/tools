@@ -41,6 +41,59 @@ import {
   type Request,
 } from "./types.js";
 
+/**
+ * The files a Codex `apply_patch` changes, or undefined for a patch that does not follow the
+ * format: `*** Begin Patch`, then file sections, then `*** End Patch` (a trailing newline and
+ * CRLF line endings are fine). A section is `*** Add File: <path>` with `+` lines,
+ * `*** Delete File: <path>`, or `*** Update File: <path>` with an optional `*** Move to: <path>`
+ * and hunks: `@@` (with or without context text), then ` `, `+` and `-` lines, and an optional
+ * `*** End of File`. A path may be absolute, relative, a Windows path, or contain spaces.
+ */
+export function parsePatch(text: string): { targets: string[]; deletes: string[] } | undefined {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  while (lines.length && lines.at(-1) === "") lines.pop();
+  if (lines[0]?.trim() !== "*** Begin Patch" || lines.at(-1)?.trim() !== "*** End Patch")
+    return undefined;
+  const targets: string[] = [];
+  const deletes: string[] = [];
+  const header = (line: string, name: string) => {
+    const prefix = `*** ${name}: `;
+    if (!line.startsWith(prefix)) return undefined;
+    const path = line.slice(prefix.length).trim();
+    return path && !/[\0\r\n]/.test(path) ? path : "";
+  };
+  let section: "add" | "update" | "delete" | undefined;
+  let afterHeader = false;
+  for (const line of lines.slice(1, -1)) {
+    const add = header(line, "Add File");
+    const update = header(line, "Update File");
+    const remove = header(line, "Delete File");
+    const move = header(line, "Move to");
+    if (add === "" || update === "" || remove === "" || move === "") return undefined;
+    if (add !== undefined) {
+      targets.push(add);
+      section = "add";
+    } else if (update !== undefined) {
+      targets.push(update);
+      section = "update";
+      afterHeader = true;
+      continue;
+    } else if (remove !== undefined) {
+      deletes.push(remove);
+      section = "delete";
+    } else if (move !== undefined) {
+      if (section !== "update" || !afterHeader) return undefined;
+      targets.push(move);
+    } else if (section === "add") {
+      if (!line.startsWith("+")) return undefined;
+    } else if (section === "update") {
+      if (!/^(?:@@|[ +-]|\*\*\* End of File$)/.test(line) && line !== "") return undefined;
+    } else return undefined;
+    afterHeader = false;
+  }
+  return { targets, deletes };
+}
+
 export function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -582,17 +635,13 @@ function evaluateCore(request: Request, profile: Profile): Decision {
     return result(request, "unknown", "Execution directory differs from the reviewed directory");
   // Only the target decides a file tool: `content`, `old_string` and `new_string` are data.
   const file = input.file_path ?? input.notebook_path ?? input.path;
-  if (request.tool === "apply_patch" && typeof input.command === "string") {
-    const lines = input.command.split("\n");
-    if (lines[0] !== "*** Begin Patch" || lines.at(-1)?.trim() !== "*** End Patch")
-      return result(request, "unknown", "Unrecognized patch format");
-    const paths: string[] = [];
-    for (const line of lines) {
-      if (line.startsWith("*** Delete File: "))
-        return result(request, "destructive", "File deletion requires human approval");
-      for (const prefix of ["*** Add File: ", "*** Update File: ", "*** Move to: "])
-        if (line.startsWith(prefix)) paths.push(line.slice(prefix.length));
-    }
+  const patchText = input.command ?? input.patch ?? input.input;
+  if (request.tool === "apply_patch" && typeof patchText === "string") {
+    const patch = parsePatch(patchText);
+    if (!patch) return result(request, "unknown", "Unrecognized patch format");
+    if (patch.deletes.length)
+      return result(request, "destructive", "File deletion requires human approval");
+    const paths = patch.targets;
     if (!paths.length) return result(request, "unknown", "Patch has no verified target paths");
     const checks = paths.map((path) =>
       profile.mode === "permissive"

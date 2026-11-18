@@ -117,6 +117,69 @@ test("accepts structured patches and rejects protected and deletion targets", ()
     }).category,
   ).toBe("destructive");
 });
+describe("apply_patch: every documented form", () => {
+  const patch = (command: string, key = "command") => ({
+    ...request(""),
+    tool: "apply_patch",
+    input: { [key]: command },
+  });
+  const decide = (command: string, key?: string) => evaluate(patch(command, key));
+  test.each([
+    // A Codex patch from a live session: an absolute path and a bare `@@`.
+    () => `*** Begin Patch\n*** Update File: ${worktree}/src/a.ts\n@@\n-old\n+new\n*** End Patch`,
+    () => `*** Begin Patch\n*** Update File: ${worktree}/src/a.ts\n@@\n-old\n+new\n*** End Patch\n`,
+    () =>
+      "*** Begin Patch\n*** Update File: src/a.ts\n@@ function f() {\n x\n-old\n+new\n*** End of File\n*** End Patch",
+    () => "*** Begin Patch\r\n*** Add File: src/b c.ts\r\n+x\r\n*** End Patch\r\n",
+    () =>
+      "*** Begin Patch\n*** Update File: src/a.ts\n*** Move to: src/moved.ts\n@@\n-old\n+new\n*** End Patch",
+    () =>
+      `*** Begin Patch\n*** Add File: ${worktree}/src/c.ts\n+x\n*** Update File: src/a.ts\n@@\n x\n+y\n*** End Patch`,
+  ])("approved in the worktree %#", (make) => {
+    const d = decide(make());
+    expect(d.reason).not.toBe("Unrecognized patch format");
+    expect(d.decision).toBe("approve");
+  });
+  test("the patch may come as `patch` or `input`", () => {
+    const text = "*** Begin Patch\n*** Add File: src/d.ts\n+x\n*** End Patch\n";
+    expect(decide(text, "patch").decision).toBe("approve");
+    expect(decide(text, "input").decision).toBe("approve");
+  });
+  test("each target is judged: protected, outside the worktree, a Windows path", () => {
+    expect(
+      decide(
+        `*** Begin Patch\n*** Update File: ${worktree}/.codex/hooks.json\n@@\n+x\n*** End Patch\n`,
+      ).decision,
+    ).toBe("human");
+    expect(
+      decide(`*** Begin Patch\n*** Add File: ${repo}/src/x.ts\n+x\n*** End Patch`).decision,
+    ).toBe("human");
+    expect(
+      decide(
+        "*** Begin Patch\n*** Update File: src/a.ts\n*** Move to: .github/workflows/x.yml\n@@\n+x\n*** End Patch",
+      ).decision,
+    ).toBe("human");
+    expect(
+      decide("*** Begin Patch\n*** Add File: C:\\Users\\me\\x.ts\n+x\n*** End Patch").reason,
+    ).not.toBe("Unrecognized patch format");
+  });
+  test.each([
+    "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old",
+    "*** Update File: src/a.ts\n@@\n+new\n*** End Patch",
+    "*** Begin Patch\n*** Add File: src/a.ts\nno plus\n*** End Patch",
+    "*** Begin Patch\n*** Update File: \n@@\n+x\n*** End Patch",
+    "*** Begin Patch\n*** Move to: src/a.ts\n*** End Patch",
+    "*** Begin Patch\nrandom text\n*** End Patch",
+  ])("a malformed patch goes to a person: %j", (text) => {
+    const d = decide(text);
+    expect(d.decision).toBe("human");
+    expect(d.reason).toBe("Unrecognized patch format");
+  });
+  test("a deletion still needs a person", () =>
+    expect(
+      decide(`*** Begin Patch\n*** Delete File: ${worktree}/code.txt\n*** End Patch\n`).category,
+    ).toBe("destructive"));
+});
 test("AI confidence cannot override unknown effects or hard rules", () => {
   const r = request("python3 unknown.py");
   expect(evaluate(r, { requestHash: hash(r), category: "code-read", confidence: 1 }).decision).toBe(

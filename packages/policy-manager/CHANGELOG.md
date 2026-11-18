@@ -1,5 +1,12 @@
 # @agent-corpus/policy-manager
 
+## 0.11.3
+
+### Patch Changes
+
+- Fewer false asks, from a replay of real transcripts. `self-approve` is running the CLI: `npm view`/`info`/`ls`/`install` of the package, `command -v pm`, `v=$(npm view ...)`, and commit messages, PR bodies or source edits that mention `pm approve` no longer count; interpreter code counts when it imports the package or can start a process (words in string literals aside) and names the CLI, and the text-only `approve` check applies only where the script runs code the scan cannot follow. `pm --version`, `pm --help` and `pm help` print without a session service. `policy-state` needs a target that can reach the state: inline code that only calls file functions on literal non-state paths is data however much `acp` or path text it holds, `process.argv`/`sys.argv` words are read, a variable bound once to a literal (an assignment that has run, or a `for` list) is filled in, `cd`, `case`, `test` and loop lists name no target, find's name and path patterns and `-newermt`-style predicates are read-only, and here-documents fed to an interpreter are code, not shell. `gh api graphql` with an allow-listed literal mutation and variable fields (`-f t=$t` from a literal loop) is not `repo-delete`, while a `query` field with an expansion now is. A path under `.claude/worktrees/<name>/` is judged inside that worktree, and inline interpreter code is no longer checked as one protected path.
+- Codex `apply_patch` accepts every documented form: absolute, relative and Windows paths and paths with spaces in `Add`/`Update`/`Delete File` and `Move to` headers, `@@` with or without context, `*** End of File`, CRLF line endings, a trailing newline after `*** End Patch`, and the patch under `command`, `patch` or `input`. Each target is judged by the worktree, protected and temp rules; a malformed patch still goes to a person.
+
 ## 0.11.2
 
 ### Patch Changes

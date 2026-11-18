@@ -246,6 +246,13 @@ export function isProtectedPath(path: string): boolean {
     while (!existsSync(parent)) parent = dirname(parent);
     const root = canonical(git(parent, ["rev-parse", "--show-toplevel"]));
     const feature = featureCheckout(parent) === root;
+    // A path in `.claude/worktrees/<name>/` whose worktree is gone (or not yet made) is judged
+    // inside that worktree's own top level, as it would be while it exists; its default branch is
+    // unknown, so the worktree-code names stay protected.
+    const inside = /^\.claude\/worktrees\/[^/]+\/(.+)$/.exec(
+      relative(root, canonical(path)).replace(/\\/g, "/"),
+    )?.[1];
+    if (inside !== undefined) return protectedPath(inside);
     if (protectedPath(relative(root, canonical(path)), feature)) return true;
     // A protected name that is a symlink (`.claude -> config`) vanishes once the path is resolved,
     // so also judge the path as written, relative to the checkout it lives in.

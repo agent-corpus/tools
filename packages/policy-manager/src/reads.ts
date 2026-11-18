@@ -107,6 +107,9 @@ const FIND: Record<string, boolean> = {
   ...Object.fromEntries(
     ["-name", "-iname", "-path", "-ipath", "-type", "-maxdepth", "-mindepth", "-newer"]
       .concat(["-mtime", "-mmin", "-size", "-regex", "-iregex", "-perm", "-user", "-group"])
+      .concat(["-newermt", "-newerct", "-neweraa", "-newermm", "-newerBt", "-anewer", "-cnewer"])
+      .concat(["-atime", "-amin", "-ctime", "-cmin", "-links", "-inum", "-wholename"])
+      .concat(["-iwholename", "-lname", "-ilname", "-uid", "-gid", "-samefile"])
       .map((name) => [name, true]),
   ),
   ...Object.fromEntries(
@@ -551,7 +554,7 @@ const READ_ONLY: Record<string, ReadOnlySpec> = {
   uniq: { flags: /^-[cdui]+$/, valued: ["-f", "-s"], operands: false },
   find: {
     flags:
-      /^(?:-(?:name|iname|path|ipath|type|maxdepth|mindepth|newer|mtime|mmin|size|regex|iregex|perm|user|group|print|print0|o|or|a|and|not|prune|empty|true|false|depth|xdev)|!|\(|\))$/,
+      /^(?:-(?:name|iname|path|ipath|type|maxdepth|mindepth|newer|newer[acmBt][acmBt]|anewer|cnewer|mtime|mmin|atime|amin|ctime|cmin|links|inum|wholename|iwholename|lname|ilname|uid|gid|samefile|size|regex|iregex|perm|user|group|print|print0|o|or|a|and|not|prune|empty|true|false|depth|xdev|readable|writable|executable|nouser|nogroup|quit)|!|\(|\))$/,
     operands: true,
   },
 };

@@ -1867,8 +1867,12 @@ export function simpleDecision(
   // files a sed script reads or writes are.
   const operands = textOperands(program, args);
   const namePatterns = operands.patterns;
+  // Inline interpreter code is judged as code (interpreterCodeRefusal), not as one path.
+  const inlineCode = /^(?:node|nodejs|bun|deno|python[\d.]*|perl|ruby|php)$/.test(program)
+    ? args.findIndex((arg) => ["-c", "-e", "-p", "--eval", "--print"].includes(arg)) + 1
+    : 0;
   for (const [index, word] of args.entries()) {
-    if (operands.text.has(index)) continue;
+    if (operands.text.has(index) || (inlineCode > 0 && index === inlineCode)) continue;
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
     // echo and printf read no file, so only a path-like word is judged, by name.
     const pathLike = candidate.includes("/") || candidate.startsWith(".");

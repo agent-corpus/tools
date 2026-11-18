@@ -135,6 +135,8 @@ describe("any agent command that runs the CLI is self-approve, however the subco
   test.each([
     "pm --help",
     "pm --version",
+    "pm help",
+    "~/.local/bin/pm --version",
     "pm review-classifications",
     "pm review-classifications --since 2026-11-01T00:00:00Z",
     "policy-manager setup-hook-codex --dry-run",

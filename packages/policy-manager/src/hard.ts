@@ -93,7 +93,11 @@ const REASON_RULES: Array<[RegExp, HardRule]> = [
   [/^Forced worktree removal requires human approval$/, "remove-worktree-force"],
   [/^git clean deletes untracked files$/, "git-clean"],
   [/^Matches an organization human-approval pattern$/, "human-patterns"],
-  [/credential|secret|Printing the environment/i, "credential-read"],
+  // A protected-or-credential path decision is judged by its path below, not by its wording.
+  [
+    /^(?!.*protected or credential path).*(?:credential|secret|Printing the environment)/i,
+    "credential-read",
+  ],
 ];
 
 const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell", "powershell"]);
@@ -434,6 +438,8 @@ function ghApiFloor(words: Word[]): boolean {
   let method: string | undefined;
   let fields = false;
   const values: string[] = [];
+  /** Field words with an expansion: their text is not what gh sends. */
+  const computed: string[] = [];
   const start = texts.indexOf("api") + 1;
   for (let k = start; k < texts.length; k++) {
     const text = texts[k] as string;
@@ -448,9 +454,11 @@ function ghApiFloor(words: Word[]): boolean {
     else if (attached) method = attached[1];
     else if (/^(?:-[fF]|--field|--raw-field)$/.test(text)) {
       fields = true;
+      if (words[k + 1] && !words[k + 1]?.literal) computed.push(texts[k + 1] ?? "");
       values.push(texts[++k] ?? "");
     } else if (/^(?:--field|--raw-field)=|^-[fF]./.test(text)) {
       fields = true;
+      if (!words[k]?.literal) computed.push(text);
       values.push(text.replace(/^(?:--field=|--raw-field=|-[fF])/, ""));
     } else if (text === "--input" || text.startsWith("--input=")) {
       fields = true;
@@ -473,8 +481,11 @@ function ghApiFloor(words: Word[]): boolean {
       !(effective === "POST" && fields && variableReply(endpoint))
     );
   if (endpoint === "graphql") {
-    // A query read from a file cannot be judged; one without a mutation reads.
+    // A query read from a file cannot be judged; one without a mutation reads. A query with an
+    // expansion (`-f query="$Q"`) can be any mutation; variables (`-f id=$t`) are only values.
     if (values.some((value) => value === "@" || /^query=@/.test(value))) return true;
+    if (computed.some((text) => /^(?:(?:--field=|--raw-field=|-[fF])?query=)/.test(text)))
+      return true;
     for (const value of values) {
       const mutations = mutationFields(value);
       if (mutations === undefined) continue;
@@ -750,6 +761,144 @@ interface Context {
   runsText?: boolean;
   /** Absolute directories where a recursive rm is disposable (the profile's scratch roots). */
   scratchRoots: string[];
+}
+
+/** Shell variables the shell itself sets or changes: their values are never known here. */
+const SPECIAL_VARIABLE =
+  /^(?:IFS|PWD|OLDPWD|RANDOM|SRANDOM|SECONDS|LINENO|UID|EUID|PPID|HISTCMD|REPLY|OPTARG|OPTIND|PATH|HOME|CDPATH|ENV|PS\d|BASH\w*|ZSH\w*|EPOCH\w*|FUNCNAME|PIPESTATUS|argv|status|path|cdpath)$/;
+/** A value that is one word as it stands: no whitespace, glob, quote or expansion. */
+const ONE_WORD = /^[^\s*?[\]{}'"\\$`]+$/;
+/** The most combinations of loop values one command is judged with. */
+const MAX_VARIANTS = 16;
+
+/**
+ * The variables whose value is known at each segment: a name bound exactly once in the script,
+ * either by a plain assignment of a literal value (`F=/tmp/x/notes.md`) that has run whenever the
+ * segment runs (it starts the script or follows `;` or a newline at the top level, or every
+ * operator from it to the segment is `&&`), or by a `for NAME in <literal words>` loop whose body
+ * holds the segment. A script with `eval` or `source`, or a name bound any other way (`read`,
+ * `export`, `unset`, `${N:=x}`, a loop, arithmetic), has none.
+ */
+function knownVariables(
+  segments: Word[][],
+  script: string,
+  settled = new Set<string>(),
+): Array<Map<string, string[]>> {
+  const known = segments.map(() => new Map<string, string[]>());
+  if (
+    segments.some((segment) => {
+      const program = command(segment).program;
+      return !!program && (!program.literal || /^(?:eval|source|\.)$/.test(program.text));
+    })
+  )
+    return known;
+  const binders = new Map<string, number>();
+  const bind = (name: string) => binders.set(name, (binders.get(name) ?? 0) + 1);
+  for (const segment of segments) {
+    const first = segment[0];
+    if (first?.literal && /^(?:for|select)$/.test(first.text) && segment[1]) bind(segment[1].text);
+    // Assignments in command position (`F=x`, `F=x cmd`, `env F=x cmd`); `-f t=$t` is an argument.
+    for (const word of command(segment).assignments) {
+      const name = /^([A-Za-z_]\w*)(\+?)=/.exec(word.text);
+      if (name) bind(name[1] as string);
+      if (name?.[2]) binders.set(name[1] as string, 2);
+    }
+  }
+  const rebinds = (name: string) =>
+    new RegExp(
+      `\\b(?:read|unset|export|local|declare|typeset|readonly|let|mapfile|readarray|getopts|vared|zparseopts|integer|float)\\b[^\\n;&|]*\\b${name}\\b|\\bprintf?\\s+(?:-\\S+\\s+)*-v\\s*${name}\\b|\\$\\{${name}:?[=?]|\\(\\([^)]*\\b${name}\\s*(?:[-+*/%]?=|\\+\\+|--)|\\b${name}\\s*\\[`,
+    ).test(script);
+  const usable = (name: string) =>
+    binders.get(name) === 1 && !SPECIAL_VARIABLE.test(name) && !rebinds(name);
+  const simple = (after: string | undefined) => !after || /^[;\n]+$/.test(after);
+  for (const [j, segment] of segments.entries()) {
+    const first = segment[0];
+    if (!first) continue;
+    // `for NAME in a b c`: inside the body, NAME is one of the words.
+    if (first.literal && first.text === "for" && segment[2]?.text === "in" && segment[2].literal) {
+      const name = segment[1]?.text ?? "";
+      const values = segment.slice(3);
+      if (
+        !usable(name) ||
+        !values.length ||
+        values.some(
+          (word) => !word.literal || !ONE_WORD.test(word.text) || word.text.startsWith("-"),
+        )
+      )
+        continue;
+      for (let k = j + 1; k < segments.length; k++) {
+        const head = segments[k]?.[0];
+        if (head?.literal && head.text === "done" && head.depth === first.depth) break;
+        known[k]?.set(
+          name,
+          values.map((word) => word.text),
+        );
+      }
+      continue;
+    }
+    // A segment of plain assignments only, at the top level.
+    if (command(segment).program || segment.some((word) => word.depth || word.redirect)) continue;
+    for (const word of segment) {
+      const match = /^([A-Za-z_]\w*)=(.*)$/s.exec(word.text);
+      if (!match || !word.literal) continue;
+      const name = match[1] as string;
+      if (!usable(name)) continue;
+      let chained = true;
+      // Assigned before anything reads it, and known wherever it is read afterwards: the value
+      // is judged at each use, so the assignment itself names no target.
+      const read = new RegExp(`\\$\\{?${name}\\b`);
+      if (
+        simple(first.after) &&
+        !segments.slice(0, j).some((earlier) => earlier.some((w) => read.test(w.text)))
+      )
+        settled.add(name);
+      for (let k = j + 1; k < segments.length; k++) {
+        const here = segments[k] as Word[];
+        const after = here[0]?.after;
+        chained &&= after === "&&" || after === "$(";
+        if (!simple(first.after) && (!chained || here.some((w) => w.depth))) break;
+        known[k]?.set(name, [match[2] as string]);
+      }
+    }
+  }
+  return known;
+}
+
+/**
+ * The segment with each word whose expansions are all known variables filled in, once per
+ * combination of values (at most MAX_VARIANTS), or the segment as it is. An unquoted expansion is
+ * filled in only with values that stay one word.
+ */
+function filled(segment: Word[], known: Map<string, string[]>): Word[][] {
+  if (!known.size) return [segment];
+  let variants: Word[][] = [[]];
+  for (const word of segment) {
+    let options = [word];
+    if (!word.literal && !word.heredoc && /\$/.test(word.text)) {
+      const parts = word.text.split(/(\$\{\w+\}|\$[A-Za-z_]\w*)/);
+      let texts: string[] | undefined = [""];
+      for (const [index, part] of parts.entries()) {
+        if (index % 2 === 0) {
+          if (part.includes("$") || part.includes("`")) texts = undefined;
+        } else {
+          const values = known.get(part.replace(/^\$\{?|\}$/g, ""));
+          if (!values || (word.bare && values.some((value) => !ONE_WORD.test(value))))
+            texts = undefined;
+          else texts = texts?.flatMap((text) => values.map((value) => text + value));
+        }
+        if (!texts) break;
+        if (index % 2 === 0) texts = texts.map((text) => text + part);
+      }
+      if (texts && texts.length <= MAX_VARIANTS)
+        options = texts.map((text) => {
+          const { bare: _bare, ...rest } = word;
+          return { ...rest, text, literal: true };
+        });
+    }
+    variants = variants.flatMap((variant) => options.map((option) => [...variant, option]));
+    if (variants.length > MAX_VARIANTS) return [segment];
+  }
+  return variants;
 }
 
 /** Programs that delete or move their operands: a directory above the state counts for them. */
@@ -1137,6 +1286,19 @@ function stdinScript(
   textRules(text, [...context.cwds][0] ?? "", rules);
 }
 
+/**
+ * Code names the policy service's secrets (the token, grants, socket: anything in a session
+ * directory but its audit logs) when a string literal that is a whole path could be one. A path
+ * inside longer text (source being edited, a message) is data.
+ */
+function codeSecrets(code: string, context: Context, rules: Set<HardRule>): void {
+  for (const match of code.matchAll(/(["'`])((?:~\/|\/)[^\s"'`]{1,4096})\1/g))
+    if (namesStateSecret(match[2] as string, context.cwds, false)) {
+      rules.add("credential-read");
+      return;
+    }
+}
+
 function analyzeScript(
   script: string,
   context: Context,
@@ -1147,6 +1309,16 @@ function analyzeScript(
   // Here-document bodies are data unless something in the script runs text as code.
   const runs = !complete || segments.some((segment) => runsText(command(segment)));
   if (runs) context.runsText = true;
+  // Only a shell (or a runner that may start one) reads a here-document as shell commands; one
+  // fed to an interpreter, or written to a file an interpreter runs, is code: judged by
+  // `codeTouchesState` and for the paths it names.
+  const runsShell =
+    !complete ||
+    segments.some((segment) => {
+      const program = command(segment).program;
+      const name = (program?.text.split(/[\\/]/).pop() ?? "").replace(/\d+(?:\.\d+)*$/, "");
+      return !!program && (!program.literal || SHELL_NAMES.has(name) || RUNNERS.has(name));
+    });
   for (const segment of segments)
     for (const word of segment) {
       if (word.heredoc) continue;
@@ -1155,16 +1327,19 @@ function analyzeScript(
     }
   // A script the scanner could not read fully is judged on its words alone.
   if (!complete) opaqueGitRules(context.words, true, rules);
+  const settled = new Set<string>();
+  const known = knownVariables(segments, script, settled);
   for (const [k, segment] of segments.entries()) {
-    analyzeCommand(command(segment), segment, context, rules, depth);
+    for (const variant of filled(segment, known[k] ?? new Map()))
+      analyzeCommand(command(variant), variant, context, rules, depth, settled);
     stdinScript(segments, k, context, rules, depth);
     // A here-document fed to a shell, or in a script that runs text (`cat <<EOF | sh`), is code.
     for (const doc of segment.filter((word) => word.heredoc)) {
       if (depth >= 4) continue;
-      if (runs) {
+      if (runs && runsShell) {
         analyzeScript(doc.text, context, rules, depth + 1);
         textRules(doc.text, [...context.cwds][0] ?? "", rules);
-      }
+      } else if (runs) codeSecrets(doc.text, context, rules);
       if (doc.quoted) continue;
       // Fail closed on an unquoted body: besides its substitutions as the scanner reads them, read
       // what follows every `$(` and backtick as a script, so text the scanner might mis-read
@@ -1188,6 +1363,7 @@ function analyzeCommand(
   context: Context,
   rules: Set<HardRule>,
   depth: number,
+  settled = new Set<string>(),
 ): void {
   // Every word could name a file: arguments, redirect targets, assignment values. A here-document
   // body, and an argument with whitespace in it (a message, a PR body), is text, not a path,
@@ -1195,8 +1371,16 @@ function analyzeCommand(
   // The policy service's state may be read by a read-only program; anything else that names it
   // (a write, a move, a delete, a redirection into it, an unknown program) goes to a person.
   const programName = cmd.program?.text.split(/[\\/]/).pop() ?? "";
+  // `cd` and `pushd` change no file (what runs there is judged in that directory), and the words
+  // of a `for NAME in ...` list are values (judged where `$NAME` is used), not operands.
+  const loopList = !!segment[0]?.literal && /^(?:for|select)$/.test(segment[0].text);
   const reading =
-    !!cmd.program?.literal && readOnly([programName, ...cmd.args.map((word) => word.text)]);
+    loopList ||
+    (!!cmd.program?.literal &&
+      (/^(?:cd|pushd|case|\[|\[\[|test|echo|:|true|false|break|continue|sleep|seq|wait)$/.test(
+        programName,
+      ) ||
+        readOnly([programName, ...cmd.args.map((word) => word.text)])));
   const argTexts = cmd.args.map((word) => word.text);
   // A recursive permission or owner change reaches everything below its operand, so a directory
   // above the state counts as for a delete.
@@ -1260,13 +1444,36 @@ function analyzeCommand(
   // Inline interpreter code (`python3 -c`, `perl -e`, `node -e`, a here-document) that could
   // delete, move or write the state.
   if (cmd.program?.literal && INTERPRETERS.has(programName)) {
-    const code = [
-      ...cmd.args.filter((_, k) =>
-        /^(?:-c|-e|-E|-p|-r|--eval|--print)$/.test(cmd.args[k - 1]?.text ?? ""),
-      ),
-      ...segment.filter((word) => word.heredoc),
-    ].map((word) => word.text);
-    if (code.some((text) => codeTouchesState(text, context.cwds))) rules.add("policy-state");
+    // The literal words after the code are `process.argv[1..]` (node -e) or `sys.argv[1..]`
+    // (python -c, python - with the code on standard input).
+    const words = (from: number) =>
+      cmd.args.slice(from).map((word) => (word.literal ? word.text : undefined));
+    const inline = cmd.args.findIndex((_, k) =>
+      /^(?:-c|-e|-E|-p|-r|--eval|--print)$/.test(cmd.args[k - 1]?.text ?? ""),
+    );
+    const dash = cmd.args.findIndex((word) => word.text === "-");
+    const codes: Array<[string, Array<string | undefined>]> = [
+      ...cmd.args
+        .filter((_, k) => /^(?:-c|-e|-E|-p|-r|--eval|--print)$/.test(cmd.args[k - 1]?.text ?? ""))
+        .map((word): [string, Array<string | undefined>] => [
+          word.text,
+          inline >= 0 && /^(?:node|nodejs|python[\d.]*)$/.test(programName)
+            ? words(inline + 1)
+            : [],
+        ]),
+      ...segment
+        .filter((word) => word.heredoc)
+        .map((word): [string, Array<string | undefined>] => [
+          word.text,
+          dash >= 0 && /^python[\d.]*$/.test(programName) ? words(dash + 1) : [],
+        ]),
+    ];
+    if (
+      codes.some(([text, argv]) =>
+        codeTouchesState(text, context.cwds, { argv, interpreter: programName }),
+      )
+    )
+      rules.add("policy-state");
   }
   // awk runs commands through `system(...)` and pipes (`print | "cmd"`, `"cmd" | getline`): a
   // literal command is judged like `sh -c`, anything else is opaque.
@@ -1311,8 +1518,16 @@ function analyzeCommand(
       }
     writeTargets(targets, opaque, scripts.join("\n"), context, rules);
   }
+  // find's name and path patterns are matched below its start directories (`findReachesState`
+  // judges what an action could reach), not paths in the working directory.
+  const findPatterns = new Set<Word>();
+  if (programName === "find" && cmd.program?.literal)
+    cmd.args.forEach((word, k) => {
+      if (/^-(?:i?name|i?path|i?wholename|i?regex|i?lname)$/.test(cmd.args[k - 1]?.text ?? ""))
+        findPatterns.add(word);
+    });
   for (const word of segment) {
-    if (word.heredoc) continue;
+    if (word.heredoc || findPatterns.has(word)) continue;
     if (!word.redirect && !context.runsText && /\s/.test(word.text)) continue;
     const text = word.text.replace(/^[A-Za-z_]\w*=/, "").replace(/^--?[\w-]+=/, "");
     if (!text) continue;
@@ -1324,6 +1539,10 @@ function analyzeCommand(
     // A word that is only an expansion (`"$Q"`) counts for a delete, a move or a redirection.
     const target = stateText(text, word.literal);
     const opaque = !word.literal && !/[^*/]/.test(target);
+    // A segment of assignments runs nothing: a value that is only an expansion (`B=$(gh ...)`,
+    // `X=$Y`) names no file; its command is judged on its own, and its uses where they are.
+    if (!cmd.program && opaque) continue;
+    if (!cmd.program && settled.has(/^([A-Za-z_]\w*)=/.exec(word.text)?.[1] ?? "")) continue;
     if (
       (word.writes || (!word.redirect && !reading)) &&
       word !== cmd.program &&

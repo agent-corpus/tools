@@ -1,6 +1,7 @@
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, posix } from "node:path";
+import { maskStrings, withoutStrings } from "./clirun.js";
 import { canonical, resolveWord, tempRoots } from "./evidence.js";
 
 /**
@@ -530,8 +531,12 @@ function callArgs(code: string, start: number, parens: boolean): string[] | unde
  * `pathlib.Path(<literal>)`, `open(<literal>[, mode])` (the file it opens), or `os.path.join` of
  * literals only. Anything computed (a variable, `Path.cwd()`, concatenation, an f-string) is not.
  */
-function literalPath(text: string): string | undefined {
+function literalPath(text: string, argv: Array<string | undefined> = []): string | undefined {
   const expr = text.trim();
+  // `process.argv[1]` (node -e) and `sys.argv[1]` (python -c, python -) are the first word after
+  // the code, when the shell passed a literal one.
+  const arg = /^(?:process\s*\.\s*argv|sys\s*\.\s*argv)\s*\[\s*([1-9])\s*\]$/.exec(expr);
+  if (arg) return argv[Number(arg[1]) - 1];
   // The arguments of a call that is the whole expression: `Path(x)`, not `Path(x).read_text()`.
   const call = (pattern: RegExp) => {
     const match = pattern.exec(expr);
@@ -556,17 +561,33 @@ function literalPath(text: string): string | undefined {
 }
 
 /**
- * Variables assigned exactly once, to a literal path (`literalPath`): `p = '/x'`,
- * `const p = "/x"`, `p = Path('/x')`, `f = open('/x', 'w')`, `p = os.path.join('/tmp', 'x')`.
+ * Variables whose every assignment is a literal path (`literalPath`): `p = '/x'`,
+ * `const p = "/x"`, `p = Path('/x')`, `f = open('/x', 'w')`, `p = os.path.join('/tmp', 'x')`,
+ * `f = process.argv[1]` with a literal word there. The value is one of them wherever it is read. A
+ * name that is also bound another way (a parameter, a loop or `with ... as` target, destructuring,
+ * an augmented assignment) has no known value.
  */
-function literalVariables(code: string): Map<string, string | undefined> {
-  const found = new Map<string, string | undefined>();
+function literalVariables(
+  code: string,
+  argv: Array<string | undefined> = [],
+): Map<string, string[] | undefined> {
+  const found = new Map<string, string[] | undefined>();
   for (const line of code.split(/[\n;]/)) {
     const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)(.*)$/.exec(line);
     if (!match) continue;
     const [, name = "", value = ""] = match;
-    found.set(name, found.has(name) ? undefined : literalPath(value));
+    const path = literalPath(value, argv);
+    const known = found.has(name) ? found.get(name) : [];
+    found.set(name, known && path !== undefined ? [...known, path] : undefined);
   }
+  const bound = (list: string) => {
+    for (const name of list.split(/[\s,()[\]{}*=:.]+/))
+      if (/^[A-Za-z_]\w*$/.test(name)) found.set(name, undefined);
+  };
+  for (const match of code.matchAll(
+    /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|\b(\w+)\s*,\s*\w+\s*=(?!=)|\b\w+\s*,\s*(\w+)\s*=(?!=)/g,
+  ))
+    for (const group of match.slice(1)) if (group) bound(group);
   return found;
 }
 
@@ -576,20 +597,28 @@ function literalVariables(code: string): Map<string, string | undefined> {
  * `join`, an f-string, a variable not assigned a literal once, a `listdir`/`walk` result): the
  * state lies in the temp directory, so a computed path fails closed.
  */
-function callsReachState(code: string, cwds: string[]): boolean {
-  const vars = literalVariables(code);
+function callsReachState(
+  code: string,
+  cwds: string[],
+  argv: Array<string | undefined> = [],
+  interpreter = "",
+): boolean {
+  const vars = literalVariables(code, argv);
   const aliases = moduleAliases(code);
-  const value = (arg: string): string | undefined => {
+  const values = (arg: string): string[] | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
     if (name) return vars.get(name);
-    return literalPath(arg);
+    const path = literalPath(arg, argv);
+    return path === undefined ? undefined : [path];
   };
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
-    const path = value(arg);
-    return path === undefined || namesState(path, cwds, true);
+    const paths = values(arg);
+    return paths === undefined || paths.some((path) => namesState(path, cwds, true));
   };
-  for (const match of code.matchAll(FILE_CALL)) {
+  // Calls are found outside string literals (a message or source text being edited is data);
+  // their arguments are read from the code itself.
+  for (const match of maskStrings(code, interpreter).matchAll(FILE_CALL)) {
     const [whole, receiver, name = "", opener = ""] = match;
     const at = (match.index ?? 0) + whole.length;
     const parens = opener.includes("(");
@@ -665,6 +694,43 @@ function callsReachState(code: string, cwds: string[]): boolean {
   return false;
 }
 
+/**
+ * Code that can start a process or evaluate a string, so names in its text may become commands or
+ * file calls this cannot read.
+ */
+const RUNS_CODE =
+  /child_process|subprocess|\bspawn|\bexec(?:Sync|File\w*|[lv]p?e?)?\s*\(|\bsystem\s*[("'$]|\bpopen|Popen|\bpty\b|\bcommands\s*\.|shell_exec|passthru|proc_open|\bqx\b|%x[({[]|\bIO\s*\.\s*popen|Bun\s*\.|Deno\s*\.|\beval\b|\bFunction\s*\(|\bvm\s*\.|\bWorker\s*\(|__import__|importlib|\bgetattr\s*\(|\bcompile\s*\(|\brequire\s*\(\s*[^'"\s)]|\bimport\s*\(\s*[^'"\s)]|\bsend\s*\(|call_user_func|\bos\s*\.\s*(?:system|popen|exec|spawn|posix_spawn|fork)|\bReflect\b|\.\s*(?:call|apply|bind)\s*\(/;
+/** A module member that is not called (`const r = fs.rmSync`) or a computed one (`fs["rmSync"]`). */
+const UNCALLED_MEMBER =
+  /\b(?:fs|fsp|os|shutil|promises|pathlib|FileUtils|File|Dir|IO|Pathname)\s*(?:\.\s*\w+\b(?!\s*[.(\w])|\[)|\bimport\s+\*|\buse\s+File::|\brequire\s+["']fileutils/;
+/** Names that change files: an imported one is a file call this only follows by its own name. */
+const FILE_NAME =
+  /^(?:rm|unlink|rmdir|remove|move|copy|cp|mv|rename|replace|truncate|symlink|link|chmod|chown|chdir|touch|open|fopen|write|append|output|empty|ensure|mk|copytree|copyfile|copy2|rmtree|removedirs|renames)/i;
+/**
+ * Whether code reaches a file function other than by a call `callsReachState` reads: an uncalled
+ * or computed module member, a wildcard import, or a file function imported under another name, or
+ * one whose name is not a bare call read there (`const { rm } = require("fs/promises")`,
+ * `from os import remove`).
+ */
+function hiddenFileCall(code: string): boolean {
+  if (UNCALLED_MEMBER.test(code)) return true;
+  const lists = [
+    ...code.matchAll(/\bimport\s*(?:\w+\s*,\s*)?\{([^}]*)\}\s*from/g),
+    ...code.matchAll(/(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:require|await\s+import)\s*\(/g),
+    ...code.matchAll(/\bfrom\s+[\w.]+\s+import\s+\(?([\w\s,]+)\)?/g),
+  ];
+  for (const match of lists)
+    for (const item of (match[1] ?? "").split(",")) {
+      const [name = "", local = name] = item
+        .trim()
+        .split(/\s+as\s+|\s*:\s*/)
+        .map((part) => part.trim());
+      if (!name || !FILE_NAME.test(name)) continue;
+      if (local !== name || !BARE_CALLS.test(name)) return true;
+    }
+  return false;
+}
+
 /** The code with each `os.path.join` of literals only replaced by its joined path, quoted. */
 function joinedLiterals(code: string): string {
   let out = "";
@@ -692,11 +758,31 @@ function joinedLiterals(code: string): string {
  * glob matching one, or a path built at run time (`f'/tmp/{x}'`, `'/tmp/' + x`, `"$TMPDIR/$x"`,
  * read as a glob). A literal path into another directory in temp (`/tmp/pm-x/notes.md`) is not.
  */
-export function codeTouchesState(code: string, cwds: Iterable<string>): boolean {
+export function codeTouchesState(
+  code: string,
+  cwds: Iterable<string>,
+  options: { argv?: Array<string | undefined>; interpreter?: string } = {},
+): boolean {
   if (code.length > MAX_CODE) return true;
-  if (/\bacp/i.test(code)) return true;
   const roots = [...cwds];
-  if (callsReachState(code, roots.length ? roots : ["/"])) return true;
+  if (callsReachState(code, roots.length ? roots : ["/"], options.argv, options.interpreter))
+    return true;
+  // Code that only calls the file functions read above, each on a literal path that is not the
+  // state, cannot change the state: text that names `acp`, or a path, is data there. Code that
+  // starts processes, evaluates strings, or reaches a file function some other way (an imported
+  // name, a reference that is not a call) is judged by everything it names.
+  const bare = withoutStrings(code, options.interpreter);
+  if (
+    !RUNS_CODE.test(bare) &&
+    !(
+      code.includes("`") &&
+      !/^(?:node|nodejs|deno|bun|python[\d.]*)$/i.test(options.interpreter ?? "")
+    ) &&
+    !hiddenFileCall(bare) &&
+    !TEMP_LOOKUP.test(bare)
+  )
+    return false;
+  if (/\bacp/i.test(code)) return true;
   // Dynamic import or attribute indirection hides which call runs (`__import__`, `getattr`,
   // `require(x)`, `eval`, `Function`): with a temp lookup or a path built at run time, fail closed.
   if (
