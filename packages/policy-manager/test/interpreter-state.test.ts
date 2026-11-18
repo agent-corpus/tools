@@ -130,8 +130,8 @@ describe("string methods are not file calls", () => {
     expect(codeTouchesState(code, [worktree])).toBe(false);
   });
   test.each([
-    "Path(name).replace(target)\n",
-    "os.replace(name, other)\n",
+    "name = sys.argv[1]\nPath(name).replace(target)\n",
+    "name = os.environ['X']\nos.replace(name, other)\n",
     "os.rename(name, '/tmp/pm-x/b')\n",
     "Path(name).rename('/tmp/pm-x/b')\n",
   ])("a path method or module call with a computed path fails closed: %s", (code) => {

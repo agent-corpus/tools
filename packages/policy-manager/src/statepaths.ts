@@ -434,6 +434,27 @@ export function findReachesState(args: string[], cwds: Iterable<string>): boolea
 const TEMP_LOOKUP =
   /\$\{?(?:TMPDIR|TMP|TEMP)\b|environ\b[^\n]{0,40}\b(?:TMPDIR|TMP|TEMP)\b|process\.env\.(?:TMPDIR|TMP|TEMP)\b|ENV\[\s*["'](?:TMPDIR|TMP|TEMP)|getenv\(\s*["'](?:TMPDIR|TMP|TEMP)|gettempdir|tempfile\.tempdir|os\.tmpdir|tmpdir\(\)|Dir\.tmpdir|sys_get_temp_dir|GetTempPath/;
 
+/**
+ * Code that can produce a temp path for a file call this cannot read: temp named outright, a
+ * parent step (`..`), paths read from outside the code (argv, environment, standard input, a
+ * directory listing, a glob), or text decoded or rebuilt at run time.
+ */
+const TEMP_HINT =
+  /tmp|temp|\/var|\/private|folders|acp|\.\.|argv|environ|process\.env|getenv|ENV\[|\$\{?\w|stdin|\binput\s*\(|readline|listdir|scandir|walk|readdir|\bglob\b|\bchr\s*\(|fromCharCode|base64|b64|fromhex|codecs|decode|unhexlify|pack\s*\(|\\x[0-9a-f]{2}|\\u[0-9a-f]{4}|\\[0-7]{3}|%[0-9a-f]{2}|\[::-1\]|reverse|rot13|translate|maketrans|expandvars|\bbytes\s*\(|bytearray|%c|\bord\s*\(|struct|marshal|pickle|zlib|gzip|bz2|lzma|Buffer\.from|atob|unescape/i;
+
+/**
+ * The path-like quoted strings in the code (short, no spaces), joined in order, so a name split
+ * across literals (`'/t' + 'mp'`) reads whole. Text being written (source, messages) is left out.
+ */
+function joinedStrings(code: string): string {
+  let out = "";
+  for (const match of code.matchAll(/'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|`([^`]*)`/g)) {
+    const text = match[1] ?? match[2] ?? match[3] ?? "";
+    if (text.length <= 200 && !/\s/.test(text)) out += text;
+  }
+  return out;
+}
+
 /** Longest inline code judged; longer code fails closed. */
 const MAX_CODE = 100_000;
 
@@ -635,14 +656,20 @@ function callsReachState(
     const path = literalPath(arg, argv);
     return path === undefined ? undefined : [path];
   };
+  // A path this cannot read can only lead to the state if the code can produce a temp path: it
+  // names temp (also split across literals: '/t' + 'mp'), reads paths from outside (argv, the
+  // environment, standard input, a listing), or decodes text. Without any of that, every string
+  // the path is built from is visible here and none points at temp.
+  const hinted =
+    TEMP_HINT.test(withoutStrings(code, interpreter)) ||
+    // In a string, `${name}` is template text (data) unless the name itself points at temp.
+    TEMP_HINT.test(joinedStrings(code).replace(/\$\{?(\w+)\}?/g, "$1"));
   const reaches = (arg: string | undefined) => {
-    if (arg === undefined) return true;
+    if (arg === undefined) return hinted;
     const paths = values(arg);
     // A session directory by its name counts too, also one not created yet or another user's.
-    return (
-      paths === undefined ||
-      paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true))
-    );
+    if (paths === undefined) return hinted;
+    return paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true));
   };
   // Calls are found outside string literals (a message or source text being edited is data);
   // their arguments are read from the code itself.
@@ -686,7 +713,7 @@ function callsReachState(
       // A glob only finds names; `open`/`fopen`/`File.write` write only in a write mode.
       if (name === "glob") continue;
       const args = callArgs(code, at, parens);
-      if (!args) return true;
+      if (!args) return hinted;
       if (name === "write") {
         if (receiver !== "File" && receiver !== "IO") continue;
       } else {
@@ -715,7 +742,7 @@ function callsReachState(
       continue;
     }
     const args = callArgs(code, at, parens);
-    if (!args) return true;
+    if (!args) return hinted;
     const count = TWO_PATHS.has(name) ? 2 : 1;
     for (let i = 0; i < count; i++) if (reaches(args[i])) return true;
   }

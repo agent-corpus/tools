@@ -1,5 +1,11 @@
 # @agent-corpus/policy-manager
 
+## 0.12.1
+
+### Patch Changes
+
+- Inline interpreter code that edits files through a variable or function parameter (`def edit(path): open(b + path, "w")`, `global s`) no longer counts as reaching the policy service state when nothing in the code can produce a temp path. A path this cannot read still fails closed when the code names temp (also split across literals), reads paths from outside (argv, environment, standard input, a listing or glob), or decodes or rebuilds text at run time.
+
 ## 0.12.0
 
 ### Minor Changes
