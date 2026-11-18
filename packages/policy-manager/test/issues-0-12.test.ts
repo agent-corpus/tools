@@ -271,6 +271,14 @@ describe("review nits", () => {
         `GIT_DIR=${gitDir} git --work-tree=${repo} checkout -- AGENTS.md`,
         `export GIT_DIR=${gitDir}; pushd ${repo}; git stash`,
         `git -C ${repo} checkout -- AGENTS.md`,
+        `GIT_DIR=${gitDir} git '-C' ${repo} stash`,
+        `GIT_DIR=${gitDir} git "-C" ${repo} stash`,
+        `GIT_DIR=${gitDir} git \\\n  -C ${repo} stash`,
+        `GIT_DIR=${gitDir} git -C${repo} stash`,
+        `GIT_DIR=${gitDir} git '--work-tree'=${repo} stash`,
+        `GIT_DIR=${gitDir} git -c core.x=1 -C ${repo} stash`,
+        `GIT_DIR=${gitDir} env git -C ${repo} stash`,
+        `GIT_DIR=${gitDir} git status; cd '${repo}'; git stash`,
       ])
         expect(await decide(bash(command, wt)), command).not.toBe("eng");
     },

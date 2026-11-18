@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { parseShell } from "./shell.js";
 
 /** Path separators: `/`, and `\` only on Windows; on POSIX `\` is a file-name character. */
 const SEPARATOR = process.platform === "win32" ? /[\\/]/ : /\//;
@@ -659,26 +660,57 @@ export function gitEnvConfined(
  * name. Otherwise the variables are an environment override as before.
  */
 export function gitEnvScriptSafe(script: string, cwd: string): boolean {
-  if (/\bgit\b[^\n;&|]*\s(?:-C\b|--work-tree\b|--git-dir\b|--namespace\b)/.test(script))
-    return false;
-  if (/\b(?:pushd|popd)\b/.test(script)) return false;
+  // Judge the words the shell will actually pass (quotes removed, line continuations joined). A
+  // script the scanner cannot flatten into plain commands (loops, conditionals, background jobs,
+  // unreadable words) gets no exception.
+  const pipelines = parseShell(script);
+  if (!pipelines) return false;
   const tops = new Set<string | undefined>();
-  for (const match of script.matchAll(/\b(GIT_DIR|GIT_WORK_TREE)=("[^"]*"|'[^']*'|[^\s;&|]+)/g))
-    tops.add(
-      featureGitTop(match[1] as string, (match[2] as string).replace(/^(["'])(.*)\1$/, "$2"), cwd),
-    );
+  const commands = pipelines.flat();
+  const note = (name: string, value: string) => {
+    if (name === "GIT_DIR" || name === "GIT_WORK_TREE") tops.add(featureGitTop(name, value, cwd));
+  };
+  for (const command of commands) {
+    if (command.subs.length) return false;
+    for (const [name, value] of command.env) note(name, value);
+    const name = basename(command.argv[0] ?? "");
+    if (name === "export")
+      for (const word of command.argv.slice(1)) {
+        const at = word.indexOf("=");
+        if (at > 0) note(word.slice(0, at), word.slice(at + 1));
+      }
+  }
   const [top] = tops;
   if (tops.size !== 1 || !top) return false;
-  for (const match of script.matchAll(
-    /(?:^|[\n;&|(]|\bthen|\bdo|\belse)\s*(?:builtin\s+|command\s+)?cd\b([^\n;&|)]*)/g,
-  )) {
-    const target = (match[1] ?? "").trim().replace(/^(["'])(.*)\1$/, "$2");
-    if (!target || /[$`*?[{~]|\s/.test(target) || target === "-") return false;
-    try {
-      if (!inside(top, canonical(resolve(cwd, target)))) return false;
-    } catch {
-      return false;
+  // Git global options that take a value; the subcommand follows them.
+  const VALUED = new Set(["-c", "--exec-path", "--config-env", "--super-prefix", "--list-cmds"]);
+  for (const command of commands) {
+    const [program = "", ...args] = command.argv;
+    const name = basename(program);
+    if (name === "pushd" || name === "popd") return false;
+    if (name === "cd") {
+      const target = args.length === 1 ? args[0] : undefined;
+      if (!target || target === "-" || /[$`*?[{~]/.test(target)) return false;
+      try {
+        if (!inside(top, canonical(resolve(cwd, target)))) return false;
+      } catch {
+        return false;
+      }
+      continue;
     }
+    if (name === "git") {
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i] as string;
+        if (!arg.startsWith("-")) break;
+        if (/^(?:-C|--work-tree|--git-dir|--namespace)(?:=|$)|^-C./.test(arg)) return false;
+        if (VALUED.has(arg)) i++;
+      }
+      continue;
+    }
+    // Anything else that could start git (wrappers, shells, xargs) voids the exception.
+    if (name === "export") continue;
+    if (args.some((arg) => basename(arg) === "git" || /(?:^|[\s;&|(`'"])git(?:\s|$)/.test(arg)))
+      return false;
   }
   return true;
 }
