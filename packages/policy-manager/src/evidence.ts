@@ -463,6 +463,45 @@ export function notedProtectedWrite(
   return true;
 }
 
+export const MEMORY_WRITE = "Write to Claude Code's auto-memory";
+/**
+ * Whether a write target is a Markdown file directly in a Claude Code auto-memory directory,
+ * `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<project>/memory/<name>.md` (`MEMORY.md` included),
+ * which Claude Code itself writes without asking. The path as written has no `..` segment, and
+ * resolves to that same place with no symlink on the way: neither the file nor any directory.
+ */
+export function claudeMemoryFile(input: string, lexical: string): boolean {
+  try {
+    if (input.split(/[\\/]/).includes("..")) return false;
+    const config = resolve(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"));
+    const rel = relative(config, resolve(lexical)).split(sep);
+    if (rel.length !== 4 || rel[0] !== "projects" || rel[2] !== "memory") return false;
+    const [, project = "", , name = ""] = rel;
+    if (!project || project.startsWith(".") || !/^[^/\\]+\.md$/i.test(name)) return false;
+    // No symlink anywhere: the configuration directory and every step below it are what they say.
+    const memory = join(config, "projects", project, "memory");
+    if (canonical(memory) !== join(canonical(config), "projects", project, "memory")) return false;
+    // A directory not created yet is fine (Claude Code creates it); one that exists is no link.
+    for (const dir of [join(config, "projects"), join(config, "projects", project), memory])
+      if (isLink(dir)) return false;
+    const file = join(memory, name);
+    if (existsSync(file) || isLink(file)) {
+      const stat = lstatSync(file);
+      if (!stat.isFile() || stat.nlink > 1) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isLink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 export function pathEvidence(
   cwd: string,
   input: string,
@@ -473,6 +512,8 @@ export function pathEvidence(
     const path = canonical(lexical);
     if (write && notedProtectedWrite(input, lexical, path))
       return { allowed: true, category: "worktree-write", reason: NOTED_WRITE };
+    if (write && claudeMemoryFile(input, lexical))
+      return { allowed: true, category: "worktree-write", reason: MEMORY_WRITE };
     if (
       sensitive(path) ||
       sensitive(lexical) ||

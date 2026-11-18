@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -160,5 +160,67 @@ describe("a path under .claude/worktrees/<name> is judged inside that worktree",
     expect(isProtectedPath(join(gone, ".claude", "settings.json"))).toBe(true);
     expect(isProtectedPath(join(gone, ".agent-config", "x.md"))).toBe(true);
     expect(isProtectedPath(join(repo, ".claude", "settings.json"))).toBe(true);
+  });
+});
+
+describe("Claude Code's auto-memory: Markdown files in projects/<project>/memory/", () => {
+  let config: string, memory: string, previous: string | undefined;
+  beforeAll(() => {
+    previous = process.env.CLAUDE_CONFIG_DIR;
+    config = slash(join(root, "home", ".claude"));
+    memory = `${config}/projects/-Users-me-code-app/memory`;
+    mkdirSync(memory, { recursive: true });
+    writeFileSync(`${memory}/MEMORY.md`, "# Memory\n");
+    mkdirSync(join(root, "elsewhere"));
+    mkdirSync(`${config}/projects/linked`, { recursive: true });
+    symlinkSync(join(root, "elsewhere"), `${config}/projects/linked/memory`);
+    symlinkSync(join(root, "elsewhere", "x.md"), `${memory}/link.md`);
+    process.env.CLAUDE_CONFIG_DIR = config;
+  });
+  afterAll(() => {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previous;
+  });
+  const tool = (name: string, input: Record<string, unknown>): Request => ({
+    sessionId: "s1",
+    harness: "claude",
+    cwd: root,
+    tool: name,
+    input,
+  });
+
+  test.skipIf(process.platform === "win32").each([
+    () => tool("Write", { file_path: `${memory}/MEMORY.md`, content: "x" }),
+    () => tool("Write", { file_path: `${memory}/feedback_terse.md`, content: "x" }),
+    () => tool("Edit", { file_path: `${memory}/MEMORY.md`, old_string: "a", new_string: "b" }),
+    // A project whose memory directory does not exist yet: Claude Code creates it.
+    () => tool("Write", { file_path: `${config}/projects/-new/memory/MEMORY.md`, content: "x" }),
+    () => bash(`echo "- [x](x.md) — y" >> ${memory}/MEMORY.md`),
+    () => bash(`cat > ${memory}/note.md <<'EOF'\nx\nEOF`),
+  ])("approved %#", async (make) => {
+    const d = await session().decide(make(), "PreToolUse");
+    expect(d.decision).toBe("approve");
+  });
+
+  test
+    .skipIf(process.platform === "win32")
+    .each([
+      () => tool("Write", { file_path: `${config}/settings.json`, content: "{}" }),
+      () => tool("Write", { file_path: `${config}/CLAUDE.md`, content: "x" }),
+      () => tool("Write", { file_path: `${config}/hooks/x.md`, content: "x" }),
+      () => tool("Write", { file_path: `${config}/agents/x.md`, content: "x" }),
+      () =>
+        tool("Write", { file_path: `${config}/projects/-Users-me-code-app/s.jsonl`, content: "x" }),
+      () => tool("Write", { file_path: `${memory}/s.jsonl`, content: "x" }),
+      () => tool("Write", { file_path: `${memory}/sub/x.md`, content: "x" }),
+      () => tool("Write", { file_path: `${memory}/../x.md`, content: "x" }),
+      () => tool("Write", { file_path: `${memory}/../../../settings.md`, content: "x" }),
+      () => tool("Write", { file_path: `${config}/projects/linked/memory/x.md`, content: "x" }),
+      () => tool("Write", { file_path: `${memory}/link.md`, content: "x" }),
+      () => bash(`echo x >> ${config}/settings.json`),
+      () => bash(`echo x > ${memory}/../MEMORY.md`),
+    ])("still asks %#", async (make) => {
+    const d = await session().decide(make(), "PreToolUse");
+    expect(d.decision).not.toBe("approve");
   });
 });

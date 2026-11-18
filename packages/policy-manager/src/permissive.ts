@@ -3,11 +3,13 @@ import { basename, delimiter, dirname, join, resolve } from "node:path";
 import {
   branchEvidence,
   canonical,
+  claudeMemoryFile,
   disposable,
   type Fill,
   git,
   inside,
   isProtectedPath,
+  MEMORY_WRITE,
   NOTED_WRITE,
   notedProtectedWrite,
   OUTSIDE_REPOSITORY,
@@ -717,6 +719,8 @@ function writeEvidence(cwd: string, input: string, profile: Profile, directory: 
     path = canonical(lexical);
     if (notedProtectedWrite(input, lexical, path, directory))
       return { allowed: true, category: "worktree-write" as const, reason: NOTED_WRITE };
+    if (!directory && claudeMemoryFile(input, lexical))
+      return { allowed: true, category: "worktree-write" as const, reason: MEMORY_WRITE };
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
         allowed: false,
