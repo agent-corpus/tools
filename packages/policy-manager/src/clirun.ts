@@ -295,8 +295,23 @@ export function runsPolicyCli(script: string, cliPath?: string): boolean {
   return scriptRuns(script, cliPath, 0);
 }
 
-const WINDOWS_CLI =
-  /(?:^|[\n;&|(`]|\b(?:env|sudo|exec|nohup|time|xargs|script|start|cmd|-c)\s)\s*["']?[^\s;&|()<>'"`]*\\(?:pm|policy-manager)(?:\.cmd|\.exe|\.bat|\.ps1)?["']?(?=\s|$|[;&|)])/im;
+/** Wrappers whose next word is the command they run. */
+const LEADS = new Set(["env", "sudo", "exec", "nohup", "time", "xargs", "script", "start", "cmd"]);
+/**
+ * Whether a word in command position is a Windows path to the CLI (`C:\\bin\\pm.cmd`), which the
+ * scanner cannot read because it drops backslashes. Linear: one split, then each piece's words.
+ */
+function windowsCli(script: string): boolean {
+  for (const piece of script.split(/[\n;&|(`]/)) {
+    for (const raw of piece.split(/\s+/)) {
+      const word = raw.replace(/^["']|["']$/g, "");
+      if (!word) continue;
+      if (word.includes("\\") && CLI_NAME.test(word.slice(word.lastIndexOf("\\") + 1))) return true;
+      if (!LEADS.has(word) && !word.startsWith("-") && !/^[A-Za-z_]\w*=/.test(word)) break;
+    }
+  }
+  return false;
+}
 const SHELL_NAME = /^(?:sh|bash|zsh|dash|ksh|mksh|fish|source|\.)(?:\.exe)?$/i;
 /** Programs that build a command from their input or arguments, out of the scanner's sight. */
 const COMPOSERS = new Set(["xargs", "parallel", "eval", "watch", "tmux", "screen", "ssh"]);
@@ -312,7 +327,7 @@ export function hidesCode(script: string, depth = 0): boolean {
   // The scanner drops backslashes, so a Windows path to the CLI (`C:\\bin\\pm.cmd`) is read here.
   // Only a word in command position counts: at the start of a line or after an operator, a
   // wrapper or a quote that opens a command string.
-  if (WINDOWS_CLI.test(script)) return true;
+  if (windowsCli(script)) return true;
   const { segments, complete } = scan(script);
   if (!complete) return true;
   // Files a here-document writes are code once something runs them.

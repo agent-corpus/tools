@@ -1292,7 +1292,7 @@ function stdinScript(
  * inside longer text (source being edited, a message) is data.
  */
 function codeSecrets(code: string, context: Context, rules: Set<HardRule>): void {
-  for (const match of code.matchAll(/(["'`])((?:~\/|\/)[^\s"'`]{1,4096})\1/g))
+  for (const match of code.matchAll(/(["'`])((?:~\/|\/|[A-Za-z]:[\\/])[^\s"'`]{1,4096})\1/g))
     if (namesStateSecret(match[2] as string, context.cwds, false)) {
       rules.add("credential-read");
       return;

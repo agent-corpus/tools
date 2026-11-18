@@ -15,6 +15,8 @@ import { canonical, resolveWord, tempRoots } from "./evidence.js";
 const slashes = (path: string) => path.replace(/\\/g, "/");
 const WINDOWS = process.platform === "win32";
 const STATE_DIR = /^acp-(?:\d+|user)-/i;
+/** A path with a session directory name in it, wherever it lies. */
+const STATE_NAME = /(?:^|[\\/])acp-(?:\d+|user)-[^\\/]*(?:[\\/]|$)/i;
 /** Files a session directory holds, by name; a sample stands for the rotated logs. */
 const STATE_FILES = ["audit.jsonl", "audit.00000001.jsonl", "token", "service.sock", "grants.json"];
 
@@ -614,7 +616,11 @@ function callsReachState(
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
     const paths = values(arg);
-    return paths === undefined || paths.some((path) => namesState(path, cwds, true));
+    // A session directory by its name counts too, also one not created yet or another user's.
+    return (
+      paths === undefined ||
+      paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true))
+    );
   };
   // Calls are found outside string literals (a message or source text being edited is data);
   // their arguments are read from the code itself.
