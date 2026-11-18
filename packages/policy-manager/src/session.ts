@@ -2,7 +2,7 @@ import { basename, dirname } from "node:path";
 import { looksLikeApproveGrant, looksLikeClassifyRecord } from "./adapters.js";
 import { audit, requestSummary } from "./audit.js";
 import { type ClassifierResult, classifyWithCli } from "./classifier.js";
-import { runsPolicyCli } from "./clirun.js";
+import { approveCheckText, runsPolicyCli } from "./clirun.js";
 import {
   type CreatedFiles,
   creationTargets,
@@ -209,7 +209,10 @@ export class PolicySession {
     const command = request.input.command ?? request.input.cmd;
     if (!SHELL_TOOLS.has(request.tool) || typeof command !== "string") return undefined;
     // Classification records (`classify`, literally) are judged by `classifyRecord`.
-    if (!looksLikeApproveGrant(command) && !runsPolicyCli(command, this.cliPath)) return undefined;
+    // Naming `approve` with the CLI anywhere counts, except in a commit message, a PR body or an
+    // npm read or install of the package (`approveCheckText`).
+    if (!runsPolicyCli(command, this.cliPath) && !looksLikeApproveGrant(approveCheckText(command)))
+      return undefined;
     return { ...result(request, "sensitive", APPROVE_GUARD), hard: "self-approve" };
   }
   /**

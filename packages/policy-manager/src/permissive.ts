@@ -1,19 +1,26 @@
 import { lstatSync, readdirSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { withoutStrings } from "./clirun.js";
 import {
   branchEvidence,
   canonical,
+  claudeMemoryFile,
   disposable,
   type Fill,
+  featureGitTop,
   git,
+  gitEnvConfined,
+  gitEnvScriptSafe,
   inside,
   isProtectedPath,
+  MEMORY_WRITE,
   NOTED_WRITE,
   notedProtectedWrite,
   OUTSIDE_REPOSITORY,
   pathEvidence,
   policyState,
   protectedPath,
+  readSensitive,
   resolveWord,
   sensitive,
   tempRoots,
@@ -21,11 +28,11 @@ import {
 } from "./evidence.js";
 import { commandDecision } from "./flow.js";
 import { aliasDirectory, gitAlias, KNOWN_GIT, shellArgs } from "./gitalias.js";
-import { helperMatch } from "./helpers.js";
+import { committedScript, helperMatch } from "./helpers.js";
 import { mergedEvidence, onRemote, remoteTipMatches } from "./merged.js";
 import { evaluateArgv, result, words as shellWords } from "./policy.js";
 import type { Profile } from "./profile.js";
-import { sedScript } from "./reads.js";
+import { readOnly, sedScript } from "./reads.js";
 import {
   deletesProtected,
   deletionScriptCwd,
@@ -37,6 +44,7 @@ import {
   worktreeDeletion,
 } from "./recoverable.js";
 import { type Redirect, type SimpleCommand, SUBSTITUTION } from "./shell.js";
+import { INDIRECT_CALL } from "./statepaths.js";
 import type { Decision, Request } from "./types.js";
 
 /**
@@ -648,7 +656,7 @@ export function permissiveRead(cwd: string, input: string) {
   try {
     const lexical = resolveWord(cwd, input);
     const path = canonical(lexical);
-    if (sensitive(path) || sensitive(lexical))
+    if (readSensitive(path) || readSensitive(lexical))
       return {
         allowed: false,
         category: "sensitive" as const,
@@ -684,9 +692,20 @@ export function permissiveWrite(
   profile: Profile,
   fill?: Fill,
   directory = false,
+  /** A plain write (a file tool, a redirection, `tee`) that may land in Claude Code's memory. */
+  memory = false,
 ) {
-  const check = writeEvidence(cwd, input, profile, directory);
+  const check = writeEvidence(cwd, input, profile, directory, memory);
   if (!check.allowed || !fill) return check;
+  // A later script run in the same command may be the file written here.
+  fill.script.wrote = true;
+  // After a command that can create a symlink, a memory file may be one: protected again.
+  if (fill.script.tainted && check.reason === MEMORY_WRITE)
+    return {
+      allowed: false,
+      category: "sensitive" as const,
+      reason: "Protected path requires human approval",
+    };
   if (fill.script.tainted)
     return DISPOSABLE_WRITES.has(check.reason)
       ? {
@@ -709,7 +728,13 @@ function hardLinked(path: string): boolean {
   }
 }
 
-function writeEvidence(cwd: string, input: string, profile: Profile, directory: boolean) {
+function writeEvidence(
+  cwd: string,
+  input: string,
+  profile: Profile,
+  directory: boolean,
+  memory = false,
+) {
   let lexical: string | undefined;
   let path: string | undefined;
   try {
@@ -717,6 +742,8 @@ function writeEvidence(cwd: string, input: string, profile: Profile, directory: 
     path = canonical(lexical);
     if (notedProtectedWrite(input, lexical, path, directory))
       return { allowed: true, category: "worktree-write" as const, reason: NOTED_WRITE };
+    if (memory && !directory && claudeMemoryFile(input, lexical))
+      return { allowed: true, category: "worktree-write" as const, reason: MEMORY_WRITE };
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
         allowed: false,
@@ -1391,7 +1418,7 @@ export function redirectDecision(
   const check =
     redirect.op === "<"
       ? permissiveRead(cwd, redirect.target)
-      : permissiveWrite(cwd, redirect.target, profile, fill);
+      : permissiveWrite(cwd, redirect.target, profile, fill, false, true);
   return check.allowed ? undefined : human(request, check.category, check.reason);
 }
 
@@ -1439,14 +1466,17 @@ const DANGEROUS_CODE =
   /\b(?:rmtree|removedirs|unlink|unlinkSync|rmdir|rmdirSync|rmSync|os\.remove|os\.removedirs|shutil\.move|child_process|execSync|spawnSync|spawn|subprocess|os\.system|os\.popen|os\.exec[a-z]*|eval|exec|compile|__import__|importlib|ctypes|socket|urlopen|requests\.(?:post|put|delete|patch)|fetch)\b|\bfs\.rm\b|\bPath\([^)]*\)\.(?:unlink|rmdir)|\brm\s+-/;
 
 function interpreterCodeRefusal(code: string): string | undefined {
-  if (DANGEROUS_CODE.test(code))
-    return "Interpreter code that deletes files, starts processes or evaluates strings requires human review";
+  // Naming a protected or credential path comes first: it is a hard item whatever the code does.
   for (const token of code.split(/[\s"'`()[\]{},;=<>|&]+/))
     if (
       (token.includes("/") || token.startsWith(".")) &&
       (sensitive(token) || protectedPath(token))
     )
       return "Interpreter code that names a protected or credential path requires human review";
+  if (INDIRECT_CALL.test(withoutStrings(code)))
+    return "Interpreter code that calls a function it names indirectly requires human review";
+  if (DANGEROUS_CODE.test(code))
+    return "Interpreter code that deletes files, starts processes or evaluates strings requires human review";
   return undefined;
 }
 
@@ -1498,14 +1528,17 @@ const GLOB_ENTRIES = 5000;
  * working directory (a symlink to a key, or a cwd inside `~/.ssh`), or, for a glob in its last
  * component, by any entry it would match.
  */
-function sensitiveOperand(cwd: string, word: string): boolean {
+function sensitiveOperand(cwd: string, word: string, read?: { walk: boolean }): boolean {
   if (word === "") return false;
-  if (sensitive(word)) return true;
+  // A read is judged by `readSensitive` (Git's own files but its config are no credential); a
+  // glob still expands the strict way.
+  const check = read ? (path: string) => readSensitive(path, read.walk) : sensitive;
+  if (check(word)) return true;
   if (GLOB.test(word)) return sensitiveGlob(cwd, word);
   try {
     const lexical = resolveWord(cwd, word);
     if (!lstatExists(lexical)) return false;
-    return sensitive(lexical) || sensitive(canonical(lexical));
+    return check(lexical) || check(canonical(lexical));
   } catch {
     return false;
   }
@@ -1766,9 +1799,22 @@ export function simpleDecision(
   cwd: string,
   fill?: Fill,
 ): Decision {
-  for (const [name] of command.env)
-    if (BANNED_ENV.test(name))
-      return human(request, "unknown", "Environment override requires human review");
+  // `GIT_DIR`/`GIT_WORK_TREE` only when they confine git to one verified feature worktree.
+  const gitTops: Record<string, string | undefined> = {};
+  for (const [name, value] of command.env) {
+    if (!BANNED_ENV.test(name)) continue;
+    const top = /^GIT_(?:DIR|WORK_TREE)$/.test(name) ? featureGitTop(name, value, cwd) : undefined;
+    if (!top) return human(request, "unknown", "Environment override requires human review");
+    gitTops[name] = top;
+  }
+  const script = request.input.command ?? request.input.cmd;
+  if (
+    (gitTops.GIT_DIR || gitTops.GIT_WORK_TREE) &&
+    (!gitEnvConfined(gitTops.GIT_DIR, gitTops.GIT_WORK_TREE, cwd) ||
+      typeof script !== "string" ||
+      !gitEnvScriptSafe(script, request.cwd))
+  )
+    return human(request, "unknown", "Environment override requires human review");
   for (const redirect of command.redirects) {
     const refusal = redirectDecision(request, redirect, profile, cwd, fill);
     if (refusal) return refusal;
@@ -1867,8 +1913,32 @@ export function simpleDecision(
   // files a sed script reads or writes are.
   const operands = textOperands(program, args);
   const namePatterns = operands.patterns;
+  // A program that only reads, and a word that only tells git where its directory is, read no
+  // credential in Git's own files but its config.
+  const reads =
+    readOnly([program, ...args]) ||
+    /^(?:cat|ls|head|tail|grep|egrep|fgrep|rg|wc|stat|file|tree|du|test|\[|export)$/.test(program);
+  const walk =
+    /^(?:rg|tree|du)$/.test(program) ||
+    args.some((arg) => /^-[a-zA-Z]*[rR]|^--recursive$|^--dereference-recursive$/.test(arg));
   for (const [index, word] of args.entries()) {
     if (operands.text.has(index)) continue;
+    const gitDir = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=|^--(?:git-dir|work-tree)=/.test(
+      word,
+    );
+    if (reads || gitDir) {
+      const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
+      const read = { walk: walk && !gitDir };
+      if (
+        namePatterns.has(index) || PRINTERS.has(program)
+          ? (candidate.includes("/") || candidate.startsWith(".") || namePatterns.has(index)) &&
+            readSensitive(candidate, read.walk)
+          : sensitiveOperand(cwd, candidate, read) ||
+            (candidate !== word && sensitiveOperand(cwd, word, read))
+      )
+        return human(request, "sensitive", "Protected path requires human approval");
+      continue;
+    }
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
     // echo and printf read no file, so only a path-like word is judged, by name.
     const pathLike = candidate.includes("/") || candidate.startsWith(".");
@@ -1926,6 +1996,14 @@ export function simpleDecision(
   const helper = helperMatch(profile.credentialHelpers, cwd, argv);
   if (helper.kind === "refused") return human(request, "sensitive", helper.reason);
   if (helper.kind === "match") {
+    // An earlier command in the script that may change files (a script run, an unknown program)
+    // could rewrite the helper after it was checked.
+    if (fill?.script.tainted)
+      return human(
+        request,
+        "sensitive",
+        "A credential helper after a command that may change files requires a person",
+      );
     if (
       stageIndex > 0 ||
       command.stdin !== undefined ||
@@ -1995,6 +2073,22 @@ export function simpleDecision(
       );
     const unsafe = code === undefined ? undefined : interpreterCodeRefusal(code);
     if (unsafe) return human(request, "unknown", unsafe);
+    // A script file runs without review only as committed on the default branch: an edited or
+    // untracked script goes to the classifier.
+    if (code === undefined && !args.includes("-m")) {
+      const script = args.find((arg) => !arg.startsWith("-"));
+      if (
+        script !== undefined &&
+        (committedScript(cwd, script) === false ||
+          // Checked before anything runs: an earlier command in the script may change it.
+          (committedScript(cwd, script) === true && (fill?.script.wrote || fill?.script.tainted)))
+      )
+        return human(
+          request,
+          "unknown",
+          "Running a script that is not the committed default-branch version requires review",
+        );
+    }
   }
   if (
     program === "xargs" &&
@@ -2064,7 +2158,14 @@ export function simpleDecision(
       if (!check.allowed) return human(request, check.category, check.reason);
     }
     for (const file of [...(split?.targets ?? operands), ...optionValues]) {
-      const check = permissiveWrite(cwd, file, profile, fill, program === "mkdir");
+      const check = permissiveWrite(
+        cwd,
+        file,
+        profile,
+        fill,
+        program === "mkdir",
+        program === "tee",
+      );
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   }

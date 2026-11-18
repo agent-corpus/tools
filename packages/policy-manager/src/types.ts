@@ -75,6 +75,8 @@ export interface Decision {
   credentialHelpers?: string[];
   /** The agent tried to approve a request itself: no approval instruction is offered for it. */
   userOnly?: boolean;
+  /** A listed credential that only flows into a listed consumer; the consumer was judged. */
+  credentialUse?: boolean;
 }
 
 export interface OutcomeReport {

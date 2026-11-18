@@ -29,6 +29,11 @@ export interface Word {
   heredoc?: boolean;
   /** A here-document with a quoted delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`): nothing expands. */
   quoted?: boolean;
+  /**
+   * On the first word of a segment: the operator characters before it (`&&`, `;`, `\n`, `|`,
+   * `||`, `&`, `(`, `)`), or `$(` for the first command of a substitution. Empty at the start.
+   */
+  after?: string;
 }
 
 export interface Scan {
@@ -46,6 +51,8 @@ interface Frame {
   closer: ")" | "`";
   /** The quoting the substitution was opened in, which resumes after it. */
   resume: "" | '"' | "h";
+  /** The operators before the outer segment, restored after the substitution. */
+  after: string;
 }
 
 /**
@@ -58,6 +65,8 @@ export function scan(script: string, heredoc = false): Scan {
   const segments: Word[][] = [];
   const stack: Frame[] = [];
   let segment: Word[] = [];
+  /** Operator characters since the last segment ended, for the next segment's first word. */
+  let after = "";
   let text = "";
   // A here-document body is one word of text from its first character.
   let active = heredoc;
@@ -97,7 +106,9 @@ export function scan(script: string, heredoc = false): Scan {
         ...(pipeNext && !segment.length ? { piped: true, pipedAt: pipeDepth } : {}),
         depth,
         ...(bare ? { bare: true } : {}),
+        ...(segment.length === 0 ? { after } : {}),
       });
+      if (segment.length === 1) after = "";
       if (!redirectNext) pipeNext = false;
       redirectNext = false;
       redirectWrites = false;
@@ -133,6 +144,7 @@ export function scan(script: string, heredoc = false): Scan {
       bare: bare || quote === "",
       closer,
       resume: quote === "'" ? "" : quote,
+      after,
     });
     segment = [];
     text = "";
@@ -140,10 +152,12 @@ export function scan(script: string, heredoc = false): Scan {
     literal = true;
     bare = false;
     quote = "";
+    after = "$(";
   };
   const close = () => {
     endSegment();
     const frame = stack.pop() as Frame;
+    after = frame.after;
     segment = frame.segment;
     text = `${frame.text}$`;
     active = frame.active;
@@ -294,10 +308,12 @@ export function scan(script: string, heredoc = false): Scan {
         }
       }
       pending = [];
+      after += "\n";
       continue;
     }
     if (/[;&|()\n]/.test(c)) {
       endSegment();
+      after += c;
       // `a | b` and `a |& b`, not `a || b`; `a | (b)` pipes into the subshell's first command.
       const pipe = c === "|" && next !== "|" && script[i - 1] !== "|";
       if (pipe) pipeDepth = groups.length;
@@ -378,6 +394,8 @@ export function command(segment: Word[]): Command {
     while (i < words.length && KEYWORDS.has(words[i]?.text ?? "")) i++;
     const name = basenameOf(words[i]?.text ?? "");
     if (!words[i]?.literal || !(name in WRAPPERS)) break;
+    // `command -v pm` and `command -V pm` print how a name resolves; they run nothing.
+    if (name === "command" && /^-[pvV]*[vV][pvV]*$/.test(words[i + 1]?.text ?? "")) break;
     const valued = WRAPPERS[name] as string[];
     i++;
     while (i < words.length) {

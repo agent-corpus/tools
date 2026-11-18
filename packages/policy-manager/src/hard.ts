@@ -1,11 +1,14 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { withoutStrings } from "./clirun.js";
 import {
   canonical,
+  evidenceScope,
   git,
   inside,
   isProtectedPath,
+  readSensitive,
   resolveWord,
   sensitive,
   tempRoots,
@@ -20,6 +23,7 @@ import {
   findReachesState,
   namesState,
   namesStateSecret,
+  RUNS_CODE,
   stateText,
 } from "./statepaths.js";
 import type { Decision, Request } from "./types.js";
@@ -183,7 +187,16 @@ const POLICY_STATE = /(?:^|\/)acp-(?:\d+|user)-[^/]*(?:\/|$)/i;
 export const policyStatePath = (path: string) => POLICY_STATE.test(normalize(path));
 
 /** The hard rules a path names. */
-function pathRules(path: string, rules: Set<HardRule>, credentials: boolean): void {
+/**
+ * `credentials`: `true` judges the path as a credential the strict way (`sensitive`), as for a
+ * write or an unknown program; `"read"` and `"walk"` as a file read or a tree read
+ * (`readSensitive`), where Git's own files other than its config are not credentials.
+ */
+function pathRules(
+  path: string,
+  rules: Set<HardRule>,
+  credentials: boolean | "read" | "walk",
+): void {
   // Pure for a given environment, and asked for the same words many times: memoized.
   const key = `${credentials ? 1 : 0}${process.env.CLAUDE_CONFIG_DIR}|${process.env.CODEX_HOME}|${process.env.COPILOT_HOME}|${path}`;
   let found = pathMemo.get(key);
@@ -194,7 +207,12 @@ function pathRules(path: string, rules: Set<HardRule>, credentials: boolean): vo
       found.push("policy-profile");
     if (HARNESS_SETTINGS.some((pattern) => pattern.test(target)) || configuredSettings(target))
       found.push("harness-settings");
-    if (credentials && sensitive(target)) found.push("credential-read");
+    if (
+      credentials === true
+        ? sensitive(target)
+        : credentials && readSensitive(target, credentials === "walk")
+    )
+      found.push("credential-read");
     if (pathMemo.size > 8192) pathMemo.clear();
     pathMemo.set(key, found);
   }
@@ -261,6 +279,11 @@ function gitRules(sub: string, rest: string[], rules: Set<HardRule>): void {
       rules.add("remove-worktree-force");
   } else if (sub === "clean") {
     if (!has((f) => long(f, "--dry-run") || short(f, /n/))) rules.add("git-clean");
+  } else if (sub === "remote") {
+    // What a remote is and which branch is its default decide what counts as merged and as
+    // committed: changing them is protected.
+    if (/^(?:set-head|set-url|add|rename|remove|rm|set-branches)$/.test(positional[0] ?? ""))
+      rules.add("protected");
   }
 }
 
@@ -334,6 +357,8 @@ const GH_DELETE: Record<string, RegExp> = {
   pr: /^merge$/,
   workflow: /^(?:run|enable|disable)$/,
   run: /^(?:rerun|delete|cancel)$/,
+  // Project and repository settings that cannot be taken back.
+  project: /^(?:delete|close|item-delete|item-archive|field-delete|unlink|mark-template)$/,
 };
 
 /**
@@ -434,6 +459,8 @@ function ghApiFloor(words: Word[]): boolean {
   let method: string | undefined;
   let fields = false;
   const values: string[] = [];
+  /** Field words with an expansion: their text is not what gh sends. */
+  const computed: string[] = [];
   const start = texts.indexOf("api") + 1;
   for (let k = start; k < texts.length; k++) {
     const text = texts[k] as string;
@@ -448,9 +475,11 @@ function ghApiFloor(words: Word[]): boolean {
     else if (attached) method = attached[1];
     else if (/^(?:-[fF]|--field|--raw-field)$/.test(text)) {
       fields = true;
+      if (words[k + 1] && !words[k + 1]?.literal) computed.push(texts[k + 1] ?? "");
       values.push(texts[++k] ?? "");
     } else if (/^(?:--field|--raw-field)=|^-[fF]./.test(text)) {
       fields = true;
+      if (!words[k]?.literal) computed.push(text);
       values.push(text.replace(/^(?:--field=|--raw-field=|-[fF])/, ""));
     } else if (text === "--input" || text.startsWith("--input=")) {
       fields = true;
@@ -473,8 +502,11 @@ function ghApiFloor(words: Word[]): boolean {
       !(effective === "POST" && fields && variableReply(endpoint))
     );
   if (endpoint === "graphql") {
-    // A query read from a file cannot be judged; one without a mutation reads.
+    // A query read from a file cannot be judged; one without a mutation reads. A query with an
+    // expansion (`-f query="$Q"`) can be any mutation; variables (`-f id=$t`) are only values.
     if (values.some((value) => value === "@" || /^query=@/.test(value))) return true;
+    if (computed.some((text) => /^(?:(?:--field=|--raw-field=|-[fF])?query=)/.test(text)))
+      return true;
     for (const value of values) {
       const mutations = mutationFields(value);
       if (mutations === undefined) continue;
@@ -630,7 +662,8 @@ function ghFloor(args: string[]): boolean {
   const { words, unknown } = leading("gh", args, 3);
   const pair = (group: string, verb: string, third = "") =>
     GH_DELETE[group]?.test(verb) ||
-    (group === "repo" && verb === "deploy-key" && /^(?:add|delete)$/.test(third));
+    (group === "repo" && verb === "deploy-key" && /^(?:add|delete)$/.test(third)) ||
+    (group === "repo" && verb === "autolink" && /^(?:create|delete)$/.test(third));
   if (!unknown) return !!pair(words[0] ?? "", words[1] ?? "", words[2] ?? "");
   // An option gh does not know came first: any later pair of words could be the subcommand.
   const positional = args.filter((arg) => !arg.startsWith("-"));
@@ -736,6 +769,104 @@ function featureWorktree(path: string): boolean {
     return false;
   }
 }
+/** Variable names that hold a secret: `GITHUB_TOKEN`, `DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`. */
+const SECRET_VARIABLE =
+  /(?:TOKEN|SECRET|PASSW(?:OR)?D|PASSPHRASE|CREDENTIAL|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CLIENT_?SECRET|CONNECTION_?STRING|_PAT$|^PAT$|(?:^|_)AUTH(?:_|$))/i;
+/** git commands that print remote URLs or the whole config. */
+function printsRemote(args: string[]): boolean {
+  let k = 0;
+  while (
+    args[k] === "-C" ||
+    args[k] === "-c" ||
+    args[k]?.startsWith("--git-dir") ||
+    args[k] === "--no-pager"
+  )
+    k += args[k] === "-C" || args[k] === "-c" ? 2 : 1;
+  const [sub = "", ...rest] = args.slice(k);
+  if (sub === "config")
+    return (
+      rest.some((arg) => /^(?:-l|--list|--get-regexp|--get-all|--show-origin)$/.test(arg)) ||
+      rest.some((arg) => /(?:^|\.)(?:url|pushurl|extraheader|insteadof)$/i.test(arg))
+    );
+  if (sub === "remote")
+    return (
+      rest.includes("-v") ||
+      rest.includes("--verbose") ||
+      rest[0] === "get-url" ||
+      rest[0] === "show"
+    );
+  if (sub === "var") return rest.includes("-l");
+  if (sub === "ls-remote") return rest.includes("--get-url");
+  return false;
+}
+/**
+ * Whether a checkout the script runs in has a remote URL with user info (`https://user:token@`),
+ * a URL rewrite, or an `http.*.extraheader`: printing them would print a credential. Read at
+ * decision time; an unreadable checkout counts as yes.
+ */
+function remoteHasSecret(context: Context): boolean {
+  if (context.unknownCwd) return true;
+  for (const cwd of context.cwds) {
+    let out = "";
+    try {
+      out = git(cwd, [
+        "config",
+        "--get-regexp",
+        "^(remote\\..*\\.(url|pushurl)|url\\..*\\.(insteadof|pushinsteadof)|http\\..*extraheader)$",
+      ]);
+    } catch {
+      // Exit 1: nothing matched. Anything else (no repository) cannot leak a remote.
+      continue;
+    }
+    if (/\bhttps?:\/\/[^/\s@]+@|extraheader/i.test(out)) return true;
+  }
+  return false;
+}
+/**
+ * Read commands of common CLIs that print a secret: a token, a kubeconfig with credentials, chart
+ * values, function environment variables, decrypted parameters or app settings. A credential read
+ * however they are spelled, wherever they appear.
+ */
+function printsSecret(name: string, args: string[]): boolean {
+  const words = args.filter((arg) => !arg.startsWith("-"));
+  const has = (...flags: string[]) =>
+    args.some((arg) => flags.some((f) => arg === f || arg.startsWith(`${f}=`)));
+  const path = words.join(" ");
+  if (name === "gh")
+    return (
+      (/^auth (?:status|token)\b/.test(path) &&
+        (path.startsWith("auth token") || has("--show-token", "-t"))) ||
+      /^config get (?:oauth_token|.*token)/.test(path) ||
+      /^secret\b/.test(path)
+    );
+  if (name === "kubectl" || name === "oc")
+    return (
+      (/^config view\b/.test(path) && has("--raw", "--flatten")) ||
+      /^(?:create token|get secrets?|describe secrets?)\b/.test(path) ||
+      /^get\b.*\bsecrets?\b/.test(path)
+    );
+  if (name === "helm") return /^get (?:values|all|manifest)\b/.test(path);
+  if (name === "aws")
+    return (
+      /^lambda get-function(?:-configuration)?\b/.test(path) ||
+      (/^ssm get-parameters?(?:-by-path)?\b/.test(path) && has("--with-decryption")) ||
+      /^sts get-session-token\b|^ecr get-login-password\b|^ecr-public get-login-password\b|^secretsmanager get-secret-value\b|^codeartifact get-authorization-token\b|^configure (?:get|export-credentials)\b/.test(
+        path,
+      )
+    );
+  if (name === "gcloud")
+    return /^(?:auth (?:print-access-token|print-identity-token|application-default print-access-token)|secrets versions access|config config-helper)\b/.test(
+      path,
+    );
+  if (name === "az")
+    return (
+      /^(?:(?:webapp|functionapp|logicapp) config appsettings list|containerapp secret (?:show|list)|acr credential show|account get-access-token|storage account (?:keys list|show-connection-string)|aks get-credentials)\b/.test(
+        path,
+      ) ||
+      (/^containerapp secret\b/.test(path) && has("--show-values"))
+    );
+  return false;
+}
 const SECRET_WORD =
   /(?:secret|credential|password|connection[-_]?strings?|(?:^|[-_])keys?(?:$|[-_])|listKeys|access-token|get-token|kubeconfig)/i;
 
@@ -750,6 +881,181 @@ interface Context {
   runsText?: boolean;
   /** Absolute directories where a recursive rm is disposable (the profile's scratch roots). */
   scratchRoots: string[];
+}
+
+/** Shell variables the shell itself sets or changes: their values are never known here. */
+const SPECIAL_VARIABLE =
+  /^(?:IFS|TMPDIR|TMP|TEMP|PWD|OLDPWD|RANDOM|SRANDOM|SECONDS|LINENO|UID|EUID|PPID|HISTCMD|REPLY|OPTARG|OPTIND|PATH|HOME|CDPATH|ENV|PS\d|BASH\w*|ZSH\w*|EPOCH\w*|FUNCNAME|PIPESTATUS|argv|status|path|cdpath)$/;
+/** A value that is one word as it stands: no whitespace, glob, quote or expansion. */
+const ONE_WORD = /^[^\s*?[\]{}'"\\$`]+$/;
+/** The most combinations of loop values one command is judged with. */
+const MAX_VARIANTS = 16;
+
+/**
+ * The variables whose value is known at each segment: a name bound exactly once in the script,
+ * either by a plain assignment of a literal value (`F=/tmp/x/notes.md`) that has run whenever the
+ * segment runs (it starts the script or follows `;` or a newline at the top level, or every
+ * operator from it to the segment is `&&`), or by a `for NAME in <literal words>` loop whose body
+ * holds the segment. A script with `eval` or `source`, or a name bound any other way (`read`,
+ * `export`, `unset`, `${N:=x}`, a loop, arithmetic), has none.
+ */
+/**
+ * Whether variable values can be known for certain in a script: it was read completely, has no
+ * pipe, background job, subshell or substitution (only `;`, newlines and `&&` between commands),
+ * no assigning expansion (`${X:=...}`, `${X=...}`, `${X:?...}`), no function definition and no
+ * command that binds or moves (`read`, `export`, `eval`, `source`, `pushd`, `cd -`...); every
+ * assignment is a plain `NAME=literal` at the top level, and the shell's own variables (`IFS`)
+ * are left alone. Otherwise every variable is unknown, as before.
+ */
+function plainScript(segments: Word[][], script: string, complete: boolean): boolean {
+  if (!complete) return false;
+  if (
+    /\$\{#?[A-Za-z_]\w*:?[=?]|\b[A-Za-z_]\w*\s*\(\s*\)|\bfunction\s+\w|\{[A-Za-z_]\w*\}[<>]/.test(
+      script,
+    )
+  )
+    return false;
+  for (const segment of segments) {
+    const after = segment[0]?.after ?? "";
+    if (/[|$()]/.test(after) || /&/.test(after.replace(/&&/g, ""))) return false;
+    const cmd = command(segment);
+    const program = cmd.program;
+    if (program && !program.literal) return false;
+    const name = program?.text ?? "";
+    if (
+      /^(?:read|export|eval|source|\.|pushd|popd|local|declare|typeset|readonly|unset|let|mapfile|readarray|getopts|vared|zparseopts|integer|float|alias|set)$/.test(
+        name,
+      ) ||
+      (name === "cd" && cmd.args.some((word) => word.text === "-"))
+    )
+      return false;
+    for (const word of segment) {
+      const assigned = /^([A-Za-z_]\w*)(\+?)=/.exec(word.text);
+      const position = cmd.assignments.includes(word) || (!program && !word.redirect);
+      if (!assigned || !position) continue;
+      if (assigned[2] || !word.literal || word.depth || program) return false;
+      if (SPECIAL_VARIABLE.test(assigned[1] as string)) return false;
+    }
+  }
+  return true;
+}
+
+function knownVariables(
+  segments: Word[][],
+  script: string,
+  settled = new Set<string>(),
+  loops = new Set<number>(),
+): Array<Map<string, string[]>> {
+  const known = segments.map(() => new Map<string, string[]>());
+  if (!plainScript(segments, script, true)) return known;
+  const binders = new Map<string, number>();
+  const bind = (name: string) => binders.set(name, (binders.get(name) ?? 0) + 1);
+  for (const segment of segments) {
+    const first = segment[0];
+    if (first?.literal && /^(?:for|select)$/.test(first.text) && segment[1]) bind(segment[1].text);
+    // Assignments in command position (`F=x`, `F=x cmd`, `env F=x cmd`); `-f t=$t` is an argument.
+    for (const word of command(segment).assignments) {
+      const name = /^([A-Za-z_]\w*)(\+?)=/.exec(word.text);
+      if (name) bind(name[1] as string);
+      if (name?.[2]) binders.set(name[1] as string, 2);
+    }
+  }
+  const rebinds = (name: string) =>
+    new RegExp(
+      `\\b(?:read|unset|export|local|declare|typeset|readonly|let|mapfile|readarray|getopts|vared|zparseopts|integer|float)\\b[^\\n;&|]*\\b${name}\\b|\\bprintf?\\s+(?:-\\S+\\s+)*-v\\s*${name}\\b|\\$\\{${name}:?[=?]|\\(\\([^)]*\\b${name}\\s*(?:[-+*/%]?=|\\+\\+|--)|\\b${name}\\s*\\[`,
+    ).test(script);
+  const usable = (name: string) =>
+    binders.get(name) === 1 && !SPECIAL_VARIABLE.test(name) && !rebinds(name);
+  const simple = (after: string | undefined) => !after || /^[;\n]+$/.test(after);
+  for (const [j, segment] of segments.entries()) {
+    const first = segment[0];
+    if (!first) continue;
+    // `for NAME in a b c`: inside the body, NAME is one of the words.
+    if (first.literal && first.text === "for" && segment[2]?.text === "in" && segment[2].literal) {
+      const name = segment[1]?.text ?? "";
+      const values = segment.slice(3);
+      if (
+        !usable(name) ||
+        !values.length ||
+        values.some(
+          (word) => !word.literal || !ONE_WORD.test(word.text) || word.text.startsWith("-"),
+        )
+      )
+        continue;
+      loops.add(j);
+      for (let k = j + 1; k < segments.length; k++) {
+        const head = segments[k]?.[0];
+        if (head?.literal && head.text === "done" && head.depth === first.depth) break;
+        known[k]?.set(
+          name,
+          values.map((word) => word.text),
+        );
+      }
+      continue;
+    }
+    // A segment of plain assignments only, at the top level.
+    if (command(segment).program || segment.some((word) => word.depth || word.redirect)) continue;
+    for (const word of segment) {
+      const match = /^([A-Za-z_]\w*)=(.*)$/s.exec(word.text);
+      if (!match || !word.literal) continue;
+      const name = match[1] as string;
+      if (!usable(name)) continue;
+      let chained = true;
+      // Assigned before anything reads it, and known wherever it is read afterwards: the value
+      // is judged at each use, so the assignment itself names no target.
+      const read = new RegExp(`\\$\\{?${name}\\b`);
+      if (
+        simple(first.after) &&
+        !segments.slice(0, j).some((earlier) => earlier.some((w) => read.test(w.text)))
+      )
+        settled.add(name);
+      for (let k = j + 1; k < segments.length; k++) {
+        const here = segments[k] as Word[];
+        const after = here[0]?.after;
+        chained &&= after === "&&" || after === "$(";
+        if (!simple(first.after) && (!chained || here.some((w) => w.depth))) break;
+        known[k]?.set(name, [match[2] as string]);
+      }
+    }
+  }
+  return known;
+}
+
+/**
+ * The segment with each word whose expansions are all known variables filled in, once per
+ * combination of values (at most MAX_VARIANTS), or the segment as it is. An unquoted expansion is
+ * filled in only with values that stay one word.
+ */
+function filled(segment: Word[], known: Map<string, string[]>): Word[][] {
+  if (!known.size) return [segment];
+  let variants: Word[][] = [[]];
+  for (const word of segment) {
+    let options = [word];
+    if (!word.literal && !word.heredoc && /\$/.test(word.text)) {
+      const parts = word.text.split(/(\$\{\w+\}|\$[A-Za-z_]\w*)/);
+      let texts: string[] | undefined = [""];
+      for (const [index, part] of parts.entries()) {
+        if (index % 2 === 0) {
+          if (part.includes("$") || part.includes("`")) texts = undefined;
+        } else {
+          const values = known.get(part.replace(/^\$\{?|\}$/g, ""));
+          if (!values || (word.bare && values.some((value) => !ONE_WORD.test(value))))
+            texts = undefined;
+          else texts = texts?.flatMap((text) => values.map((value) => text + value));
+        }
+        if (!texts) break;
+        if (index % 2 === 0) texts = texts.map((text) => text + part);
+      }
+      if (texts && texts.length <= MAX_VARIANTS)
+        options = texts.map((text) => {
+          const { bare: _bare, ...rest } = word;
+          return { ...rest, text, literal: true };
+        });
+    }
+    variants = variants.flatMap((variant) => options.map((option) => [...variant, option]));
+    if (variants.length > MAX_VARIANTS) return [segment];
+  }
+  return variants;
 }
 
 /** Programs that delete or move their operands: a directory above the state counts for them. */
@@ -1137,6 +1443,26 @@ function stdinScript(
   textRules(text, [...context.cwds][0] ?? "", rules);
 }
 
+/**
+ * Code names the policy service's secrets (the token, grants, socket: anything in a session
+ * directory but its audit logs) when a string literal that is a whole path could be one. A path
+ * inside longer text (source being edited, a message) is data.
+ */
+function codeSecrets(code: string, context: Context, rules: Set<HardRule>, strict = false): void {
+  // Code that starts processes, or code a script runs from a file it wrote: every path-like word,
+  // and a session directory itself, counts.
+  const all = strict || RUNS_CODE.test(withoutStrings(code));
+  const pattern = all
+    ? /()((?:~\/|\/|[A-Za-z]:[\\/])[^\s"'`,;()<>|&{}]{1,4096})/g
+    : /(["'`])((?:~\/|\/|[A-Za-z]:[\\/])[^\s"'`]{1,4096})\1/g;
+  for (const match of code.matchAll(pattern))
+    if (namesStateSecret(match[2] as string, context.cwds, all)) {
+      secretReads++;
+      rules.add("credential-read");
+      return;
+    }
+}
+
 function analyzeScript(
   script: string,
   context: Context,
@@ -1147,6 +1473,22 @@ function analyzeScript(
   // Here-document bodies are data unless something in the script runs text as code.
   const runs = !complete || segments.some((segment) => runsText(command(segment)));
   if (runs) context.runsText = true;
+  // Only a shell (or a runner that may start one) reads a here-document as shell commands; one
+  // fed to an interpreter, or written to a file an interpreter runs, is code: judged by
+  // `codeTouchesState` and for the paths it names.
+  const runsShell =
+    !complete ||
+    segments.some((segment) => {
+      const program = command(segment).program;
+      const name = (program?.text.split(/[\\/]/).pop() ?? "").replace(/\d+(?:\.\d+)*$/, "");
+      return (
+        !!program &&
+        (!program.literal ||
+          SHELL_NAMES.has(name) ||
+          RUNNERS.has(name) ||
+          (/[\\/]/.test(program.text) && !INTERPRETERS.has(name)))
+      );
+    });
   for (const segment of segments)
     for (const word of segment) {
       if (word.heredoc) continue;
@@ -1155,16 +1497,41 @@ function analyzeScript(
     }
   // A script the scanner could not read fully is judged on its words alone.
   if (!complete) opaqueGitRules(context.words, true, rules);
+  const settled = new Set<string>();
+  const loops = new Set<number>();
+  const known = knownVariables(segments, script, settled, loops);
+  const plain = plainScript(segments, script, complete);
   for (const [k, segment] of segments.entries()) {
-    analyzeCommand(command(segment), segment, context, rules, depth);
+    for (const variant of filled(segment, known[k] ?? new Map()))
+      analyzeCommand(command(variant), variant, context, rules, depth, settled, {
+        loopList: loops.has(k),
+        plain,
+      });
     stdinScript(segments, k, context, rules, depth);
+    // The names `find` prints, fed to another command (`| xargs cat`, `cat $(find ...)`), are
+    // read by it: a find that can reach the session files is a credential read.
+    const found = command(segment);
+    if (
+      found.program?.literal &&
+      /(?:^|\/)find$/.test(found.program.text) &&
+      (segments[k + 1]?.[0]?.piped ||
+        segment[0]?.after?.includes("$(") ||
+        segment.some((word) => word.redirect && word.writes && !/^\/dev\/null$/.test(word.text))) &&
+      findReachesState(
+        found.args.map((word) => word.text),
+        context.cwds,
+      )
+    ) {
+      rules.add("credential-read");
+      secretReads++;
+    }
     // A here-document fed to a shell, or in a script that runs text (`cat <<EOF | sh`), is code.
     for (const doc of segment.filter((word) => word.heredoc)) {
       if (depth >= 4) continue;
-      if (runs) {
+      if (runs && runsShell) {
         analyzeScript(doc.text, context, rules, depth + 1);
         textRules(doc.text, [...context.cwds][0] ?? "", rules);
-      }
+      } else if (runs) codeSecrets(doc.text, context, rules);
       if (doc.quoted) continue;
       // Fail closed on an unquoted body: besides its substitutions as the scanner reads them, read
       // what follows every `$(` and backtick as a script, so text the scanner might mis-read
@@ -1180,6 +1547,118 @@ function analyzeScript(
       }
     }
   }
+  writtenThenRun(segments, context, rules, depth);
+}
+
+/**
+ * A file the script writes and then runs (`sh f`, `bash f`, `python3 f`, `node f`, `./f`,
+ * `source f`) is code: a literal body (a quoted here-document, literal `echo`/`printf`) gets the
+ * full rules (a shell's every hard rule, an interpreter's state and secret checks), and anything
+ * else (another program's output, a copy, a body with expansions) is `opaque-script`. So is a
+ * script that sets an npm script or a Git alias and runs it.
+ */
+/** Programs that run a script file named among their arguments. */
+const LAUNCHERS = new Set([
+  ...["uv", "uvx", "npx", "pnpm", "yarn", "bunx", "bun", "deno", "tsx", "ts-node", "pipx"],
+  ...["poetry", "pipenv", "conda", "rye", "hatch", "pdm", "env", "time", "nohup", "timeout"],
+  ...["xargs", "script", "setsid", "nice", "caffeinate", "watch", "make", "just", "task"],
+]);
+
+/** The literal text a `cat` here-document or a literal `echo`/`printf` writes, or undefined. */
+function fileBody(segment: Word[]): string | undefined {
+  const cmd = command(segment);
+  const name = cmd.program?.literal ? (cmd.program.text.split("/").pop() ?? "") : "";
+  if (name === "cat" && !cmd.args.length) {
+    const docs = segment.filter((word) => word.heredoc || word.herestring);
+    const doc = docs[0];
+    if (docs.length !== 1 || !doc) return undefined;
+    if (!doc.literal || (!doc.quoted && /[$`\\]/.test(doc.text))) return undefined;
+    return doc.text;
+  }
+  // Only text written as it stands: a printf format with no directive or escape and no further
+  // arguments, an echo with no option and no backslash. Anything the program would expand is not
+  // known here.
+  if (!cmd.args.every((word) => word.literal)) return undefined;
+  const texts = cmd.args.map((word) => word.text);
+  if (name === "printf" && texts.length === 1 && !/[%\\]/.test(texts[0] ?? "")) return texts[0];
+  if (name === "echo" && texts.every((text) => !text.startsWith("-") && !text.includes("\\")))
+    return `${texts.join(" ")}\n`;
+  return undefined;
+}
+
+function writtenThenRun(
+  segments: Word[][],
+  context: Context,
+  rules: Set<HardRule>,
+  depth: number,
+): void {
+  const written = new Map<string, string | undefined>();
+  const keys = (text: string) => {
+    const found = new Set([text]);
+    for (const cwd of context.cwds)
+      try {
+        found.add(slashes(resolveWord(cwd, text)));
+      } catch {
+        /* matched as written */
+      }
+    return [...found];
+  };
+  const lookup = (word: Word | undefined): { content: string | undefined } | undefined => {
+    if (!word) return undefined;
+    if (!word.literal) return written.size ? { content: undefined } : undefined;
+    for (const key of keys(word.text)) if (written.has(key)) return { content: written.get(key) };
+    return undefined;
+  };
+  const text = segments.map((segment) => segment.map((word) => word.text).join(" ")).join("\n");
+  if (/\bnpm\s+pkg\s+set\s+scripts\./.test(text)) rules.add("opaque-script");
+  for (const segment of segments) {
+    const cmd = command(segment);
+    const name = (cmd.program?.text.split(/[\\/]/).pop() ?? "").replace(/\d+(?:\.\d+)*$/, "");
+    // What runs a written file: the file itself, or a shell or interpreter given it.
+    let run: { content: string | undefined } | undefined;
+    let kind: "shell" | "code" = "shell";
+    if (cmd.program && /[\\/]/.test(cmd.program.text)) run = lookup(cmd.program);
+    if (!run && cmd.program?.literal && (SHELL_NAMES.has(name) || INTERPRETERS.has(name))) {
+      const file = cmd.args.find((word) => !word.text.startsWith("-"));
+      run = lookup(file);
+      kind = SHELL_NAMES.has(name) ? "shell" : "code";
+    }
+    // A launcher runs a file it is given anywhere among its words (`uv run f`, `npx tsx f`,
+    // `deno run f`, `bun f`, `pnpm exec node f`): judged as code.
+    if (!run && cmd.program?.literal && LAUNCHERS.has(name))
+      for (const word of cmd.args) {
+        run = lookup(word);
+        if (run) {
+          kind = "code";
+          break;
+        }
+      }
+    if (run) {
+      // Unknown code run by the script could change anything, the policy state included.
+      if (run.content === undefined || depth >= 4) rules.add("policy-state");
+      else if (kind === "shell") {
+        analyzeScript(run.content, context, rules, depth + 1);
+        textRules(run.content, [...context.cwds][0] ?? "", rules);
+      } else {
+        if (codeTouchesState(run.content, context.cwds, { interpreter: name }))
+          rules.add("policy-state");
+        codeSecrets(run.content, context, rules, true);
+      }
+    }
+    // Then what this command writes: a literal body, or something unknown.
+    const targets = [
+      ...segment.filter((word) => word.redirect && word.writes),
+      ...(cmd.program?.literal && /^(?:tee|cp|mv|install|ln|rsync|curl|wget|dd)$/.test(name)
+        ? cmd.args.filter((word) => !word.text.startsWith("-"))
+        : []),
+    ];
+    const body = fileBody(segment);
+    for (const target of targets) {
+      const content = target.redirect ? body : undefined;
+      if (!target.literal) written.set("*", undefined);
+      else for (const key of keys(target.text)) written.set(key, content);
+    }
+  }
 }
 
 function analyzeCommand(
@@ -1188,6 +1667,8 @@ function analyzeCommand(
   context: Context,
   rules: Set<HardRule>,
   depth: number,
+  settled = new Set<string>(),
+  shape: { loopList: boolean; plain: boolean } = { loopList: false, plain: false },
 ): void {
   // Every word could name a file: arguments, redirect targets, assignment values. A here-document
   // body, and an argument with whitespace in it (a message, a PR body), is text, not a path,
@@ -1195,8 +1676,16 @@ function analyzeCommand(
   // The policy service's state may be read by a read-only program; anything else that names it
   // (a write, a move, a delete, a redirection into it, an unknown program) goes to a person.
   const programName = cmd.program?.text.split(/[\\/]/).pop() ?? "";
+  // `cd` and `pushd` change no file (what runs there is judged in that directory), and the words
+  // of a `for NAME in ...` list are values (judged where `$NAME` is used), not operands.
+  // Only in a plain script (`plainScript`), where no expansion can assign: a literal loop list
+  // whose variable is filled in at each use, and builtins that print or wait.
   const reading =
-    !!cmd.program?.literal && readOnly([programName, ...cmd.args.map((word) => word.text)]);
+    shape.loopList ||
+    (!!cmd.program?.literal &&
+      ((shape.plain &&
+        /^(?:case|echo|true|false|break|continue|sleep|seq|wait)$/.test(programName)) ||
+        readOnly([programName, ...cmd.args.map((word) => word.text)])));
   const argTexts = cmd.args.map((word) => word.text);
   // A recursive permission or owner change reaches everything below its operand, so a directory
   // above the state counts as for a delete.
@@ -1260,13 +1749,40 @@ function analyzeCommand(
   // Inline interpreter code (`python3 -c`, `perl -e`, `node -e`, a here-document) that could
   // delete, move or write the state.
   if (cmd.program?.literal && INTERPRETERS.has(programName)) {
-    const code = [
-      ...cmd.args.filter((_, k) =>
-        /^(?:-c|-e|-E|-p|-r|--eval|--print)$/.test(cmd.args[k - 1]?.text ?? ""),
-      ),
-      ...segment.filter((word) => word.heredoc),
-    ].map((word) => word.text);
-    if (code.some((text) => codeTouchesState(text, context.cwds))) rules.add("policy-state");
+    // The literal words after the code are `process.argv[1..]` (node -e) or `sys.argv[1..]`
+    // (python -c, python - with the code on standard input).
+    // Only plain words: node reads options (and a leading `--`) after the code as its own, so a
+    // first word that starts with `-` leaves argv unknown.
+    const words = (from: number) =>
+      cmd.args[from]?.text.startsWith("-")
+        ? []
+        : cmd.args.slice(from).map((word) => (word.literal ? word.text : undefined));
+    const inline = cmd.args.findIndex((_, k) =>
+      /^(?:-c|-e|-E|-p|-r|--eval|--print)$/.test(cmd.args[k - 1]?.text ?? ""),
+    );
+    const dash = cmd.args.findIndex((word) => word.text === "-");
+    const codes: Array<[string, Array<string | undefined>]> = [
+      ...cmd.args
+        .filter((_, k) => /^(?:-c|-e|-E|-p|-r|--eval|--print)$/.test(cmd.args[k - 1]?.text ?? ""))
+        .map((word): [string, Array<string | undefined>] => [
+          word.text,
+          inline >= 0 && /^(?:node|nodejs|python[\d.]*)$/.test(programName)
+            ? words(inline + 1)
+            : [],
+        ]),
+      ...segment
+        .filter((word) => word.heredoc)
+        .map((word): [string, Array<string | undefined>] => [
+          word.text,
+          dash >= 0 && /^python[\d.]*$/.test(programName) ? words(dash + 1) : [],
+        ]),
+    ];
+    if (
+      codes.some(([text, argv]) =>
+        codeTouchesState(text, context.cwds, { argv, interpreter: programName }),
+      )
+    )
+      rules.add("policy-state");
   }
   // awk runs commands through `system(...)` and pipes (`print | "cmd"`, `"cmd" | getline`): a
   // literal command is judged like `sh -c`, anything else is opaque.
@@ -1311,19 +1827,48 @@ function analyzeCommand(
       }
     writeTargets(targets, opaque, scripts.join("\n"), context, rules);
   }
+  // Printing a variable whose name says it holds a secret shows the secret to the agent.
+  if (
+    cmd.program?.literal &&
+    /^(?:echo|printf|print)$/.test(programName) &&
+    cmd.args.some((word) =>
+      [...word.text.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some((match) =>
+        SECRET_VARIABLE.test(match[1] as string),
+      ),
+    )
+  ) {
+    rules.add("credential-read");
+    secretReads++;
+  }
+  // find's name and path patterns are matched below its start directories (`findReachesState`
+  // judges what an action could reach), not paths in the working directory.
+  const findPatterns = new Set<Word>();
+  if (programName === "find" && cmd.program?.literal)
+    cmd.args.forEach((word, k) => {
+      if (/^-(?:i?name|i?path|i?wholename|i?regex|i?lname)$/.test(cmd.args[k - 1]?.text ?? ""))
+        findPatterns.add(word);
+    });
   for (const word of segment) {
-    if (word.heredoc) continue;
+    if (word.heredoc || findPatterns.has(word)) continue;
     if (!word.redirect && !context.runsText && /\s/.test(word.text)) continue;
     const text = word.text.replace(/^[A-Za-z_]\w*=/, "").replace(/^--?[\w-]+=/, "");
     if (!text) continue;
-    pathRules(text, rules, true);
+    // A read, or a word that only names a Git directory for git (`GIT_DIR=...`, `--git-dir=...`,
+    // `--work-tree=...`), reads no credential in Git's own files but its config.
+    const namesGitDir =
+      /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=|^--(?:git-dir|work-tree)=/.test(word.text) &&
+      !word.redirect;
+    const mode: boolean | "read" | "walk" =
+      !word.writes && (reading || namesGitDir) ? (walks && !namesGitDir ? "walk" : "read") : true;
+    pathRules(text, rules, mode);
     const resolved = resolutions(text, context.cwds);
-    for (const path of resolved) pathRules(path, rules, true);
+    for (const path of resolved) pathRules(path, rules, mode);
     // A target is matched as the shell would expand it (a glob, a variable read as `*`), and for a
     // delete or move a directory above the state counts too.
     // A word that is only an expansion (`"$Q"`) counts for a delete, a move or a redirection.
     const target = stateText(text, word.literal);
     const opaque = !word.literal && !/[^*/]/.test(target);
+    if (!cmd.program && settled.has(/^([A-Za-z_]\w*)=/.exec(word.text)?.[1] ?? "")) continue;
     if (
       (word.writes || (!word.redirect && !reading)) &&
       word !== cmd.program &&
@@ -1365,6 +1910,13 @@ function analyzeCommand(
     // An expanded script is not known: judge it on every word the script names.
     if (!inner.literal || depth >= 4) opaqueGitRules(context.words, true, rules);
     return;
+  }
+  if (
+    program.literal &&
+    (printsSecret(name, args) || (name === "git" && printsRemote(args) && remoteHasSecret(context)))
+  ) {
+    rules.add("credential-read");
+    secretReads++;
   }
   if (program.literal && CLOUD.has(name)) {
     if (args.some((arg) => SECRET_WORD.test(arg))) rules.add("credential-read");
@@ -1518,6 +2070,18 @@ export function scriptRules(
   return rules;
 }
 
+/**
+ * The patch an `apply_patch` request carries: the first of `command`, `patch` and `input` that is
+ * a string holding `*** Begin Patch` (Codex may send `command` as an argv array), else the first
+ * string among them.
+ */
+export function patchField(input: Record<string, unknown>): string | undefined {
+  const fields = [input.command, input.patch, input.input].filter(
+    (value): value is string => typeof value === "string",
+  );
+  return fields.find((value) => value.includes("*** Begin Patch")) ?? fields[0];
+}
+
 /** The hard rules a request falls under, from what it touches. */
 function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: string[]): void {
   const input = request.input;
@@ -1526,7 +2090,8 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
     for (const target of [path, ...resolutions(path, cwds)]) {
       if (write) pathRules(target, rules, false);
       if (write && policyStatePath(target)) rules.add("policy-state");
-      if (sensitive(slashes(target))) rules.add("credential-read");
+      if (write ? sensitive(slashes(target)) : readSensitive(slashes(target)))
+        rules.add("credential-read");
     }
   };
   // A tool that reads or searches a tree (Grep, Glob, LS, a notebook) on a session directory, or a
@@ -1535,7 +2100,10 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
     const path = input.path ?? input.notebook_path ?? input.file_path ?? input.dir_path;
     const target = typeof path === "string" && path ? path : request.cwd;
     if (target && namesStateSecret(slashes(target), cwds, true)) rules.add("credential-read");
-    if (typeof path === "string") file(path, false);
+    // A tree read of a Git directory reads its config: judged the strict way.
+    if (typeof path === "string")
+      for (const at of [path, ...resolutions(path, cwds)])
+        if (sensitive(slashes(at))) rules.add("credential-read");
     return;
   }
   if (WRITE_TOOLS.has(request.tool) || ["Read", "view", "read_file"].includes(request.tool)) {
@@ -1544,7 +2112,7 @@ function requestRules(request: Request, rules: Set<HardRule>, scratchRoots: stri
     return;
   }
   if (request.tool === "apply_patch") {
-    const patch = input.command ?? input.patch ?? input.input;
+    const patch = patchField(input);
     if (typeof patch !== "string") return;
     for (const line of patch.split("\n"))
       if (/^\*\*\* (?:Add File|Update File|Delete File|Move to): /.test(line))
@@ -1567,8 +2135,23 @@ export function hardRules(
   decision: Decision,
   scratchRoots: string[] = [],
 ): HardRule[] {
-  // The engine and the session ask about the same request in turn: answer from a short memo.
-  const key = JSON.stringify([
+  // Within one decision (`withEvidence`) the engine asks about the same request more than once:
+  // answer from a memo that ends with the decision, so no later request sees a stale answer.
+  const scope = evidenceScope();
+  const key = ruleKey(request, decision, scratchRoots);
+  const hit = scope === undefined ? undefined : ruleMemo.get(key);
+  if (hit && hit.scope === scope) return [...hit.rules];
+  const before = secretReads;
+  const rules = withEvidence(() => hardRulesOnce(request, decision, scratchRoots));
+  lastSecret = secretReads > before;
+  if (scope !== undefined) {
+    if (ruleMemo.size >= 32) ruleMemo.delete(ruleMemo.keys().next().value as string);
+    ruleMemo.set(key, { scope, rules, secret: lastSecret });
+  }
+  return [...rules];
+}
+const ruleKey = (request: Request, decision: Decision, scratchRoots: string[]) =>
+  JSON.stringify([
     request.tool,
     request.cwd,
     request.input,
@@ -1577,16 +2160,9 @@ export function hardRules(
     decision.userOnly ?? false,
     scratchRoots,
   ]);
-  const now = Date.now();
-  const hit = ruleMemo.get(key);
-  if (hit && now - hit.at < 2000) return [...hit.rules];
-  const before = secretReads;
-  const rules = withEvidence(() => hardRulesOnce(request, decision, scratchRoots));
-  if (ruleMemo.size >= 32) ruleMemo.delete(ruleMemo.keys().next().value as string);
-  ruleMemo.set(key, { at: now, rules, secret: secretReads > before });
-  return [...rules];
-}
-const ruleMemo = new Map<string, { at: number; rules: HardRule[]; secret: boolean }>();
+/** Whether the last computed (not memoized) hard-rule answer read a policy secret. */
+let lastSecret = false;
+const ruleMemo = new Map<string, { scope: number; rules: HardRule[]; secret: boolean }>();
 /** Shell words that read the policy service's own secrets, counted as the scan finds them. */
 let secretReads = 0;
 /**
@@ -1604,18 +2180,12 @@ export function readsPolicySecret(request: Request, scratchRoots: string[] = [])
     cache: "none",
     cached: false,
   };
-  const before = secretReads;
+  const scope = evidenceScope();
+  const hit =
+    scope === undefined ? undefined : ruleMemo.get(ruleKey(request, decision, scratchRoots));
+  if (hit && hit.scope === scope) return hit.secret;
   hardRules(request, decision, scratchRoots);
-  const key = JSON.stringify([
-    request.tool,
-    request.cwd,
-    request.input,
-    decision.reason,
-    decision.category,
-    false,
-    scratchRoots,
-  ]);
-  return ruleMemo.get(key)?.secret ?? secretReads > before;
+  return lastSecret;
 }
 function hardRulesOnce(request: Request, decision: Decision, scratchRoots: string[]): HardRule[] {
   const rules = new Set<HardRule>();

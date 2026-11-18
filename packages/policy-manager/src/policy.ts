@@ -11,7 +11,7 @@ import {
   resolveWord,
   withEvidence,
 } from "./evidence.js";
-import { hardRule, hardRules, readsPolicySecret } from "./hard.js";
+import { hardRule, hardRules, patchField, readsPolicySecret } from "./hard.js";
 
 /** Tools that write a file (a shell command is judged by the engine itself). */
 const WRITE_TOOLS = new Set([
@@ -25,6 +25,7 @@ const WRITE_TOOLS = new Set([
   "apply_patch",
 ]);
 
+import { credentialUse } from "./creduse.js";
 import { onRemote } from "./merged.js";
 import { commandDecision, permissiveRead, permissiveWrite } from "./permissive.js";
 import { mcpReadOnly, type Profile, strictProfile } from "./profile.js";
@@ -41,14 +42,86 @@ import {
   type Request,
 } from "./types.js";
 
+/**
+ * The files a Codex `apply_patch` changes, or undefined for a patch that does not follow the
+ * format: `*** Begin Patch`, then file sections, then `*** End Patch` (a trailing newline and
+ * CRLF line endings are fine). A section is `*** Add File: <path>` with `+` lines,
+ * `*** Delete File: <path>`, or `*** Update File: <path>` with an optional `*** Move to: <path>`
+ * and hunks: `@@` (with or without context text), then ` `, `+` and `-` lines, and an optional
+ * `*** End of File`. A path may be absolute, relative, a Windows path, or contain spaces.
+ */
+export function parsePatch(text: string): { targets: string[]; deletes: string[] } | undefined {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  while (lines.length && lines.at(-1) === "") lines.pop();
+  if (lines[0]?.trim() !== "*** Begin Patch" || lines.at(-1)?.trim() !== "*** End Patch")
+    return undefined;
+  const targets: string[] = [];
+  const deletes: string[] = [];
+  const header = (line: string, name: string) => {
+    const prefix = `*** ${name}: `;
+    if (!line.startsWith(prefix)) return undefined;
+    const path = line.slice(prefix.length).trim();
+    return path && !/[\0\r\n]/.test(path) ? path : "";
+  };
+  let section: "add" | "update" | "delete" | undefined;
+  let afterHeader = false;
+  for (const line of lines.slice(1, -1)) {
+    const add = header(line, "Add File");
+    const update = header(line, "Update File");
+    const remove = header(line, "Delete File");
+    const move = header(line, "Move to");
+    if (add === "" || update === "" || remove === "" || move === "") return undefined;
+    if (add !== undefined) {
+      targets.push(add);
+      section = "add";
+    } else if (update !== undefined) {
+      targets.push(update);
+      section = "update";
+      afterHeader = true;
+      continue;
+    } else if (remove !== undefined) {
+      deletes.push(remove);
+      section = "delete";
+    } else if (move !== undefined) {
+      if (section !== "update" || !afterHeader) return undefined;
+      targets.push(move);
+    } else if (section === "add") {
+      if (!line.startsWith("+")) return undefined;
+    } else if (section === "update") {
+      if (!/^(?:@@|[ +-]|\*\*\* End of File$)/.test(line) && line !== "") return undefined;
+    } else return undefined;
+    afterHeader = false;
+  }
+  return { targets, deletes };
+}
+
 export function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 /** Shell tools whose `description` only labels the command. Elsewhere it can be content. */
 export const SHELL_TOOLS = new Set(["Bash", "bash", "exec_command", "shell"]);
 /** The correlation hash of a request, over its effect-relevant input only. */
+/** Input fields that name a file, for deciding whether a file tool depends on its cwd. */
+const PATH_FIELDS = ["file_path", "path", "notebook_path", "dir_path"];
 export function requestHash(request: Request): string {
-  if (!SHELL_TOOLS.has(request.tool)) return hash(request);
+  if (!SHELL_TOOLS.has(request.tool)) {
+    // What a file tool does depends on its paths, not on bookkeeping (a tool-use id, a
+    // description) or, when every path is absolute, on the session's working directory.
+    const paths = PATH_FIELDS.map((key) => request.input?.[key]).filter((v) => v !== undefined);
+    // Only file tools: elsewhere a description can be content (an MCP work item body).
+    if (!paths.length) return hash(request);
+    const input = Object.fromEntries(
+      Object.entries(request.input ?? {}).filter(
+        ([key]) => !/^(?:description|tool_use_id|toolUseId)$/.test(key),
+      ),
+    );
+    const absolute =
+      paths.length > 0 &&
+      paths.every(
+        (value) => typeof value === "string" && /^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(value),
+      );
+    return hash({ ...request, input, ...(absolute ? { cwd: "" } : {}) });
+  }
   const input = Object.fromEntries(
     Object.entries(request.input ?? {}).filter(([key]) => key !== "description"),
   );
@@ -419,6 +492,19 @@ function evaluateOnce(
   const command = request.input?.command ?? request.input?.cmd;
   if (SHELL_TOOLS.has(request.tool) && typeof command === "string" && tooManyWords(command))
     return result(request, "unknown", TOO_MANY_WORDS);
+  // A listed credential that only flows into a listed consumer: the request is the consumer.
+  const consumer =
+    SHELL_TOOLS.has(request.tool) && typeof command === "string"
+      ? credentialUse(command, profile.credentialUses ?? [])
+      : undefined;
+  if (consumer !== undefined) {
+    const inner = evaluateOnce(
+      { ...request, input: { ...request.input, command: consumer, cmd: undefined } },
+      ai,
+      profile,
+    );
+    return { ...inner, requestHash: requestHash(request), credentialUse: true };
+  }
   const decision = evaluateSteps(request, ai, profile);
   if (decision.decision !== "approve" || !SHELL_TOOLS.has(request.tool)) return decision;
   const floor = hardRules(request, { ...decision, decision: "human" }, profile.scratchRoots).find(
@@ -442,7 +528,7 @@ function evaluateOnce(
       ...result(
         request,
         "sensitive",
-        "Reading the policy service's session credentials requires a person",
+        "A command that shows a secret (a token, credentials, or the policy service's session files) requires a person",
       ),
       hard: "credential-read",
     };
@@ -582,17 +668,13 @@ function evaluateCore(request: Request, profile: Profile): Decision {
     return result(request, "unknown", "Execution directory differs from the reviewed directory");
   // Only the target decides a file tool: `content`, `old_string` and `new_string` are data.
   const file = input.file_path ?? input.notebook_path ?? input.path;
-  if (request.tool === "apply_patch" && typeof input.command === "string") {
-    const lines = input.command.split("\n");
-    if (lines[0] !== "*** Begin Patch" || lines.at(-1)?.trim() !== "*** End Patch")
-      return result(request, "unknown", "Unrecognized patch format");
-    const paths: string[] = [];
-    for (const line of lines) {
-      if (line.startsWith("*** Delete File: "))
-        return result(request, "destructive", "File deletion requires human approval");
-      for (const prefix of ["*** Add File: ", "*** Update File: ", "*** Move to: "])
-        if (line.startsWith(prefix)) paths.push(line.slice(prefix.length));
-    }
+  const patchText = patchField(input);
+  if (request.tool === "apply_patch" && typeof patchText === "string") {
+    const patch = parsePatch(patchText);
+    if (!patch) return result(request, "unknown", "Unrecognized patch format");
+    if (patch.deletes.length)
+      return result(request, "destructive", "File deletion requires human approval");
+    const paths = patch.targets;
     if (!paths.length) return result(request, "unknown", "Patch has no verified target paths");
     const checks = paths.map((path) =>
       profile.mode === "permissive"
@@ -618,7 +700,7 @@ function evaluateCore(request: Request, profile: Profile): Decision {
     const evidence =
       profile.mode === "permissive"
         ? write
-          ? permissiveWrite(request.cwd, file, profile)
+          ? permissiveWrite(request.cwd, file, profile, undefined, false, true)
           : permissiveRead(request.cwd, file)
         : pathEvidence(request.cwd, file, write);
     return result(request, evidence.category, evidence.reason, evidence.allowed);

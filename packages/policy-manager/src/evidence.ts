@@ -4,12 +4,14 @@ import {
   existsSync,
   lstatSync,
   readdirSync,
+  readFileSync,
   readlinkSync,
   realpathSync,
   statSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { parseShell } from "./shell.js";
 
 /** Path separators: `/`, and `\` only on Windows; on POSIX `\` is a file-name character. */
 const SEPARATOR = process.platform === "win32" ? /[\\/]/ : /\//;
@@ -65,8 +67,14 @@ let gitMemo: Map<string, { out?: string; error?: unknown }> | undefined;
 let gitDepth = 0;
 /** `canonical` answers for the length of one decision, like `gitMemo`. */
 let realMemo: Map<string, { out?: string; error?: unknown }> | undefined;
+let evidenceScopes = 0;
+/** The current decision's scope, or undefined outside one: memos must not outlive it. */
+export function evidenceScope(): number | undefined {
+  return gitDepth > 0 ? evidenceScopes : undefined;
+}
 export function withEvidence<T>(run: () => T): T {
   if (gitDepth++ === 0) {
+    evidenceScopes++;
     gitMemo = new Map();
     realMemo = new Map();
   }
@@ -143,7 +151,8 @@ export function inside(root: string, path: string): boolean {
   const rel = relative(root, path);
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
-const CREDENTIAL_CONFIG_DIRS = /(?:^|[\\/])\.config[\\/](?:gh|gcloud|op|hub)(?:[\\/]|$)/i;
+const CREDENTIAL_CONFIG_DIRS =
+  /(?:^|[\\/])\.config[\\/](?:gh|gcloud|op|hub|curl|git|pip|yarn|npm)(?:[\\/]|$)/i;
 
 /**
  * A file in a policy service session directory (`acp-<uid>-*`) other than its audit logs: the
@@ -164,10 +173,37 @@ export function sensitive(path: string): boolean {
     path
       .split(/[\\/]/)
       .some((part) =>
-        /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gcloud|\.docker|\.gnupg|\.password-store|\.git-credentials|\.vault-token|\.pgpass|\.my\.cnf|\.pypirc|\.npmrc|\.netrc|\.kube|(?:credentials?|secrets?)(?:\.(?:json|ya?ml|toml|ini|env|txt|xml|conf|cfg|properties))?|id_rsa|id_ed25519|id_ecdsa|kubeconfig|terraform\.tfstate(?:\..*)?|.*\.(?:pem|key|pfx|p12))$/i.test(
+        /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gcloud|\.docker|\.gnupg|\.password-store|\.git-credentials|\.vault-token|\.pgpass|\.my\.cnf|\.pypirc|\.npmrc|\.netrc|\.kube|(?:credentials?|secrets?)(?:\.(?:json|ya?ml|toml|ini|env|txt|xml|conf|cfg|properties))?|id_(?:rsa|dsa|ecdsa|ed25519|ecdsa_sk|ed25519_sk|xmss)|client_secret.*\.json|\.curlrc|curlrc|\.wgetrc|\.gitconfig|\.yarnrc(?:\.yml)?|kubeconfig|terraform\.tfstate(?:\..*)?|.*\.(?:pem|key|pfx|p12|p8|jks|keystore|ppk))$/i.test(
           part,
         ),
       )
+  );
+}
+/** Files in a Git directory that can hold credentials (a token in a remote URL or extra header). */
+const GIT_SECRET = /^(?:config.*|\.?credentials?(?:\..*)?|.*\.(?:pem|key))$/i;
+/**
+ * Whether reading `path` could read a credential. A Git directory is one only for the files that
+ * can hold one (`config`, `config.worktree`, credentials), or when read as a tree (`whole`) from the
+ * directory itself, a linked worktree's or a submodule's: `HEAD`, `gitdir`, `commondir`, `locked`,
+ * refs and logs carry none, and neither does a worktree's `.git` file. Writes keep `sensitive`.
+ */
+export function readSensitive(path: string, whole = false): boolean {
+  if (!sensitive(path)) return false;
+  // A pattern (a glob or brace expansion) can name any file there: judged the strict way.
+  if (/[*?[{]/.test(path)) return true;
+  const parts = path.split(/[\\/]/);
+  const at = parts.findIndex((part) => part.toLowerCase() === ".git");
+  if (at < 0) return true;
+  const rest = parts.slice(at + 1).filter(Boolean);
+  // Sensitive for another reason as well (a key file, `.ssh`, the policy state, `gh` config).
+  const other = [...parts.slice(0, at), ...rest].join("/");
+  if (sensitive(other) || rest.some((part) => part.toLowerCase() === ".git")) return true;
+  if (rest.some((part) => GIT_SECRET.test(part))) return true;
+  if (!whole) return false;
+  return (
+    rest.length === 0 ||
+    (rest[0] === "worktrees" && rest.length <= 2) ||
+    (rest[0] === "modules" && !rest.some((part) => /^(?:objects|refs|logs|hooks|info)$/.test(part)))
   );
 }
 const PROTECTED_NAME =
@@ -246,6 +282,13 @@ export function isProtectedPath(path: string): boolean {
     while (!existsSync(parent)) parent = dirname(parent);
     const root = canonical(git(parent, ["rev-parse", "--show-toplevel"]));
     const feature = featureCheckout(parent) === root;
+    // A path in `.claude/worktrees/<name>/` whose worktree is gone (or not yet made) is judged
+    // inside that worktree's own top level, as it would be while it exists; its default branch is
+    // unknown, so the worktree-code names stay protected.
+    const inside = /^\.claude\/worktrees\/[^/]+\/(.+)$/.exec(
+      relative(root, canonical(path)).replace(/\\/g, "/"),
+    )?.[1];
+    if (inside !== undefined) return protectedPath(inside);
     if (protectedPath(relative(root, canonical(path)), feature)) return true;
     // A protected name that is a symlink (`.claude -> config`) vanishes once the path is resolved,
     // so also judge the path as written, relative to the checkout it lives in.
@@ -393,6 +436,8 @@ export interface Fill {
     approved: boolean;
     /** Background jobs started so far; one may outlive the loop or pipeline that started it. */
     jobs: number;
+    /** An earlier command may have written or changed a file (anything but a plain reader). */
+    wrote?: boolean;
   };
   /** In a loop, a pipeline or a background job a later command can run first. */
   reorder: boolean;
@@ -456,6 +501,45 @@ export function notedProtectedWrite(
   return true;
 }
 
+export const MEMORY_WRITE = "Write to Claude Code's auto-memory";
+/**
+ * Whether a write target is a Markdown file directly in a Claude Code auto-memory directory,
+ * `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<project>/memory/<name>.md` (`MEMORY.md` included),
+ * which Claude Code itself writes without asking. The path as written has no `..` segment, and
+ * resolves to that same place with no symlink on the way: neither the file nor any directory.
+ */
+export function claudeMemoryFile(input: string, lexical: string): boolean {
+  try {
+    if (input.split(/[\\/]/).includes("..")) return false;
+    const config = resolve(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"));
+    const rel = relative(config, resolve(lexical)).split(sep);
+    if (rel.length !== 4 || rel[0] !== "projects" || rel[2] !== "memory") return false;
+    const [, project = "", , name = ""] = rel;
+    if (!project || project.startsWith(".") || !/^[^/\\]+\.md$/.test(name)) return false;
+    // No symlink anywhere: the configuration directory and every step below it are what they say.
+    const memory = join(config, "projects", project, "memory");
+    if (canonical(memory) !== join(canonical(config), "projects", project, "memory")) return false;
+    // A directory not created yet is fine (Claude Code creates it); one that exists is no link.
+    for (const dir of [join(config, "projects"), join(config, "projects", project), memory])
+      if (isLink(dir)) return false;
+    const file = join(memory, name);
+    if (existsSync(file) || isLink(file)) {
+      const stat = lstatSync(file);
+      if (!stat.isFile() || stat.nlink > 1) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isLink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 export function pathEvidence(
   cwd: string,
   input: string,
@@ -466,6 +550,8 @@ export function pathEvidence(
     const path = canonical(lexical);
     if (write && notedProtectedWrite(input, lexical, path))
       return { allowed: true, category: "worktree-write", reason: NOTED_WRITE };
+    if (write && claudeMemoryFile(input, lexical))
+      return { allowed: true, category: "worktree-write", reason: MEMORY_WRITE };
     if (
       sensitive(path) ||
       sensitive(lexical) ||
@@ -518,4 +604,113 @@ export function branchEvidence(cwd: string, branch: string): string {
   } catch {
     return "Local branch deletion requires human approval; branch reachability could not be verified";
   }
+}
+
+/**
+ * The top level of the verified linked feature worktree that `GIT_DIR=<value>` (its own git
+ * directory, `.git/worktrees/<name>`, or the `.git` file it has) or `GIT_WORK_TREE=<value>` (its
+ * top level) names, as a literal path. A main checkout, another repository, or anything unsure
+ * is undefined.
+ */
+export function featureGitTop(name: string, value: string, cwd: string): string | undefined {
+  if (!value || /[$`*?[{~]/.test(value)) return undefined;
+  try {
+    const path = canonical(resolve(cwd, value));
+    if (name === "GIT_WORK_TREE") return featureCheckout(path) === path ? path : undefined;
+    if (name !== "GIT_DIR") return undefined;
+    if (basename(path) === ".git" && statSync(path).isFile()) {
+      const top = dirname(path);
+      return featureCheckout(top) === top ? top : undefined;
+    }
+    // A linked worktree's git directory names its worktree in `gitdir` (`<worktree>/.git`).
+    const pointer = readFileSync(join(path, "gitdir"), "utf8").trim();
+    const top = canonical(dirname(resolve(path, pointer)));
+    if (featureCheckout(top) !== top) return undefined;
+    return canonical(git(top, ["rev-parse", "--absolute-git-dir"])) === path ? top : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether git, run in `cwd` with these `GIT_DIR`/`GIT_WORK_TREE` tops, reads and writes only the
+ * one verified feature worktree: both set to the same worktree, or one set and `cwd` inside that
+ * worktree (git takes the other from `cwd`). With only `GIT_DIR`, git uses `cwd` as the work
+ * tree, so from the main checkout it would write the main checkout.
+ */
+export function gitEnvConfined(
+  dir: string | undefined,
+  workTree: string | undefined,
+  cwd: string,
+): boolean {
+  if (dir && workTree) return dir === workTree;
+  const top = dir ?? workTree;
+  if (!top) return true;
+  try {
+    return inside(top, canonical(cwd));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a script that sets `GIT_DIR`/`GIT_WORK_TREE` keeps git where those name: it has no
+ * git option that moves git elsewhere (`-C`, `--work-tree`, `--git-dir`, `--namespace`), no
+ * `pushd`/`popd`, and every `cd` is a literal path into the one verified worktree the variables
+ * name. Otherwise the variables are an environment override as before.
+ */
+export function gitEnvScriptSafe(script: string, cwd: string): boolean {
+  // Judge the words the shell will actually pass (quotes removed, line continuations joined). A
+  // script the scanner cannot flatten into plain commands (loops, conditionals, background jobs,
+  // unreadable words) gets no exception.
+  const pipelines = parseShell(script);
+  if (!pipelines) return false;
+  const tops = new Set<string | undefined>();
+  const commands = pipelines.flat();
+  const note = (name: string, value: string) => {
+    if (name === "GIT_DIR" || name === "GIT_WORK_TREE") tops.add(featureGitTop(name, value, cwd));
+  };
+  for (const command of commands) {
+    if (command.subs.length) return false;
+    for (const [name, value] of command.env) note(name, value);
+    const name = basename(command.argv[0] ?? "");
+    if (name === "export")
+      for (const word of command.argv.slice(1)) {
+        const at = word.indexOf("=");
+        if (at > 0) note(word.slice(0, at), word.slice(at + 1));
+      }
+  }
+  const [top] = tops;
+  if (tops.size !== 1 || !top) return false;
+  // Git global options that take a value; the subcommand follows them.
+  const VALUED = new Set(["-c", "--exec-path", "--config-env", "--super-prefix", "--list-cmds"]);
+  for (const command of commands) {
+    const [program = "", ...args] = command.argv;
+    const name = basename(program);
+    if (name === "pushd" || name === "popd") return false;
+    if (name === "cd") {
+      const target = args.length === 1 ? args[0] : undefined;
+      if (!target || target === "-" || /[$`*?[{~]/.test(target)) return false;
+      try {
+        if (!inside(top, canonical(resolve(cwd, target)))) return false;
+      } catch {
+        return false;
+      }
+      continue;
+    }
+    if (name === "git") {
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i] as string;
+        if (!arg.startsWith("-")) break;
+        if (/^(?:-C|--work-tree|--git-dir|--namespace)(?:=|$)|^-C./.test(arg)) return false;
+        if (VALUED.has(arg)) i++;
+      }
+      continue;
+    }
+    // Anything else that could start git (wrappers, shells, xargs) voids the exception.
+    if (name === "export") continue;
+    if (args.some((arg) => basename(arg) === "git" || /(?:^|[\s;&|(`'"])git(?:\s|$)/.test(arg)))
+      return false;
+  }
+  return true;
 }

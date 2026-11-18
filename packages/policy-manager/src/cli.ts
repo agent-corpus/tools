@@ -104,8 +104,29 @@ function pmReady(): boolean {
     return false;
   }
 }
+/** The subcommands, for `--help`. */
+const help = `policy-manager <subcommand>
+Subcommands: hook, review, classify, record, approve, setup-hook, setup-hook-claude,
+setup-hook-codex, setup-hook-copilot, config, profile validate, profile install, replay,
+review-classifications, stop, usage, help, --help, --version.
+Run \`policy-manager usage\` for every subcommand's arguments.
+`;
+/**
+ * `--version`, `--help` and `help` touch no session service, and a failure here is not a policy
+ * failure: it reports itself.
+ */
+function info(): void {
+  try {
+    console.log(action === "--version" ? cliVersion(cliPath) : help);
+  } catch {
+    console.error("The policy-manager version could not be read.");
+    process.exitCode = 1;
+  }
+}
 try {
-  if (action === "usage" || !action)
+  if (args.length === 1 && (action === "--version" || action === "--help" || action === "help"))
+    info();
+  else if (action === "usage" || !action)
     console.log(args.includes("--json") ? JSON.stringify({ usage }) : usage);
   else if (action === "setup-hook" || /^setup-hook-(claude|codex|copilot)$/.test(action)) {
     const alias = action.match(/^setup-hook-(claude|codex|copilot)$/)?.[1];

@@ -1,6 +1,7 @@
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, posix } from "node:path";
+import { maskStrings, withoutStrings } from "./clirun.js";
 import { canonical, resolveWord, tempRoots } from "./evidence.js";
 
 /**
@@ -14,6 +15,8 @@ import { canonical, resolveWord, tempRoots } from "./evidence.js";
 const slashes = (path: string) => path.replace(/\\/g, "/");
 const WINDOWS = process.platform === "win32";
 const STATE_DIR = /^acp-(?:\d+|user)-/i;
+/** A path with a session directory name in it, wherever it lies. */
+const STATE_NAME = /(?:^|[\\/])acp-(?:\d+|user)-[^\\/]*(?:[\\/]|$)/i;
 /** Files a session directory holds, by name; a sample stands for the rotated logs. */
 const STATE_FILES = ["audit.jsonl", "audit.00000001.jsonl", "token", "service.sock", "grants.json"];
 
@@ -530,8 +533,12 @@ function callArgs(code: string, start: number, parens: boolean): string[] | unde
  * `pathlib.Path(<literal>)`, `open(<literal>[, mode])` (the file it opens), or `os.path.join` of
  * literals only. Anything computed (a variable, `Path.cwd()`, concatenation, an f-string) is not.
  */
-function literalPath(text: string): string | undefined {
+function literalPath(text: string, argv: Array<string | undefined> = []): string | undefined {
   const expr = text.trim();
+  // `process.argv[1]` (node -e) and `sys.argv[1]` (python -c, python -) are the first word after
+  // the code, when the shell passed a literal one.
+  const arg = /^(?:process\s*\.\s*argv|sys\s*\.\s*argv)\s*\[\s*([1-9])\s*\]$/.exec(expr);
+  if (arg) return argv[Number(arg[1]) - 1];
   // The arguments of a call that is the whole expression: `Path(x)`, not `Path(x).read_text()`.
   const call = (pattern: RegExp) => {
     const match = pattern.exec(expr);
@@ -556,17 +563,47 @@ function literalPath(text: string): string | undefined {
 }
 
 /**
- * Variables assigned exactly once, to a literal path (`literalPath`): `p = '/x'`,
- * `const p = "/x"`, `p = Path('/x')`, `f = open('/x', 'w')`, `p = os.path.join('/tmp', 'x')`.
+ * Variables whose every assignment is a literal path (`literalPath`): `p = '/x'`,
+ * `const p = "/x"`, `p = Path('/x')`, `f = open('/x', 'w')`, `p = os.path.join('/tmp', 'x')`,
+ * `f = process.argv[1]` with a literal word there. The value is one of them wherever it is read. A
+ * name that is also bound another way (a parameter, a loop or `with ... as` target, destructuring,
+ * an augmented assignment) has no known value.
  */
-function literalVariables(code: string): Map<string, string | undefined> {
-  const found = new Map<string, string | undefined>();
+function literalVariables(
+  code: string,
+  argv: Array<string | undefined> = [],
+): Map<string, string[] | undefined> {
+  const found = new Map<string, string[] | undefined>();
   for (const line of code.split(/[\n;]/)) {
     const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)(.*)$/.exec(line);
     if (!match) continue;
     const [, name = "", value = ""] = match;
-    found.set(name, found.has(name) ? undefined : literalPath(value));
+    const path = literalPath(value, argv);
+    found.set(name, found.has(name) || path === undefined ? undefined : [path]);
   }
+  // Exactly one binding: any other assignment to the name, wherever it is (`if 1: p = x`, a
+  // walrus, `+=`, destructuring, `global`/`nonlocal`), makes its value unknown.
+  for (const name of found.keys()) {
+    const word = `\\b${name}\\b`;
+    const assignments = code.match(
+      new RegExp(`${word}\\s*(?:[-+*/%&|^@:]|\\*\\*|//|<<|>>|\\?\\?|\\|\\||&&)?=(?!=)`, "g"),
+    );
+    if (
+      (assignments?.length ?? 0) !== 1 ||
+      new RegExp(
+        `\\b(?:global|nonlocal)\\b[^\\n;]*${word}|[[{(][^\\]})\\n]*${word}[^\\]})\\n]*[\\]})]\\s*=(?!=)`,
+      ).test(code)
+    )
+      found.set(name, undefined);
+  }
+  const bound = (list: string) => {
+    for (const name of list.split(/[\s,()[\]{}*=:.]+/))
+      if (/^[A-Za-z_]\w*$/.test(name)) found.set(name, undefined);
+  };
+  for (const match of code.matchAll(
+    /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|\b(\w+)\s*,\s*\w+\s*=(?!=)|\b\w+\s*,\s*(\w+)\s*=(?!=)/g,
+  ))
+    for (const group of match.slice(1)) if (group) bound(group);
   return found;
 }
 
@@ -576,20 +613,40 @@ function literalVariables(code: string): Map<string, string | undefined> {
  * `join`, an f-string, a variable not assigned a literal once, a `listdir`/`walk` result): the
  * state lies in the temp directory, so a computed path fails closed.
  */
-function callsReachState(code: string, cwds: string[]): boolean {
-  const vars = literalVariables(code);
+function callsReachState(
+  code: string,
+  cwds: string[],
+  given: Array<string | undefined> = [],
+  interpreter = "",
+): boolean {
+  let argv = given;
+  // Words after the code stand for `process.argv`/`sys.argv` only while the code never changes it.
+  if (
+    /argv\s*(?:\[[^\]]*\]\s*(?:[-+*/%]?=(?!=))|=(?!=)|\.\s*(?:splice|push|shift|unshift|pop|insert|remove|append|extend|reverse|sort|clear|fill|copyWithin)\b)|\bdel\s+sys\s*\.\s*argv|\bargv\s*\[[^\]]*:/.test(
+      code,
+    )
+  )
+    argv = [];
+  const vars = literalVariables(code, argv);
   const aliases = moduleAliases(code);
-  const value = (arg: string): string | undefined => {
+  const values = (arg: string): string[] | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
     if (name) return vars.get(name);
-    return literalPath(arg);
+    const path = literalPath(arg, argv);
+    return path === undefined ? undefined : [path];
   };
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
-    const path = value(arg);
-    return path === undefined || namesState(path, cwds, true);
+    const paths = values(arg);
+    // A session directory by its name counts too, also one not created yet or another user's.
+    return (
+      paths === undefined ||
+      paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true))
+    );
   };
-  for (const match of code.matchAll(FILE_CALL)) {
+  // Calls are found outside string literals (a message or source text being edited is data);
+  // their arguments are read from the code itself.
+  for (const match of maskStrings(code, interpreter).matchAll(FILE_CALL)) {
     const [whole, receiver, name = "", opener = ""] = match;
     const at = (match.index ?? 0) + whole.length;
     const parens = opener.includes("(");
@@ -665,6 +722,50 @@ function callsReachState(code: string, cwds: string[]): boolean {
   return false;
 }
 
+/**
+ * Code that can start a process or evaluate a string, so names in its text may become commands or
+ * file calls this cannot read.
+ */
+/**
+ * A call this cannot name: a computed member (`fs['rm'+'Sync'](x)`), a module function under
+ * another name (`import os as o`, `from os import remove as r`, `f = os.remove`), Ruby `send`,
+ * Perl symbolic calls (`&$f`, `->$m`), PHP variable functions (`$f(x)`).
+ */
+export const INDIRECT_CALL =
+  /\]\s*\(|\bgetattr\s*\(|\bimport\s+[\w.]+\s+as\b|\bfrom\s+[\w.]+\s+import\b[^\n]*\bas\b|=\s*(?:os|shutil|fs|fsp|promises|pathlib|Path|FileUtils|File|Dir)\s*\.\s*\w+\s*(?:$|[;,)\n])|\b(?:public_send|__send__)\b|\.send\s*[(:]|\bmethod\s*\(\s*:|&\$\w|&\{|->\s*\$|\$\w+\s*\(|\bcall_user_func/m;
+export const RUNS_CODE =
+  /child_process|subprocess|\bspawn|\bexec(?:Sync|File\w*|[lv]p?e?)?\s*\(|\bsystem\s*[("'$]|\bpopen|Popen|\bpty\b|\bcommands\s*\.|shell_exec|passthru|proc_open|\bqx\b|%x[({[]|\bIO\s*\.\s*popen|Bun\s*\.|Deno\s*\.|\beval\b|\bFunction\s*\(|\bvm\s*\.|\bWorker\s*\(|__import__|importlib|\bgetattr\s*\(|\bcompile\s*\(|\brequire\s*\(\s*[^'"\s)]|\bimport\s*\(\s*[^'"\s)]|\bsend\s*\(|call_user_func|\bos\s*\.\s*(?:system|popen|exec|spawn|posix_spawn|fork)|\bReflect\b|\.\s*(?:call|apply|bind)\s*\(/;
+/** A module member that is not called (`const r = fs.rmSync`) or a computed one (`fs["rmSync"]`). */
+const UNCALLED_MEMBER =
+  /\b(?:fs|fsp|os|shutil|promises|pathlib|FileUtils|File|Dir|IO|Pathname)\s*(?:\.\s*\w+\b(?!\s*[.(\w])|\[)|\bimport\s+\*|\buse\s+File::|\brequire\s+["']fileutils/;
+/** Names that change files: an imported one is a file call this only follows by its own name. */
+const FILE_NAME =
+  /^(?:rm|unlink|rmdir|remove|move|copy|cp|mv|rename|replace|truncate|symlink|link|chmod|chown|chdir|touch|open|fopen|write|append|output|empty|ensure|mk|copytree|copyfile|copy2|rmtree|removedirs|renames)/i;
+/**
+ * Whether code reaches a file function other than by a call `callsReachState` reads: an uncalled
+ * or computed module member, a wildcard import, or a file function imported under another name, or
+ * one whose name is not a bare call read there (`const { rm } = require("fs/promises")`,
+ * `from os import remove`).
+ */
+function hiddenFileCall(code: string): boolean {
+  if (UNCALLED_MEMBER.test(code)) return true;
+  const lists = [
+    ...code.matchAll(/\bimport\s*(?:\w+\s*,\s*)?\{([^}]*)\}\s*from/g),
+    ...code.matchAll(/(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:require|await\s+import)\s*\(/g),
+    ...code.matchAll(/\bfrom\s+[\w.]+\s+import\s+\(?([\w\s,]+)\)?/g),
+  ];
+  for (const match of lists)
+    for (const item of (match[1] ?? "").split(",")) {
+      const [name = "", local = name] = item
+        .trim()
+        .split(/\s+as\s+|\s*:\s*/)
+        .map((part) => part.trim());
+      if (!name || !FILE_NAME.test(name)) continue;
+      if (local !== name || !BARE_CALLS.test(name)) return true;
+    }
+  return false;
+}
+
 /** The code with each `os.path.join` of literals only replaced by its joined path, quoted. */
 function joinedLiterals(code: string): string {
   let out = "";
@@ -692,11 +793,32 @@ function joinedLiterals(code: string): string {
  * glob matching one, or a path built at run time (`f'/tmp/{x}'`, `'/tmp/' + x`, `"$TMPDIR/$x"`,
  * read as a glob). A literal path into another directory in temp (`/tmp/pm-x/notes.md`) is not.
  */
-export function codeTouchesState(code: string, cwds: Iterable<string>): boolean {
+export function codeTouchesState(
+  code: string,
+  cwds: Iterable<string>,
+  options: { argv?: Array<string | undefined>; interpreter?: string } = {},
+): boolean {
   if (code.length > MAX_CODE) return true;
-  if (/\bacp/i.test(code)) return true;
   const roots = [...cwds];
-  if (callsReachState(code, roots.length ? roots : ["/"])) return true;
+  if (callsReachState(code, roots.length ? roots : ["/"], options.argv, options.interpreter))
+    return true;
+  // Code that only calls the file functions read above, each on a literal path that is not the
+  // state, cannot change the state: text that names `acp`, or a path, is data there. Code that
+  // starts processes, evaluates strings, or reaches a file function some other way (an imported
+  // name, a reference that is not a call) is judged by everything it names.
+  const bare = withoutStrings(code, options.interpreter);
+  if (
+    !RUNS_CODE.test(bare) &&
+    !INDIRECT_CALL.test(bare) &&
+    !(
+      code.includes("`") &&
+      !/^(?:node|nodejs|deno|bun|python[\d.]*)$/i.test(options.interpreter ?? "")
+    ) &&
+    !hiddenFileCall(bare) &&
+    !TEMP_LOOKUP.test(bare)
+  )
+    return false;
+  if (/\bacp/i.test(code)) return true;
   // Dynamic import or attribute indirection hides which call runs (`__import__`, `getattr`,
   // `require(x)`, `eval`, `Function`): with a temp lookup or a path built at run time, fail closed.
   if (
@@ -814,4 +936,54 @@ function namesStateSecretOnce(text: string, cwds: string[], whole: boolean): boo
     if (whole && above.some((dir) => pathMatch(form, dir, false))) return true;
   }
   return false;
+}
+
+/**
+ * Calls inline code may make and still create no symlink: reading and writing whole files and
+ * plain string, list, dict and JSON work. Anything else (archive extraction, links, renames,
+ * copies, processes, any library call not listed) may create one.
+ */
+const LINK_FREE_CALLS = new Set([
+  ...["open", "read", "write", "close", "print", "len", "str", "int", "float", "bool", "repr"],
+  ...["list", "dict", "set", "tuple", "sorted", "reversed", "range", "enumerate", "zip", "min"],
+  ...["max", "sum", "any", "all", "isinstance", "replace", "split", "rsplit", "splitlines"],
+  ...["join", "strip", "lstrip", "rstrip", "startswith", "endswith", "format", "lower", "upper"],
+  ...["find", "rfind", "index", "count", "encode", "decode", "append", "extend", "insert", "pop"],
+  ...["get", "items", "keys", "values", "update", "loads", "dumps", "load", "dump", "search"],
+  ...["match", "fullmatch", "sub", "subn", "findall", "finditer", "compile", "group", "groups"],
+  ...["exit", "read_text", "write_text", "exists", "is_file", "readlines", "writelines"],
+  ...["readFileSync", "writeFileSync", "appendFileSync", "existsSync", "log", "error", "parse"],
+  ...["stringify", "includes", "indexOf", "lastIndexOf", "slice", "substring", "map", "filter"],
+  ...["forEach", "push", "trim", "trimEnd", "trimStart", "toString", "test", "replaceAll"],
+  ...["padStart", "padEnd", "some", "every", "reduce", "flatMap", "concat", "Error", "String"],
+  ...["Number", "Boolean", "Array", "Object", "Set", "Map", "JSON", "Path", "require"],
+]);
+/** Modules inline code may load: their link-creating calls are not on the list above. */
+const LINK_FREE_MODULES =
+  /^(?:re|json|sys|os|pathlib|textwrap|collections|fs|path|node:fs|node:path)$/;
+/**
+ * Whether inline interpreter code (Python or Node) can create no symlink: it loads only listed
+ * modules, and every call it makes (bare or as a method) is on the link-free list. Unsure is no.
+ */
+export function codeLinkFree(code: string, interpreter: string): boolean {
+  if (code.length > MAX_CODE || !/^(?:python[\d.]*|node|nodejs)$/.test(interpreter)) return false;
+  const bare = withoutStrings(code, interpreter);
+  if (RUNS_CODE.test(bare) || hiddenFileCall(bare)) return false;
+  for (const match of code.matchAll(/^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.,\s]+))/gm))
+    for (const name of (match[1] ?? match[2] ?? "").split(/[\s,]+/).filter(Boolean))
+      if (!LINK_FREE_MODULES.test(name.split(" as ")[0] ?? name)) return false;
+  for (const match of code.matchAll(/\brequire\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g))
+    if (!LINK_FREE_MODULES.test(match[1] ?? "")) return false;
+  if (/\bimport\s*\(|\bimport\s+[\w{*]/.test(bare) && interpreter.startsWith("node")) return false;
+  for (const match of bare.matchAll(/([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const name = match[1] ?? "";
+    if (
+      /^(?:if|for|while|switch|return|catch|function|def|print|elif|not|and|or|in|with|lambda)$/.test(
+        name,
+      )
+    )
+      continue;
+    if (!LINK_FREE_CALLS.has(name)) return false;
+  }
+  return true;
 }

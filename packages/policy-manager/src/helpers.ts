@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { git } from "./evidence.js";
 
 /** Git with replace refs ignored, so `refs/replace/*` cannot change what is read. */
@@ -112,6 +112,8 @@ const PLACEHOLDERS: Record<string, (value: string) => boolean> = {
     !/^\/dev\//.test(v),
   // Any one argument; the caller refuses one the shell would expand.
   text: () => true,
+  // A URL path and query: no `..` segment, no user info, fragment or whitespace.
+  path: (v) => /^[A-Za-z0-9_./?=&%,:-]{1,400}$/.test(v) && !/(?:^|\/)\.\.(?:\/|$|\?)/.test(v),
 };
 
 type Part = { literal: string } | { placeholder: string };
@@ -164,6 +166,29 @@ function matchParts(list: Part[], word: string, files: string[]): boolean {
     }
   }
   return false;
+}
+
+/** Whether `args` match a shape token for token (literals, alternatives, placeholders). */
+export function matchArgs(shape: Array<string | string[]>, args: string[]): boolean {
+  if (shape.length !== args.length || args.some((word) => word.length > MAX_WORD)) return false;
+  return shape.every((token, i) => matchToken(token, args[i] ?? "", []));
+}
+/** Validates one argument shape (for profile keys that reuse the helper token syntax). */
+export function checkShape(shape: unknown, where: string): Array<string | string[]> {
+  if (!Array.isArray(shape) || shape.length === 0 || shape.length > MAX_TOKENS)
+    throw new HelperError(`each shape in ${where} must list 1 to ${MAX_TOKENS} tokens`);
+  for (const token of shape) {
+    if (Array.isArray(token)) {
+      if (
+        token.length === 0 ||
+        token.some((t) => typeof t !== "string" || t.length === 0 || t.length > 200)
+      )
+        throw new HelperError(`alternatives in ${where} must be non-empty strings`);
+    } else if (typeof token !== "string" || token.length === 0 || token.length > 300)
+      throw new HelperError(`a token in ${where} must be a non-empty string`);
+    else parts(token);
+  }
+  return shape as Array<string | string[]>;
 }
 
 function matchToken(token: string | string[], word: string, files: string[]): boolean {
@@ -335,4 +360,68 @@ export function helperMatch(helpers: CredentialHelper[], cwd: string, argv: stri
   const shape = matchShape(helper, argv.slice(2));
   if (!shape) return refused("Credential helper run with arguments outside its allowed shapes");
   return { kind: "match", helper, shape: shape.index, files: shape.files };
+}
+
+/**
+ * Whether `script` (as run from `cwd`) is a regular, tracked file in a Git checkout whose bytes
+ * equal its blob on origin's default branch; `"outside"` for a file in no checkout (installed
+ * tools, temp scripts: judged as before). Anything unsure is false.
+ */
+export function committedScript(cwd: string, script: string): boolean | "outside" {
+  // The policy manager's own CLI is judged by its own rules; a Windows path off Windows names no
+  // file here.
+  if (/policy-manager[\\/]dist[\\/]cli\.js$/i.test(script)) return "outside";
+  if (process.platform !== "win32" && /^[A-Za-z]:[\\/]/.test(script)) return "outside";
+  const lexical = resolve(cwd, script);
+  // A file that does not exist yet (written earlier in the same script) counts where it would be.
+  try {
+    lstatSync(lexical);
+  } catch {
+    let dir = dirname(lexical);
+    while (dir !== dirname(dir)) {
+      try {
+        lstatSync(dir);
+        break;
+      } catch {
+        dir = dirname(dir);
+      }
+    }
+    try {
+      git(dir, ["rev-parse", "--show-toplevel"]);
+      return false;
+    } catch {
+      return "outside";
+    }
+  }
+  try {
+    if (lstatSync(lexical).isSymbolicLink()) return false;
+    const real = realpathSync.native(lexical);
+    if (!lstatSync(real).isFile()) return false;
+    let top: string;
+    try {
+      top = realpathSync.native(git(dirname(real), ["rev-parse", "--show-toplevel"]));
+    } catch {
+      return "outside";
+    }
+    const path = relative(top, real).split(sep).join("/");
+    if (!path || path.startsWith("..")) return false;
+    git(top, ["ls-files", "--error-unmatch", "--", path]);
+    const ref = defaultRef(top);
+    if (!ref) return false;
+    const oid = exact(top, ["rev-parse", "--verify", "--quiet", `${ref}:${path}`]);
+    if (!/^[0-9a-f]{40,64}$/.test(oid)) return false;
+    if (!sameContent(readFileSync(real), blobBytes(top, oid))) return false;
+    // What the script imports from the checkout must be committed too: no modified or untracked
+    // code file outside ignored directories (so `node_modules` does not count).
+    const status = git(top, ["status", "--porcelain", "--untracked-files=all"]);
+    return !status
+      .split("\n")
+      .some((line) =>
+        /\.(?:py|pyw|pyi|js|mjs|cjs|ts|mts|cts|jsx|tsx|json|rb|pl|pm|php|sh|bash|zsh|ps1|lua|wasm|node|so|dylib)"?$/i.test(
+          line.trim(),
+        ),
+      );
+  } catch {
+    return false;
+  }
 }
