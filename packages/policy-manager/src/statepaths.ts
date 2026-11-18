@@ -930,16 +930,52 @@ function namesStateSecretOnce(text: string, cwds: string[], whole: boolean): boo
   return false;
 }
 
-/** File calls that create, replace or move a link (or a file that may be one). */
-const LINK_CALL =
-  /\b(?:os|shutil|fs|fsp|promises|Path|pathlib)\s*\.\s*(?:symlink\w*|link\w*|rename\w*|replace|move|copy\w*|cp\w*)\b|\.(?:symlink_to|hardlink_to)\b|\b(?:symlinkSync|linkSync|renameSync|cpSync|copyFileSync|symlink|link|rename|copytree|copyfile|copy2|move)\s*\(/;
 /**
- * Whether inline interpreter code (Python or Node) can create a symlink: it calls a link, rename,
- * move or copy function, reaches a file function some other way, or can start a process or
- * evaluate a string. Code that only reads and writes files cannot.
+ * Calls inline code may make and still create no symlink: reading and writing whole files and
+ * plain string, list, dict and JSON work. Anything else (archive extraction, links, renames,
+ * copies, processes, any library call not listed) may create one.
+ */
+const LINK_FREE_CALLS = new Set([
+  ...["open", "read", "write", "close", "print", "len", "str", "int", "float", "bool", "repr"],
+  ...["list", "dict", "set", "tuple", "sorted", "reversed", "range", "enumerate", "zip", "min"],
+  ...["max", "sum", "any", "all", "isinstance", "replace", "split", "rsplit", "splitlines"],
+  ...["join", "strip", "lstrip", "rstrip", "startswith", "endswith", "format", "lower", "upper"],
+  ...["find", "rfind", "index", "count", "encode", "decode", "append", "extend", "insert", "pop"],
+  ...["get", "items", "keys", "values", "update", "loads", "dumps", "load", "dump", "search"],
+  ...["match", "fullmatch", "sub", "subn", "findall", "finditer", "compile", "group", "groups"],
+  ...["exit", "read_text", "write_text", "exists", "is_file", "readlines", "writelines"],
+  ...["readFileSync", "writeFileSync", "appendFileSync", "existsSync", "log", "error", "parse"],
+  ...["stringify", "includes", "indexOf", "lastIndexOf", "slice", "substring", "map", "filter"],
+  ...["forEach", "push", "trim", "trimEnd", "trimStart", "toString", "test", "replaceAll"],
+  ...["padStart", "padEnd", "some", "every", "reduce", "flatMap", "concat", "Error", "String"],
+  ...["Number", "Boolean", "Array", "Object", "Set", "Map", "JSON", "Path", "require"],
+]);
+/** Modules inline code may load: their link-creating calls are not on the list above. */
+const LINK_FREE_MODULES =
+  /^(?:re|json|sys|os|pathlib|textwrap|collections|fs|path|node:fs|node:path)$/;
+/**
+ * Whether inline interpreter code (Python or Node) can create no symlink: it loads only listed
+ * modules, and every call it makes (bare or as a method) is on the link-free list. Unsure is no.
  */
 export function codeLinkFree(code: string, interpreter: string): boolean {
   if (code.length > MAX_CODE || !/^(?:python[\d.]*|node|nodejs)$/.test(interpreter)) return false;
   const bare = withoutStrings(code, interpreter);
-  return !RUNS_CODE.test(bare) && !hiddenFileCall(bare) && !LINK_CALL.test(bare);
+  if (RUNS_CODE.test(bare) || hiddenFileCall(bare)) return false;
+  for (const match of code.matchAll(/^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.,\s]+))/gm))
+    for (const name of (match[1] ?? match[2] ?? "").split(/[\s,]+/).filter(Boolean))
+      if (!LINK_FREE_MODULES.test(name.split(" as ")[0] ?? name)) return false;
+  for (const match of code.matchAll(/\brequire\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g))
+    if (!LINK_FREE_MODULES.test(match[1] ?? "")) return false;
+  if (/\bimport\s*\(|\bimport\s+[\w{*]/.test(bare) && interpreter.startsWith("node")) return false;
+  for (const match of bare.matchAll(/([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const name = match[1] ?? "";
+    if (
+      /^(?:if|for|while|switch|return|catch|function|def|print|elif|not|and|or|in|with|lambda)$/.test(
+        name,
+      )
+    )
+      continue;
+    if (!LINK_FREE_CALLS.has(name)) return false;
+  }
+  return true;
 }

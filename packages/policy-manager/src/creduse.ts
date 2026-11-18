@@ -13,35 +13,13 @@ export interface CredentialUse {
   consumers: Array<Array<string | string[]>>;
 }
 
-/** On unless the profile sets `credentialUseDefaults: false`. Kept small and generic. */
-export const DEFAULT_CREDENTIAL_USES: CredentialUse[] = [
-  {
-    source: ["gh", "auth", "token"],
-    consumers: [
-      ["npx", "changeset", "version"],
-      ["npx", "changeset", "publish"],
-    ],
-  },
-  {
-    source: [
-      "az",
-      "account",
-      "get-access-token",
-      ...["--resource", "https://management.azure.com/", "--query", "accessToken", "-o", "tsv"],
-    ],
-    consumers: [
-      [
-        "curl",
-        ["-s", "-sS", "-fsS", "-sf"],
-        "-H",
-        "Authorization: Bearer $SECRET",
-        "https://management.azure.com/<path>",
-      ],
-    ],
-  },
-];
-
 export const MAX_CREDENTIAL_USES = 20;
+/** Variable names a consumer reads a credential from. */
+const AUTH_VARIABLE =
+  /^[A-Z][A-Z0-9_]*(?:_TOKEN|_PAT|_PASSWORD|_SECRET|_API_KEY|_ACCESS_KEY)$|^(?:TOKEN|PAT|PASSWORD)$/;
+/** Variables that load code or change how a program starts: never a credential channel. */
+const LOADER_VARIABLE =
+  /^(?:NODE_OPTIONS|NODE_PATH|LD_\w+|DYLD_\w+|BASH_ENV|ENV|PYTHON\w*|PERL5?\w*|RUBY\w*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|GIT_\w+|NPM_CONFIG_\w+|SHELLOPTS|PS4|PROMPT_COMMAND|IFS|PATH)$/;
 
 /** Validates the profile's `credentialUses`. */
 export function parseCredentialUses(raw: unknown): CredentialUse[] {
@@ -89,7 +67,12 @@ export function credentialUse(script: string, uses: CredentialUse[]): string | u
   const carrier = outer.filter((word) => !word.literal);
   if (carrier.length !== 1) return undefined;
   const secretWord = carrier[0];
-  const env = /^[A-Za-z_]\w*=\$$/.test(secretWord?.text ?? "") && outer[0] === secretWord;
+  // The env form only for a variable named like a credential the consumer reads for auth
+  // (`GITHUB_TOKEN`, `NPM_TOKEN`, `DB_PASSWORD`), never a loader or option variable.
+  const name = /^([A-Za-z_]\w*)=\$$/.exec(secretWord?.text ?? "")?.[1];
+  const env = !!name && outer[0] === secretWord;
+  if (env && (!AUTH_VARIABLE.test(name ?? "") || LOADER_VARIABLE.test(name ?? "")))
+    return undefined;
   const args = outer.filter((word) => word !== secretWord || !env).map((word) => word.text);
   for (const use of uses) {
     if (!matchArgs(use.source, source)) continue;

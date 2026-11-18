@@ -509,7 +509,7 @@ function evaluateOnce(
       ...result(
         request,
         "sensitive",
-        "Reading the policy service's session credentials requires a person",
+        "A command that shows a secret (a token, credentials, or the policy service's session files) requires a person",
       ),
       hard: "credential-read",
     };

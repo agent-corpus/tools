@@ -763,6 +763,51 @@ function featureWorktree(path: string): boolean {
 /** Variable names that hold a secret: `GITHUB_TOKEN`, `DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`. */
 const SECRET_VARIABLE =
   /(?:TOKEN|SECRET|PASSW(?:OR)?D|PASSPHRASE|CREDENTIAL|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CLIENT_?SECRET|CONNECTION_?STRING|_PAT$|^PAT$|(?:^|_)AUTH(?:_|$))/i;
+/**
+ * Read commands of common CLIs that print a secret: a token, a kubeconfig with credentials, chart
+ * values, function environment variables, decrypted parameters or app settings. A credential read
+ * however they are spelled, wherever they appear.
+ */
+function printsSecret(name: string, args: string[]): boolean {
+  const words = args.filter((arg) => !arg.startsWith("-"));
+  const has = (...flags: string[]) =>
+    args.some((arg) => flags.some((f) => arg === f || arg.startsWith(`${f}=`)));
+  const path = words.join(" ");
+  if (name === "gh")
+    return (
+      (/^auth (?:status|token)\b/.test(path) &&
+        (path.startsWith("auth token") || has("--show-token", "-t"))) ||
+      /^config get (?:oauth_token|.*token)/.test(path) ||
+      /^secret\b/.test(path)
+    );
+  if (name === "kubectl" || name === "oc")
+    return (
+      (/^config view\b/.test(path) && has("--raw", "--flatten")) ||
+      /^(?:create token|get secrets?|describe secrets?)\b/.test(path) ||
+      /^get\b.*\bsecrets?\b/.test(path)
+    );
+  if (name === "helm") return /^get (?:values|all|manifest)\b/.test(path);
+  if (name === "aws")
+    return (
+      /^lambda get-function(?:-configuration)?\b/.test(path) ||
+      (/^ssm get-parameters?(?:-by-path)?\b/.test(path) && has("--with-decryption")) ||
+      /^sts get-session-token\b|^ecr get-login-password\b|^ecr-public get-login-password\b|^secretsmanager get-secret-value\b|^codeartifact get-authorization-token\b|^configure (?:get|export-credentials)\b/.test(
+        path,
+      )
+    );
+  if (name === "gcloud")
+    return /^(?:auth (?:print-access-token|print-identity-token|application-default print-access-token)|secrets versions access|config config-helper)\b/.test(
+      path,
+    );
+  if (name === "az")
+    return (
+      /^(?:(?:webapp|functionapp|logicapp) config appsettings list|containerapp secret (?:show|list)|acr credential show|account get-access-token|storage account (?:keys list|show-connection-string)|aks get-credentials)\b/.test(
+        path,
+      ) ||
+      (/^containerapp secret\b/.test(path) && has("--show-values"))
+    );
+  return false;
+}
 const SECRET_WORD =
   /(?:secret|credential|password|connection[-_]?strings?|(?:^|[-_])keys?(?:$|[-_])|listKeys|access-token|get-token|kubeconfig)/i;
 
@@ -1806,6 +1851,10 @@ function analyzeCommand(
     // An expanded script is not known: judge it on every word the script names.
     if (!inner.literal || depth >= 4) opaqueGitRules(context.words, true, rules);
     return;
+  }
+  if (program.literal && printsSecret(name, args)) {
+    rules.add("credential-read");
+    secretReads++;
   }
   if (program.literal && CLOUD.has(name)) {
     if (args.some((arg) => SECRET_WORD.test(arg))) rules.add("credential-read");
