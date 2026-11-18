@@ -6,6 +6,7 @@ import {
   type Fill,
   featureGitTop,
   gitEnvConfined,
+  gitEnvScriptSafe,
   noteLinkRisk,
   resolveWord,
   UNKNOWN_CWD,
@@ -1177,9 +1178,13 @@ function exportVariables(
       return human(request, "unknown", "export of a computed name requires human review");
     }
     if (BANNED_ENV.test(assignment.name)) {
-      const top = /^GIT_(?:DIR|WORK_TREE)$/.test(assignment.name)
-        ? gitEnvTop(assignment.name, plainText(assignment.value), state)
-        : undefined;
+      const script = request.input.command ?? request.input.cmd;
+      const top =
+        /^GIT_(?:DIR|WORK_TREE)$/.test(assignment.name) &&
+        typeof script === "string" &&
+        gitEnvScriptSafe(script, request.cwd)
+          ? gitEnvTop(assignment.name, plainText(assignment.value), state)
+          : undefined;
       if (!top) return human(request, "unknown", "Environment override requires human review");
       state.gitEnv = { ...state.gitEnv, [assignment.name]: top };
     }

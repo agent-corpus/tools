@@ -10,6 +10,7 @@ import {
   featureGitTop,
   git,
   gitEnvConfined,
+  gitEnvScriptSafe,
   inside,
   isProtectedPath,
   MEMORY_WRITE,
@@ -1806,9 +1807,12 @@ export function simpleDecision(
     if (!top) return human(request, "unknown", "Environment override requires human review");
     gitTops[name] = top;
   }
+  const script = request.input.command ?? request.input.cmd;
   if (
     (gitTops.GIT_DIR || gitTops.GIT_WORK_TREE) &&
-    !gitEnvConfined(gitTops.GIT_DIR, gitTops.GIT_WORK_TREE, cwd)
+    (!gitEnvConfined(gitTops.GIT_DIR, gitTops.GIT_WORK_TREE, cwd) ||
+      typeof script !== "string" ||
+      !gitEnvScriptSafe(script, request.cwd))
   )
     return human(request, "unknown", "Environment override requires human review");
   for (const redirect of command.redirects) {

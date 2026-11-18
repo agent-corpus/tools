@@ -651,3 +651,34 @@ export function gitEnvConfined(
     return false;
   }
 }
+
+/**
+ * Whether a script that sets `GIT_DIR`/`GIT_WORK_TREE` keeps git where those name: it has no
+ * git option that moves git elsewhere (`-C`, `--work-tree`, `--git-dir`, `--namespace`), no
+ * `pushd`/`popd`, and every `cd` is a literal path into the one verified worktree the variables
+ * name. Otherwise the variables are an environment override as before.
+ */
+export function gitEnvScriptSafe(script: string, cwd: string): boolean {
+  if (/\bgit\b[^\n;&|]*\s(?:-C\b|--work-tree\b|--git-dir\b|--namespace\b)/.test(script))
+    return false;
+  if (/\b(?:pushd|popd)\b/.test(script)) return false;
+  const tops = new Set<string | undefined>();
+  for (const match of script.matchAll(/\b(GIT_DIR|GIT_WORK_TREE)=("[^"]*"|'[^']*'|[^\s;&|]+)/g))
+    tops.add(
+      featureGitTop(match[1] as string, (match[2] as string).replace(/^(["'])(.*)\1$/, "$2"), cwd),
+    );
+  const [top] = tops;
+  if (tops.size !== 1 || !top) return false;
+  for (const match of script.matchAll(
+    /(?:^|[\n;&|(]|\bthen|\bdo|\belse)\s*(?:builtin\s+|command\s+)?cd\b([^\n;&|)]*)/g,
+  )) {
+    const target = (match[1] ?? "").trim().replace(/^(["'])(.*)\1$/, "$2");
+    if (!target || /[$`*?[{~]|\s/.test(target) || target === "-") return false;
+    try {
+      if (!inside(top, canonical(resolve(cwd, target)))) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}

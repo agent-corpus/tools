@@ -264,6 +264,15 @@ describe("review nits", () => {
       ).toBe("eng");
       expect(await decide(bash(`GIT_DIR=${gitDir} git status --short`, wt))).toBe("eng");
       expect(await decide(bash("export GIT_DIR=/tmp/elsewhere\ngit status"))).not.toBe("eng");
+      // Git options and directory changes that move git elsewhere void the GIT_DIR approval.
+      for (const command of [
+        `GIT_DIR=${gitDir} git -C ${repo} stash`,
+        `GIT_DIR=${gitDir} git -C ${repo} checkout -- AGENTS.md`,
+        `GIT_DIR=${gitDir} git --work-tree=${repo} checkout -- AGENTS.md`,
+        `export GIT_DIR=${gitDir}; pushd ${repo}; git stash`,
+        `git -C ${repo} checkout -- AGENTS.md`,
+      ])
+        expect(await decide(bash(command, wt)), command).not.toBe("eng");
     },
   );
 });
