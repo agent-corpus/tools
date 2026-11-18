@@ -52,7 +52,7 @@ const CODE_INTERPRETER = /^(?:python[\d.]*|perl|ruby|node|nodejs|bun|deno|php)(?
  * run a command in Perl, Ruby and PHP; in JavaScript they are template strings.
  */
 const SPAWNS =
-  /child_process|subprocess|\bspawn|\bexec(?:Sync|File\w*|[lv]p?e?)?\s*\(|\bsystem\s*\(|\bsystem\s+["'$]|\bpopen|Popen|\bpty\b|\bcommands\s*\.|shell_exec|passthru|proc_open|\bqx\b|%x[({[]|\bIO\s*\.\s*popen|Bun\s*\.\s*(?:spawn|\$)|Deno\s*\.\s*(?:run|Command)|\beval\b|\bFunction\s*\(|\bvm\s*\.|\bWorker\s*\(|__import__|importlib|\bgetattr\s*\(|\bcompile\s*\(|\brequire\s*\(\s*[^'"\s)]|\bimport\s*\(\s*[^'"\s)]|\bos\s*\.\s*(?:system|popen|exec|spawn|posix_spawn|fork)/;
+  /child_process|subprocess|\bspawn|\bexec(?:Sync|File\w*|[lv]p?e?)?\s*\(|\bsystem\b|\bexec\b|\bpopen|Popen|\bpty\b|\bcommands\s*\.|shell_exec|passthru|proc_open|\bqx\b|%x[({[]|\bIO\s*\.\s*popen|Bun\s*\.\s*(?:spawn|\$)|Deno\s*\.\s*(?:run|Command)|\beval\b|\bFunction\s*\(|\bvm\s*\.|\bWorker\s*\(|__import__|importlib|\bgetattr\s*\(|\bcompile\s*\(|\brequire\s*\(\s*[^'"\s)]|\bimport\s*\(\s*[^'"\s)]|\bos\s*\.\s*(?:system|popen|exec|spawn|posix_spawn|fork)/;
 const BACKTICK_RUNS = /^(?:perl|ruby|php)/i;
 /** Code that loads the package itself (`import(".../@agent-corpus/policy-manager/dist/x.js")`). */
 const LOADS_PACKAGE =
@@ -153,12 +153,7 @@ export function readOnlyCliArgs(words: Word[]): boolean {
 function isCliFile(text: string, cliPath: string | undefined): boolean {
   const slashed = text.replace(/\\/g, "/");
   if (cliPath && slashed === cliPath.replace(/\\/g, "/")) return true;
-  // Any file of the installed package runs its code, except data and docs (`package.json`).
-  return (
-    /(?:^|\/)policy-manager\/dist\/cli\.js$/i.test(slashed) ||
-    (/@agent-corpus\/policy-manager\//i.test(slashed) &&
-      !/\.(?:json|md|map|d\.ts|txt)$|\/LICENSE$/i.test(slashed))
-  );
+  return /(?:^|\/)policy-manager\/dist\/cli\.js$|@agent-corpus\/policy-manager\//i.test(slashed);
 }
 
 /** The arguments after a CLI program word, or undefined when `words` do not start the CLI. */
@@ -295,70 +290,68 @@ export function runsPolicyCli(script: string, cliPath?: string): boolean {
   return scriptRuns(script, cliPath, 0);
 }
 
-/** Wrappers whose next word is the command they run. */
-const LEADS = new Set(["env", "sudo", "exec", "nohup", "time", "xargs", "script", "start", "cmd"]);
+/** npm subcommands that only read or install the package, never run its CLI. */
+const NPM_PACKAGE = /^(?:view|v|info|show|ls|list|la|ll|install|i|add|outdated)$/;
 /**
- * Whether a word in command position is a Windows path to the CLI (`C:\\bin\\pm.cmd`), which the
- * scanner cannot read because it drops backslashes. Linear: one split, then each piece's words.
+ * The script's text for the `approve` text check (`looksLikeApproveGrant`), without the few
+ * places where naming the CLI is known to be data: the message of `git commit -m/-F`, the body
+ * of `gh pr create/edit/comment --body/-b` and of `gh api -f body=`, and an `npm view`, `info`,
+ * `ls`, `install` or `outdated` of the package. Everything else, here-documents included, stays.
+ * A script the scanner cannot read fully is checked whole.
  */
-function windowsCli(script: string): boolean {
-  for (const piece of script.split(/[\n;&|(`]/)) {
-    for (const raw of piece.split(/\s+/)) {
-      const word = raw.replace(/^["']|["']$/g, "");
-      if (!word) continue;
-      if (word.includes("\\") && CLI_NAME.test(word.slice(word.lastIndexOf("\\") + 1))) return true;
-      if (!LEADS.has(word) && !word.startsWith("-") && !/^[A-Za-z_]\w*=/.test(word)) break;
-    }
-  }
-  return false;
-}
-const SHELL_NAME = /^(?:sh|bash|zsh|dash|ksh|mksh|fish|source|\.)(?:\.exe)?$/i;
-/** Programs that build a command from their input or arguments, out of the scanner's sight. */
-const COMPOSERS = new Set(["xargs", "parallel", "eval", "watch", "tmux", "screen", "ssh"]);
-
-/**
- * Whether a script runs code whose commands the scan cannot follow: a shell reading a file or its
- * standard input, a program run by path, a composer (`xargs`, `eval`, `find -exec`), a computed
- * program, interpreter code that can start a process, or a script that cannot be read. Only then
- * can text that merely names `approve` with the CLI (`looksLikeApproveGrant`) be a command.
- */
-export function hidesCode(script: string, depth = 0): boolean {
-  if (depth > MAX_DEPTH) return true;
-  // The scanner drops backslashes, so a Windows path to the CLI (`C:\\bin\\pm.cmd`) is read here.
-  // Only a word in command position counts: at the start of a line or after an operator, a
-  // wrapper or a quote that opens a command string.
-  if (windowsCli(script)) return true;
+export function approveCheckText(script: string): string {
+  // The scanner drops backslashes and comments, so a script it would change is checked whole.
   const { segments, complete } = scan(script);
-  if (!complete) return true;
-  // Files a here-document writes are code once something runs them.
-  const docs = segments.flatMap((segment) =>
-    segment.filter((word) => word.heredoc || word.herestring).map((word) => word.text),
-  );
+  if (!complete || script.includes("\\")) return script;
+  let exempt = false;
+  const kept: string[] = [];
   for (const segment of segments) {
     const cmd = command(segment);
-    const program = cmd.program;
-    if (!program || ASSIGNMENT.test(program.text)) continue;
-    if (!program.literal) return true;
-    const name = basename(program.text);
-    if (/[\\/]/.test(program.text) && !CLI_NAME.test(name)) return true;
-    if (COMPOSERS.has(name)) return true;
-    if (name === "find" && cmd.args.some((word) => /^-(?:exec|execdir|ok|okdir)$/.test(word.text)))
-      return true;
-    if (SHELL_NAME.test(name)) {
-      const inner = innerScript(cmd);
-      if (!inner) return true;
-      if (!inner.literal || hidesCode(inner.script, depth + 1)) return true;
-      continue;
+    const name = basename(cmd.program?.text ?? "");
+    const args = cmd.args.map((word) => word.text);
+    const operands = args.filter((arg) => !arg.startsWith("-"));
+    const drop = new Set<Word>();
+    if (
+      cmd.program?.literal &&
+      /^npm(?:\.cmd)?$/i.test(name) &&
+      NPM_PACKAGE.test(operands[0] ?? "")
+    )
+      for (const word of segment) drop.add(word);
+    else if (cmd.program?.literal && name === "git" && operands.includes("commit")) {
+      cmd.args.forEach((word, k) => {
+        const previous = cmd.args[k - 1]?.text ?? "";
+        if (/^(?:-m|--message|-F|--file)$/.test(previous) || /^(?:-m.|--message=)/.test(word.text))
+          drop.add(word);
+      });
+      if (args.some((arg, k) => /^(?:-F|--file)$/.test(arg) && args[k + 1] === "-"))
+        for (const word of segment) if (word.heredoc || word.herestring) drop.add(word);
+    } else if (
+      cmd.program?.literal &&
+      name === "gh" &&
+      ((operands[0] === "pr" && /^(?:create|edit|comment)$/.test(operands[1] ?? "")) ||
+        operands[0] === "api")
+    ) {
+      cmd.args.forEach((word, k) => {
+        const previous = cmd.args[k - 1]?.text ?? "";
+        if (
+          (operands[0] === "pr" &&
+            (/^(?:-b|--body)$/.test(previous) || /^--body=/.test(word.text))) ||
+          (operands[0] === "api" &&
+            /^(?:-[fF]|--field|--raw-field)$/.test(previous) &&
+            /^body=/.test(word.text))
+        )
+          drop.add(word);
+      });
+      if (args.some((arg, k) => /^(?:-F|--body-file)$/.test(arg) && args[k + 1] === "-"))
+        for (const word of segment) if (word.heredoc || word.herestring) drop.add(word);
     }
-    if (CODE_INTERPRETER.test(name)) {
-      const code = [
-        ...cmd.args.filter((word) => /\s/.test(word.text)).map((word) => word.text),
-        ...docs,
-      ];
-      if (code.some((text) => codeSpawns(text, name))) return true;
-      continue;
-    }
-    if (SHELL_OR_INTERPRETER.test(name)) return true;
+    if (drop.size) exempt = true;
+    kept.push(
+      segment
+        .filter((word) => !drop.has(word))
+        .map((word) => word.text)
+        .join(" "),
+    );
   }
-  return false;
+  return exempt ? kept.join("\n") : script;
 }

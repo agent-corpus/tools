@@ -686,9 +686,18 @@ export function permissiveWrite(
   profile: Profile,
   fill?: Fill,
   directory = false,
+  /** A plain write (a file tool, a redirection, `tee`) that may land in Claude Code's memory. */
+  memory = false,
 ) {
-  const check = writeEvidence(cwd, input, profile, directory);
+  const check = writeEvidence(cwd, input, profile, directory, memory);
   if (!check.allowed || !fill) return check;
+  // After a command that can create a symlink, a memory file may be one: protected again.
+  if (fill.script.tainted && check.reason === MEMORY_WRITE)
+    return {
+      allowed: false,
+      category: "sensitive" as const,
+      reason: "Protected path requires human approval",
+    };
   if (fill.script.tainted)
     return DISPOSABLE_WRITES.has(check.reason)
       ? {
@@ -711,7 +720,13 @@ function hardLinked(path: string): boolean {
   }
 }
 
-function writeEvidence(cwd: string, input: string, profile: Profile, directory: boolean) {
+function writeEvidence(
+  cwd: string,
+  input: string,
+  profile: Profile,
+  directory: boolean,
+  memory = false,
+) {
   let lexical: string | undefined;
   let path: string | undefined;
   try {
@@ -719,7 +734,7 @@ function writeEvidence(cwd: string, input: string, profile: Profile, directory: 
     path = canonical(lexical);
     if (notedProtectedWrite(input, lexical, path, directory))
       return { allowed: true, category: "worktree-write" as const, reason: NOTED_WRITE };
-    if (!directory && claudeMemoryFile(input, lexical))
+    if (memory && !directory && claudeMemoryFile(input, lexical))
       return { allowed: true, category: "worktree-write" as const, reason: MEMORY_WRITE };
     if (sensitive(path) || sensitive(lexical) || isProtectedPath(path) || isProtectedPath(lexical))
       return {
@@ -1395,7 +1410,7 @@ export function redirectDecision(
   const check =
     redirect.op === "<"
       ? permissiveRead(cwd, redirect.target)
-      : permissiveWrite(cwd, redirect.target, profile, fill);
+      : permissiveWrite(cwd, redirect.target, profile, fill, false, true);
   return check.allowed ? undefined : human(request, check.category, check.reason);
 }
 
@@ -1871,12 +1886,8 @@ export function simpleDecision(
   // files a sed script reads or writes are.
   const operands = textOperands(program, args);
   const namePatterns = operands.patterns;
-  // Inline interpreter code is judged as code (interpreterCodeRefusal), not as one path.
-  const inlineCode = /^(?:node|nodejs|bun|deno|python[\d.]*|perl|ruby|php)$/.test(program)
-    ? args.findIndex((arg) => ["-c", "-e", "-p", "--eval", "--print"].includes(arg)) + 1
-    : 0;
   for (const [index, word] of args.entries()) {
-    if (operands.text.has(index) || (inlineCode > 0 && index === inlineCode)) continue;
+    if (operands.text.has(index)) continue;
     const candidate = word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
     // echo and printf read no file, so only a path-like word is judged, by name.
     const pathLike = candidate.includes("/") || candidate.startsWith(".");
@@ -2072,7 +2083,14 @@ export function simpleDecision(
       if (!check.allowed) return human(request, check.category, check.reason);
     }
     for (const file of [...(split?.targets ?? operands), ...optionValues]) {
-      const check = permissiveWrite(cwd, file, profile, fill, program === "mkdir");
+      const check = permissiveWrite(
+        cwd,
+        file,
+        profile,
+        fill,
+        program === "mkdir",
+        program === "tee",
+      );
       if (!check.allowed) return human(request, check.category, check.reason);
     }
   }

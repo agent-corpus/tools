@@ -579,8 +579,22 @@ function literalVariables(
     if (!match) continue;
     const [, name = "", value = ""] = match;
     const path = literalPath(value, argv);
-    const known = found.has(name) ? found.get(name) : [];
-    found.set(name, known && path !== undefined ? [...known, path] : undefined);
+    found.set(name, found.has(name) || path === undefined ? undefined : [path]);
+  }
+  // Exactly one binding: any other assignment to the name, wherever it is (`if 1: p = x`, a
+  // walrus, `+=`, destructuring, `global`/`nonlocal`), makes its value unknown.
+  for (const name of found.keys()) {
+    const word = `\\b${name}\\b`;
+    const assignments = code.match(
+      new RegExp(`${word}\\s*(?:[-+*/%&|^@:]|\\*\\*|//|<<|>>|\\?\\?|\\|\\||&&)?=(?!=)`, "g"),
+    );
+    if (
+      (assignments?.length ?? 0) !== 1 ||
+      new RegExp(
+        `\\b(?:global|nonlocal)\\b[^\\n;]*${word}|[[{(][^\\]})\\n]*${word}[^\\]})\\n]*[\\]})]\\s*=(?!=)`,
+      ).test(code)
+    )
+      found.set(name, undefined);
   }
   const bound = (list: string) => {
     for (const name of list.split(/[\s,()[\]{}*=:.]+/))
@@ -602,9 +616,17 @@ function literalVariables(
 function callsReachState(
   code: string,
   cwds: string[],
-  argv: Array<string | undefined> = [],
+  given: Array<string | undefined> = [],
   interpreter = "",
 ): boolean {
+  let argv = given;
+  // Words after the code stand for `process.argv`/`sys.argv` only while the code never changes it.
+  if (
+    /argv\s*(?:\[[^\]]*\]\s*(?:[-+*/%]?=(?!=))|=(?!=)|\.\s*(?:splice|push|shift|unshift|pop|insert|remove|append|extend|reverse|sort|clear|fill|copyWithin)\b)|\bdel\s+sys\s*\.\s*argv|\bargv\s*\[[^\]]*:/.test(
+      code,
+    )
+  )
+    argv = [];
   const vars = literalVariables(code, argv);
   const aliases = moduleAliases(code);
   const values = (arg: string): string[] | undefined => {
@@ -704,7 +726,7 @@ function callsReachState(
  * Code that can start a process or evaluate a string, so names in its text may become commands or
  * file calls this cannot read.
  */
-const RUNS_CODE =
+export const RUNS_CODE =
   /child_process|subprocess|\bspawn|\bexec(?:Sync|File\w*|[lv]p?e?)?\s*\(|\bsystem\s*[("'$]|\bpopen|Popen|\bpty\b|\bcommands\s*\.|shell_exec|passthru|proc_open|\bqx\b|%x[({[]|\bIO\s*\.\s*popen|Bun\s*\.|Deno\s*\.|\beval\b|\bFunction\s*\(|\bvm\s*\.|\bWorker\s*\(|__import__|importlib|\bgetattr\s*\(|\bcompile\s*\(|\brequire\s*\(\s*[^'"\s)]|\bimport\s*\(\s*[^'"\s)]|\bsend\s*\(|call_user_func|\bos\s*\.\s*(?:system|popen|exec|spawn|posix_spawn|fork)|\bReflect\b|\.\s*(?:call|apply|bind)\s*\(/;
 /** A module member that is not called (`const r = fs.rmSync`) or a computed one (`fs["rmSync"]`). */
 const UNCALLED_MEMBER =

@@ -477,7 +477,7 @@ export function claudeMemoryFile(input: string, lexical: string): boolean {
     const rel = relative(config, resolve(lexical)).split(sep);
     if (rel.length !== 4 || rel[0] !== "projects" || rel[2] !== "memory") return false;
     const [, project = "", , name = ""] = rel;
-    if (!project || project.startsWith(".") || !/^[^/\\]+\.md$/i.test(name)) return false;
+    if (!project || project.startsWith(".") || !/^[^/\\]+\.md$/.test(name)) return false;
     // No symlink anywhere: the configuration directory and every step below it are what they say.
     const memory = join(config, "projects", project, "memory");
     if (canonical(memory) !== join(canonical(config), "projects", project, "memory")) return false;

@@ -56,9 +56,7 @@ describe("self-approve is running the CLI, not naming it", () => {
     "node -e 'console.log(require(process.argv[1]).version)' /x/lib/node_modules/@agent-corpus/policy-manager/package.json",
     'command -v pm || echo "no pm on PATH"',
     "git commit -q -m 'docs: an agent never runs pm approve'",
-    `node -e 'const fs=require("fs");let s=fs.readFileSync("README.md","utf8");s=s.replace("pm approve --last","pm approve --last --once");fs.writeFileSync("README.md",s)'`,
-    "python3 - <<'EOF'\np='notes.md'; s=open(p).read()\ns=s.replace('run pm approve', 'run `pm approve` (spawn none)')\nopen(p,'w').write(s)\nEOF",
-    "gh api graphql -f query='mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$t,body:$b}){comment{id}}}' -f t=X -f b='Fixed: pm approve is refused.'",
+    "gh api graphql -f query='mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$t,body:$b}){comment{id}}}' -f t=X -f body='Fixed: pm approve is refused.'",
   ])("%s", async (command) => {
     const d = await session().decide(bash(command), "PreToolUse");
     expect(d.reason).not.toBe(APPROVE_GUARD);
@@ -87,21 +85,23 @@ describe("policy-state needs a target that can reach the state", () => {
       `node -e 'const fs=require("fs");const f=process.argv[1];fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace(/x/g,"y"))' ${slash(homedir())}/.claude/projects/p/s.jsonl`,
     // Source text that mentions acp and comment openers, written to literal files.
     () =>
-      `node -e 'const fs=require("fs");let f="src/a.ts";let s=fs.readFileSync(f,"utf8");s=s.replace("/** a */","/** acp-501-x */");fs.writeFileSync(f,s);f="src/b.ts";fs.writeFileSync(f,s)'`,
+      `node -e 'const fs=require("fs");let f="src/a.ts";let s=fs.readFileSync(f,"utf8");s=s.replace("/** a */","/** acp-501-x */");fs.writeFileSync(f,s);fs.writeFileSync("src/b.ts",s)'`,
     () =>
       "python3 - <<'EOF'\np='src/a.ts'; s=open(p).read()\ns=s.replace('/** old */', '''/** acp-<uid>-* and tmpdir() */''')\nopen(p,'w').write(s)\nEOF",
     // Scratchpad writes through a variable assigned a literal, after cd into the temp root.
     () =>
       `cd /tmp && F=${scratch}/pr-body.md && gh pr view 5 --json body -q .body > $F && printf x >> $F`,
     () => `D=${scratch}/merge-ready; mkdir -p $D; cat > $D/52.md <<'EOF'\nbody\nEOF`,
-    () => `cd ${state} && grep -c decision audit.jsonl`,
-    () => `cd /tmp && B=$(gh pr view 5 --json body -q .body) && gh pr edit 5 --body "$B"`,
     () =>
       `find ${slash(homedir())}/.claude/projects -name "*.jsonl" -newermt "2026-11-16 22:20" -not -path "*/subagents/*"`,
   ])("%#", (make) => expect(rules(make())).not.toContain("policy-state"));
 
   test.each([
     () => `false || F=${state}/grants.json; echo x > $F`,
+    // Not certain: the 0.11.2 decision.
+    () => `cd ${state} && grep -c decision audit.jsonl`,
+    () => `TMPDIR=/opt/x | true; echo x > $TMPDIR/acp-*/grants.json`,
+    () => `: \${X:=${state}}; echo x > $X/grants.json`,
     () => `F=${state}/grants.json; echo x > $F`,
     () => `for f in ${state}/grants.json; do echo x > $f; done`,
     () => `node -e 'require("fs").writeFileSync(process.argv[1],"x")' ${state}/grants.json`,

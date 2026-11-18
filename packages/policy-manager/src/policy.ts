@@ -11,7 +11,7 @@ import {
   resolveWord,
   withEvidence,
 } from "./evidence.js";
-import { hardRule, hardRules, readsPolicySecret } from "./hard.js";
+import { hardRule, hardRules, patchField, readsPolicySecret } from "./hard.js";
 
 /** Tools that write a file (a shell command is judged by the engine itself). */
 const WRITE_TOOLS = new Set([
@@ -635,7 +635,7 @@ function evaluateCore(request: Request, profile: Profile): Decision {
     return result(request, "unknown", "Execution directory differs from the reviewed directory");
   // Only the target decides a file tool: `content`, `old_string` and `new_string` are data.
   const file = input.file_path ?? input.notebook_path ?? input.path;
-  const patchText = input.command ?? input.patch ?? input.input;
+  const patchText = patchField(input);
   if (request.tool === "apply_patch" && typeof patchText === "string") {
     const patch = parsePatch(patchText);
     if (!patch) return result(request, "unknown", "Unrecognized patch format");
@@ -667,7 +667,7 @@ function evaluateCore(request: Request, profile: Profile): Decision {
     const evidence =
       profile.mode === "permissive"
         ? write
-          ? permissiveWrite(request.cwd, file, profile)
+          ? permissiveWrite(request.cwd, file, profile, undefined, false, true)
           : permissiveRead(request.cwd, file)
         : pathEvidence(request.cwd, file, write);
     return result(request, evidence.category, evidence.reason, evidence.allowed);
