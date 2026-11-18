@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { withoutStrings } from "./clirun.js";
 import {
   canonical,
+  evidenceScope,
   git,
   inside,
   isProtectedPath,
@@ -351,6 +352,8 @@ const GH_DELETE: Record<string, RegExp> = {
   pr: /^merge$/,
   workflow: /^(?:run|enable|disable)$/,
   run: /^(?:rerun|delete|cancel)$/,
+  // Project and repository settings that cannot be taken back.
+  project: /^(?:delete|close|item-delete|item-archive|field-delete|unlink|mark-template)$/,
 };
 
 /**
@@ -654,7 +657,8 @@ function ghFloor(args: string[]): boolean {
   const { words, unknown } = leading("gh", args, 3);
   const pair = (group: string, verb: string, third = "") =>
     GH_DELETE[group]?.test(verb) ||
-    (group === "repo" && verb === "deploy-key" && /^(?:add|delete)$/.test(third));
+    (group === "repo" && verb === "deploy-key" && /^(?:add|delete)$/.test(third)) ||
+    (group === "repo" && verb === "autolink" && /^(?:create|delete)$/.test(third));
   if (!unknown) return !!pair(words[0] ?? "", words[1] ?? "", words[2] ?? "");
   // An option gh does not know came first: any later pair of words could be the subcommand.
   const positional = args.filter((arg) => !arg.startsWith("-"));
@@ -763,6 +767,50 @@ function featureWorktree(path: string): boolean {
 /** Variable names that hold a secret: `GITHUB_TOKEN`, `DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`. */
 const SECRET_VARIABLE =
   /(?:TOKEN|SECRET|PASSW(?:OR)?D|PASSPHRASE|CREDENTIAL|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CLIENT_?SECRET|CONNECTION_?STRING|_PAT$|^PAT$|(?:^|_)AUTH(?:_|$))/i;
+/** git commands that print remote URLs or the whole config. */
+function printsRemote(args: string[]): boolean {
+  let k = 0;
+  while (
+    args[k] === "-C" ||
+    args[k] === "-c" ||
+    args[k]?.startsWith("--git-dir") ||
+    args[k] === "--no-pager"
+  )
+    k += args[k] === "-C" || args[k] === "-c" ? 2 : 1;
+  const [sub = "", ...rest] = args.slice(k);
+  if (sub === "config")
+    return (
+      rest.some((arg) => /^(?:-l|--list|--get-regexp|--get-all|--show-origin)$/.test(arg)) ||
+      rest.some((arg) => /(?:^|\.)(?:url|pushurl|extraheader|insteadof)$/i.test(arg))
+    );
+  if (sub === "remote")
+    return rest.includes("-v") || rest.includes("--verbose") || rest[0] === "get-url";
+  if (sub === "ls-remote") return rest.includes("--get-url");
+  return false;
+}
+/**
+ * Whether a checkout the script runs in has a remote URL with user info (`https://user:token@`),
+ * a URL rewrite, or an `http.*.extraheader`: printing them would print a credential. Read at
+ * decision time; an unreadable checkout counts as yes.
+ */
+function remoteHasSecret(context: Context): boolean {
+  if (context.unknownCwd) return true;
+  for (const cwd of context.cwds) {
+    let out = "";
+    try {
+      out = git(cwd, [
+        "config",
+        "--get-regexp",
+        "^(remote\\..*\\.(url|pushurl)|url\\..*\\.(insteadof|pushinsteadof)|http\\..*extraheader)$",
+      ]);
+    } catch {
+      // Exit 1: nothing matched. Anything else (no repository) cannot leak a remote.
+      continue;
+    }
+    if (/\bhttps?:\/\/[^/\s@]+@|extraheader/i.test(out)) return true;
+  }
+  return false;
+}
 /**
  * Read commands of common CLIs that print a secret: a token, a kubeconfig with credentials, chart
  * values, function environment variables, decrypted parameters or app settings. A credential read
@@ -1852,7 +1900,10 @@ function analyzeCommand(
     if (!inner.literal || depth >= 4) opaqueGitRules(context.words, true, rules);
     return;
   }
-  if (program.literal && printsSecret(name, args)) {
+  if (
+    program.literal &&
+    (printsSecret(name, args) || (name === "git" && printsRemote(args) && remoteHasSecret(context)))
+  ) {
     rules.add("credential-read");
     secretReads++;
   }
@@ -2073,8 +2124,23 @@ export function hardRules(
   decision: Decision,
   scratchRoots: string[] = [],
 ): HardRule[] {
-  // The engine and the session ask about the same request in turn: answer from a short memo.
-  const key = JSON.stringify([
+  // Within one decision (`withEvidence`) the engine asks about the same request more than once:
+  // answer from a memo that ends with the decision, so no later request sees a stale answer.
+  const scope = evidenceScope();
+  const key = ruleKey(request, decision, scratchRoots);
+  const hit = scope === undefined ? undefined : ruleMemo.get(key);
+  if (hit && hit.scope === scope) return [...hit.rules];
+  const before = secretReads;
+  const rules = withEvidence(() => hardRulesOnce(request, decision, scratchRoots));
+  lastSecret = secretReads > before;
+  if (scope !== undefined) {
+    if (ruleMemo.size >= 32) ruleMemo.delete(ruleMemo.keys().next().value as string);
+    ruleMemo.set(key, { scope, rules, secret: lastSecret });
+  }
+  return [...rules];
+}
+const ruleKey = (request: Request, decision: Decision, scratchRoots: string[]) =>
+  JSON.stringify([
     request.tool,
     request.cwd,
     request.input,
@@ -2083,16 +2149,9 @@ export function hardRules(
     decision.userOnly ?? false,
     scratchRoots,
   ]);
-  const now = Date.now();
-  const hit = ruleMemo.get(key);
-  if (hit && now - hit.at < 2000) return [...hit.rules];
-  const before = secretReads;
-  const rules = withEvidence(() => hardRulesOnce(request, decision, scratchRoots));
-  if (ruleMemo.size >= 32) ruleMemo.delete(ruleMemo.keys().next().value as string);
-  ruleMemo.set(key, { at: now, rules, secret: secretReads > before });
-  return [...rules];
-}
-const ruleMemo = new Map<string, { at: number; rules: HardRule[]; secret: boolean }>();
+/** Whether the last computed (not memoized) hard-rule answer read a policy secret. */
+let lastSecret = false;
+const ruleMemo = new Map<string, { scope: number; rules: HardRule[]; secret: boolean }>();
 /** Shell words that read the policy service's own secrets, counted as the scan finds them. */
 let secretReads = 0;
 /**
@@ -2110,18 +2169,12 @@ export function readsPolicySecret(request: Request, scratchRoots: string[] = [])
     cache: "none",
     cached: false,
   };
-  const before = secretReads;
+  const scope = evidenceScope();
+  const hit =
+    scope === undefined ? undefined : ruleMemo.get(ruleKey(request, decision, scratchRoots));
+  if (hit && hit.scope === scope) return hit.secret;
   hardRules(request, decision, scratchRoots);
-  const key = JSON.stringify([
-    request.tool,
-    request.cwd,
-    request.input,
-    decision.reason,
-    decision.category,
-    false,
-    scratchRoots,
-  ]);
-  return ruleMemo.get(key)?.secret ?? secretReads > before;
+  return lastSecret;
 }
 function hardRulesOnce(request: Request, decision: Decision, scratchRoots: string[]): HardRule[] {
   const rules = new Set<HardRule>();

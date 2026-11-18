@@ -726,6 +726,13 @@ function callsReachState(
  * Code that can start a process or evaluate a string, so names in its text may become commands or
  * file calls this cannot read.
  */
+/**
+ * A call this cannot name: a computed member (`fs['rm'+'Sync'](x)`), a module function under
+ * another name (`import os as o`, `from os import remove as r`, `f = os.remove`), Ruby `send`,
+ * Perl symbolic calls (`&$f`, `->$m`), PHP variable functions (`$f(x)`).
+ */
+export const INDIRECT_CALL =
+  /\]\s*\(|\bgetattr\s*\(|\bimport\s+[\w.]+\s+as\b|\bfrom\s+[\w.]+\s+import\b[^\n]*\bas\b|=\s*(?:os|shutil|fs|fsp|promises|pathlib|Path|FileUtils|File|Dir)\s*\.\s*\w+\s*(?:$|[;,)\n])|\b(?:public_send|__send__)\b|\.send\s*[(:]|\bmethod\s*\(\s*:|&\$\w|&\{|->\s*\$|\$\w+\s*\(|\bcall_user_func/m;
 export const RUNS_CODE =
   /child_process|subprocess|\bspawn|\bexec(?:Sync|File\w*|[lv]p?e?)?\s*\(|\bsystem\s*[("'$]|\bpopen|Popen|\bpty\b|\bcommands\s*\.|shell_exec|passthru|proc_open|\bqx\b|%x[({[]|\bIO\s*\.\s*popen|Bun\s*\.|Deno\s*\.|\beval\b|\bFunction\s*\(|\bvm\s*\.|\bWorker\s*\(|__import__|importlib|\bgetattr\s*\(|\bcompile\s*\(|\brequire\s*\(\s*[^'"\s)]|\bimport\s*\(\s*[^'"\s)]|\bsend\s*\(|call_user_func|\bos\s*\.\s*(?:system|popen|exec|spawn|posix_spawn|fork)|\bReflect\b|\.\s*(?:call|apply|bind)\s*\(/;
 /** A module member that is not called (`const r = fs.rmSync`) or a computed one (`fs["rmSync"]`). */
@@ -802,6 +809,7 @@ export function codeTouchesState(
   const bare = withoutStrings(code, options.interpreter);
   if (
     !RUNS_CODE.test(bare) &&
+    !INDIRECT_CALL.test(bare) &&
     !(
       code.includes("`") &&
       !/^(?:node|nodejs|deno|bun|python[\d.]*)$/i.test(options.interpreter ?? "")

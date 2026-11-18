@@ -1,11 +1,13 @@
 import { lstatSync, readdirSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { withoutStrings } from "./clirun.js";
 import {
   branchEvidence,
   canonical,
   claudeMemoryFile,
   disposable,
   type Fill,
+  featureGitEnv,
   git,
   inside,
   isProtectedPath,
@@ -40,6 +42,7 @@ import {
   worktreeDeletion,
 } from "./recoverable.js";
 import { type Redirect, type SimpleCommand, SUBSTITUTION } from "./shell.js";
+import { INDIRECT_CALL } from "./statepaths.js";
 import type { Decision, Request } from "./types.js";
 
 /**
@@ -1459,14 +1462,17 @@ const DANGEROUS_CODE =
   /\b(?:rmtree|removedirs|unlink|unlinkSync|rmdir|rmdirSync|rmSync|os\.remove|os\.removedirs|shutil\.move|child_process|execSync|spawnSync|spawn|subprocess|os\.system|os\.popen|os\.exec[a-z]*|eval|exec|compile|__import__|importlib|ctypes|socket|urlopen|requests\.(?:post|put|delete|patch)|fetch)\b|\bfs\.rm\b|\bPath\([^)]*\)\.(?:unlink|rmdir)|\brm\s+-/;
 
 function interpreterCodeRefusal(code: string): string | undefined {
-  if (DANGEROUS_CODE.test(code))
-    return "Interpreter code that deletes files, starts processes or evaluates strings requires human review";
+  // Naming a protected or credential path comes first: it is a hard item whatever the code does.
   for (const token of code.split(/[\s"'`()[\]{},;=<>|&]+/))
     if (
       (token.includes("/") || token.startsWith(".")) &&
       (sensitive(token) || protectedPath(token))
     )
       return "Interpreter code that names a protected or credential path requires human review";
+  if (INDIRECT_CALL.test(withoutStrings(code)))
+    return "Interpreter code that calls a function it names indirectly requires human review";
+  if (DANGEROUS_CODE.test(code))
+    return "Interpreter code that deletes files, starts processes or evaluates strings requires human review";
   return undefined;
 }
 
@@ -1789,8 +1795,8 @@ export function simpleDecision(
   cwd: string,
   fill?: Fill,
 ): Decision {
-  for (const [name] of command.env)
-    if (BANNED_ENV.test(name))
+  for (const [name, value] of command.env)
+    if (BANNED_ENV.test(name) && !featureGitEnv(name, value, cwd))
       return human(request, "unknown", "Environment override requires human review");
   for (const redirect of command.redirects) {
     const refusal = redirectDecision(request, redirect, profile, cwd, fill);

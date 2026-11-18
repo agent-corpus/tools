@@ -1,7 +1,14 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, posix, resolve } from "node:path";
-import { canonical, type Fill, noteLinkRisk, resolveWord, UNKNOWN_CWD } from "./evidence.js";
+import {
+  canonical,
+  type Fill,
+  featureGitEnv,
+  noteLinkRisk,
+  resolveWord,
+  UNKNOWN_CWD,
+} from "./evidence.js";
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
@@ -315,6 +322,19 @@ function instantiate(
     }
   }
   return { text, loose };
+}
+
+/**
+ * `GIT_DIR`/`GIT_WORK_TREE` set to a literal path that only points git at a verified feature
+ * worktree (`featureGitEnv`), from every directory the shell may be in.
+ */
+function gitEnvAllowed(name: string, value: string | undefined, state: State): boolean {
+  return (
+    value !== undefined &&
+    state.cwds.length > 0 &&
+    !state.cwds.includes(UNKNOWN_CWD) &&
+    state.cwds.every((cwd) => featureGitEnv(name, value, cwd))
+  );
 }
 
 function plainText(word: Word | undefined): string | undefined {
@@ -722,7 +742,7 @@ function runSimple(
   if (!node.argv.length) {
     // Assignments on their own, or redirections with no command.
     for (const a of node.assigns)
-      if (BANNED_ENV.test(a.name))
+      if (BANNED_ENV.test(a.name) && !gitEnvAllowed(a.name, plainText(a.value), state))
         return human(request, "unknown", "Environment override requires human review");
     if (piped && node.assigns.length)
       return human(request, "unknown", "Assignment inside a pipeline requires human review");
@@ -1117,7 +1137,10 @@ function exportVariables(
       if (text !== undefined && NAME.test(text)) continue; // exports an existing variable
       return human(request, "unknown", "export of a computed name requires human review");
     }
-    if (BANNED_ENV.test(assignment.name))
+    if (
+      BANNED_ENV.test(assignment.name) &&
+      !gitEnvAllowed(assignment.name, plainText(assignment.value), state)
+    )
       return human(request, "unknown", "Environment override requires human review");
     const texts = envs.map((env) => instantiate(assignment.value, known, env, state).text);
     if (texts.length && texts.every((t) => SIMPLE_VALUE.test(t)))

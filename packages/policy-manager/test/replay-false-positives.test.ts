@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { isProtectedPath } from "../src/evidence.js";
 import { scriptRules } from "../src/hard.js";
-import { parseProfile, strictProfile } from "../src/profile.js";
+import { parseProfile } from "../src/profile.js";
 import { APPROVE_GUARD, PolicySession } from "../src/session.js";
 import { codeTouchesState, stateDirs } from "../src/statepaths.js";
 import type { Request } from "../src/types.js";

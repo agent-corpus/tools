@@ -4,6 +4,7 @@ import {
   existsSync,
   lstatSync,
   readdirSync,
+  readFileSync,
   readlinkSync,
   realpathSync,
   statSync,
@@ -65,8 +66,14 @@ let gitMemo: Map<string, { out?: string; error?: unknown }> | undefined;
 let gitDepth = 0;
 /** `canonical` answers for the length of one decision, like `gitMemo`. */
 let realMemo: Map<string, { out?: string; error?: unknown }> | undefined;
+let evidenceScopes = 0;
+/** The current decision's scope, or undefined outside one: memos must not outlive it. */
+export function evidenceScope(): number | undefined {
+  return gitDepth > 0 ? evidenceScopes : undefined;
+}
 export function withEvidence<T>(run: () => T): T {
   if (gitDepth++ === 0) {
+    evidenceScopes++;
     gitMemo = new Map();
     realMemo = new Map();
   }
@@ -593,5 +600,32 @@ export function branchEvidence(cwd: string, branch: string): string {
     return `Local branch deletion requires human approval; upstream=${upstream ? "present" : "absent"}; commits absent from fetched remote refs=${unique}; remote state may be stale`;
   } catch {
     return "Local branch deletion requires human approval; branch reachability could not be verified";
+  }
+}
+
+/**
+ * Whether `GIT_DIR=<value>` or `GIT_WORK_TREE=<value>` only points git at a verified linked
+ * feature worktree: GIT_WORK_TREE is that worktree's top level, GIT_DIR its own git directory
+ * (`.git/worktrees/<name>` of the main repository, or the `.git` it names). The value must be a
+ * literal path. A main checkout, another repository, or anything unsure is no.
+ */
+export function featureGitEnv(name: string, value: string, cwd: string): boolean {
+  if (!value || /[$`*?[{~]/.test(value)) return false;
+  try {
+    const path = canonical(resolve(cwd, value));
+    if (name === "GIT_WORK_TREE") return featureCheckout(path) === path;
+    if (name !== "GIT_DIR") return false;
+    // The worktree's own `.git` file.
+    if (basename(path) === ".git" && statSync(path).isFile()) {
+      const top = dirname(path);
+      return featureCheckout(top) === top;
+    }
+    // A linked worktree's git directory names its worktree in `gitdir` (`<worktree>/.git`).
+    const pointer = readFileSync(join(path, "gitdir"), "utf8").trim();
+    const top = canonical(dirname(resolve(path, pointer)));
+    if (featureCheckout(top) !== top) return false;
+    return canonical(git(top, ["rev-parse", "--absolute-git-dir"])) === path;
+  } catch {
+    return false;
   }
 }
