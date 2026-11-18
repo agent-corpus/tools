@@ -1209,6 +1209,13 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "import os as o; o.remove(input())"`,
     `python3 -c "import shutil as s, glob; [s.rmtree(d) for d in glob.glob('/v*/*')]"`,
     `python3 -c "import os; getattr(os, 'rem'+'ove')('/'+'tmp/x')"`,
+    // An unreadable path with no visible starting directory, or one that starts at `/`, fails closed
+    // however its fragments are ordered.
+    `python3 -c "import shutil as s; s.rmtree(d)"`,
+    `python3 -c "import os; a='mp'; b='/t'; c='/'; d='p-501-0123456789abcdef01234567'; e='ac'; os.rmdir(b+a+c+e+d)"`,
+    `python3 -c "import os; x='/'; os.remove(x+y)"`,
+    `node -e "const r='/'; require('fs').rmSync(r+q,{recursive:true})"`,
+    `python3 -c "import os\np='a.ts'\nif 1: p=q\nos.remove(p)"`,
     `node -e "const m='f'+'s'; require(m)['rm'+'Sync']('/'+'tmp/x')"`,
     `ruby -e "require 'fileutils'; FileUtils.send(:rm_rf, '/'+'tmp')"`,
   ])("policy-state: %s", (command) => {
@@ -1217,11 +1224,11 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
   test.each([
     `python3 -c "print(open('/etc/hosts').read().strip().replace('a','b'))"`,
     `node -e "console.log('a-b'.replace('-','+'))"`,
-    // A computed path that nothing in the code can point at temp: every string is visible.
+    // A computed path that starts from a visible directory outside the state can only go deeper.
     `python3 - <<'EOF'\np="/Users/x/repo/Header.tsx"\ns=open(p,encoding="utf-8").read()\ndef rep(a,b):\n    global s\n    s=s.replace(a,b,1)\nrep("x","y")\nopen(p,"w",encoding="utf-8").write(s)\nEOF`,
     `python3 -I - <<'EOF'\np='src/steps/settings.ts'\ns=open(p).read()\nnew='''  await api.put(\`/api/\${facilityId}/plans/\${id}\`)'''\ns=s.replace('x',new)\nopen(p,'w').write(s)\nEOF`,
-    `python3 -c "import shutil as s; s.rmtree(d)"`,
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit('a.ts')"`,
+    `python3 -c "p='a.ts'\nopen(p,'w').write('')\np='b.ts'\nopen(p,'w').write('')"`,
     `python3 -c "import os as o; print(o.getcwd())"`,
     `node -e "require('fs').writeFileSync('/tmp/pm-x/out.json','{}')"`,
   ])("not policy-state: %s", (command) => {

@@ -593,27 +593,41 @@ function literalPath(text: string, argv: Array<string | undefined> = []): string
 function literalVariables(
   code: string,
   argv: Array<string | undefined> = [],
+  interpreter = "",
 ): Map<string, string[] | undefined> {
   const found = new Map<string, string[] | undefined>();
-  for (const line of code.split(/[\n;]/)) {
-    const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)(.*)$/.exec(line);
+  // Bindings are read outside string literals: text being written (source code with its own
+  // `(p) =>` or `p = x`) is data. Values are read back from the code at the same positions.
+  const masked = maskStrings(code, interpreter);
+  const plain = new Map<string, number>();
+  for (const segment of masked.matchAll(/[^\n;]+/g)) {
+    const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)/.exec(segment[0]);
     if (!match) continue;
-    const [, name = "", value = ""] = match;
+    const at = (segment.index ?? 0) + match[0].length;
+    const name = match[1] ?? "";
+    const value = code.slice(at, (segment.index ?? 0) + segment[0].length);
     const path = literalPath(value, argv);
-    found.set(name, found.has(name) || path === undefined ? undefined : [path]);
+    // Every statement-level binding of a name to a literal adds a value it may hold; one binding to
+    // anything else makes it unknown.
+    const known = found.get(name);
+    found.set(
+      name,
+      path === undefined || (found.has(name) && !known) ? undefined : [...(known ?? []), path],
+    );
+    plain.set(name, (plain.get(name) ?? 0) + 1);
   }
-  // Exactly one binding: any other assignment to the name, wherever it is (`if 1: p = x`, a
+  // Only those bindings: any other assignment to the name, wherever it is (`if 1: p = x`, a
   // walrus, `+=`, destructuring, `global`/`nonlocal`), makes its value unknown.
   for (const name of found.keys()) {
     const word = `\\b${name}\\b`;
-    const assignments = code.match(
+    const assignments = masked.match(
       new RegExp(`${word}\\s*(?:[-+*/%&|^@:]|\\*\\*|//|<<|>>|\\?\\?|\\|\\||&&)?=(?!=)`, "g"),
     );
     if (
-      (assignments?.length ?? 0) !== 1 ||
+      (assignments?.length ?? 0) !== plain.get(name) ||
       new RegExp(
         `\\b(?:global|nonlocal)\\b[^\\n;]*${word}|[[{(][^\\]})\\n]*${word}[^\\]})\\n]*[\\]})]\\s*=(?!=)`,
-      ).test(code)
+      ).test(masked)
     )
       found.set(name, undefined);
   }
@@ -621,8 +635,8 @@ function literalVariables(
     for (const name of list.split(/[\s,()[\]{}*=:.]+/))
       if (/^[A-Za-z_]\w*$/.test(name)) found.set(name, undefined);
   };
-  for (const match of code.matchAll(
-    /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|\b(\w+)\s*,\s*\w+\s*=(?!=)|\b\w+\s*,\s*(\w+)\s*=(?!=)/g,
+  for (const match of masked.matchAll(
+    /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|(?:^|[\n;])\s*(\w+(?:\s*,\s*\w+)+)\s*,?\s*=(?!=)/g,
   ))
     for (const group of match.slice(1)) if (group) bound(group);
   return found;
@@ -648,7 +662,7 @@ function callsReachState(
     )
   )
     argv = [];
-  const vars = literalVariables(code, argv);
+  const vars = literalVariables(code, argv, interpreter);
   const aliases = moduleAliases(code);
   const values = (arg: string): string[] | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
@@ -664,11 +678,59 @@ function callsReachState(
     TEMP_HINT.test(withoutStrings(code, interpreter)) ||
     // In a string, `${name}` is template text (data) unless the name itself points at temp.
     TEMP_HINT.test(joinedStrings(code).replace(/\$\{?(\w+)\}?/g, "$1"));
+  // A path this cannot read is safe only when it starts from a visible directory that neither
+  // holds nor lies above a session directory: `b + path` with `b = '/repo/src/'`, `f'src/{x}'`,
+  // `os.path.join('/repo', x)`, `Path('/repo') / x`. Whatever follows can only go deeper, since a
+  // `..` anywhere makes the code hinted. A prefix like `'/t'` names `/`, which lies above the
+  // state, so reordered fragments (`'/t' + 'mp' + …`) still fail closed.
+  const anchored = (arg: string): boolean => {
+    const text = arg.trim();
+    const first =
+      /^(?:os\s*\.\s*path\s*\.\s*join|path\s*\.\s*(?:join|resolve)|join)\s*\(\s*([^,()]+)/.exec(
+        text,
+      )?.[1] ??
+      /^(?:pathlib\s*\.\s*)?Path\s*\(\s*([^()]+?)\s*\)\s*\//.exec(text)?.[1] ??
+      text;
+    const lead =
+      /^\s*(?:(f|r|rf|fr|b)?(['"])((?:(?!\2)[^\\\n])*)\2|`([^`$]*)|([A-Za-z_]\w*))/i.exec(first);
+    if (!lead) return false;
+    let prefixes: string[] | undefined;
+    if (lead[5] !== undefined) prefixes = vars.get(lead[5]);
+    else {
+      const body = lead[4] ?? lead[3] ?? "";
+      prefixes = [
+        /f/i.test(lead[1] ?? "") || lead[4] !== undefined ? (body.split("{")[0] ?? "") : body,
+      ];
+    }
+    if (!prefixes?.length) return false;
+    const states = stateDirs().map(fold);
+    return prefixes.every((prefix) => {
+      if (prefix.includes("..")) return false;
+      const dir = prefix.slice(0, prefix.lastIndexOf("/") + 1);
+      return cwds.every((cwd) => {
+        // No `..` can occur here, so joining is resolving (also for a Windows drive path).
+        const base = slashes(dir);
+        let abs = (/^(?:\/|[A-Za-z]:\/)/.test(base) ? base : `${slashes(cwd)}/${base}`)
+          .replace(/\/(?:\.\/)+/g, "/")
+          .replace(/\/{2,}/g, "/");
+        try {
+          abs = slashes(canonical(abs));
+        } catch {
+          /* a directory not created yet keeps its lexical form */
+        }
+        const at = fold(trim(abs));
+        if (!at || at === "/") return false;
+        return !states.some(
+          (state) => state === at || state.startsWith(`${at}/`) || at.startsWith(`${state}/`),
+        );
+      });
+    });
+  };
   const reaches = (arg: string | undefined) => {
-    if (arg === undefined) return hinted;
+    if (arg === undefined) return true;
     const paths = values(arg);
     // A session directory by its name counts too, also one not created yet or another user's.
-    if (paths === undefined) return hinted;
+    if (paths === undefined) return hinted || !anchored(arg);
     return paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true));
   };
   // Calls are found outside string literals (a message or source text being edited is data);
@@ -689,6 +751,9 @@ function callsReachState(
     const before = code.slice(Math.max(0, index - MAX_TARGET), index);
     // A method on an expression: `Path('/x').unlink()`, `require('fs').rmSync(x)`.
     const dotted = !receiver && /\.\s*$/.test(before.slice(-8));
+    // A method on what `open(...)` returns (`open(p, encoding="utf-8").read()`) acts on the file
+    // that call opened, and the `open` call itself is judged on its own.
+    if (dotted && /(?:^|[^\w.])open\s*\((?:[^()]|\([^()]*\))*\)\s*\.\s*$/.test(before)) continue;
     // The path object a method is called on, when it is `Path(<literal>)`.
     const pathObject = () =>
       /Path\s*\(([^()]*)\)\s*\.?\s*$/.exec(before.replace(/\s*\.\s*$/, ""))?.[1];
@@ -713,7 +778,7 @@ function callsReachState(
       // A glob only finds names; `open`/`fopen`/`File.write` write only in a write mode.
       if (name === "glob") continue;
       const args = callArgs(code, at, parens);
-      if (!args) return hinted;
+      if (!args) return true;
       if (name === "write") {
         if (receiver !== "File" && receiver !== "IO") continue;
       } else {
@@ -742,7 +807,7 @@ function callsReachState(
       continue;
     }
     const args = callArgs(code, at, parens);
-    if (!args) return hinted;
+    if (!args) return true;
     const count = TWO_PATHS.has(name) ? 2 : 1;
     for (let i = 0; i < count; i++) if (reaches(args[i])) return true;
   }
