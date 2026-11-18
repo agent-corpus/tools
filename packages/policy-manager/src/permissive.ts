@@ -7,8 +7,9 @@ import {
   claudeMemoryFile,
   disposable,
   type Fill,
-  featureGitEnv,
+  featureGitTop,
   git,
+  gitEnvConfined,
   inside,
   isProtectedPath,
   MEMORY_WRITE,
@@ -695,6 +696,8 @@ export function permissiveWrite(
 ) {
   const check = writeEvidence(cwd, input, profile, directory, memory);
   if (!check.allowed || !fill) return check;
+  // A later script run in the same command may be the file written here.
+  fill.script.wrote = true;
   // After a command that can create a symlink, a memory file may be one: protected again.
   if (fill.script.tainted && check.reason === MEMORY_WRITE)
     return {
@@ -1795,9 +1798,19 @@ export function simpleDecision(
   cwd: string,
   fill?: Fill,
 ): Decision {
-  for (const [name, value] of command.env)
-    if (BANNED_ENV.test(name) && !featureGitEnv(name, value, cwd))
-      return human(request, "unknown", "Environment override requires human review");
+  // `GIT_DIR`/`GIT_WORK_TREE` only when they confine git to one verified feature worktree.
+  const gitTops: Record<string, string | undefined> = {};
+  for (const [name, value] of command.env) {
+    if (!BANNED_ENV.test(name)) continue;
+    const top = /^GIT_(?:DIR|WORK_TREE)$/.test(name) ? featureGitTop(name, value, cwd) : undefined;
+    if (!top) return human(request, "unknown", "Environment override requires human review");
+    gitTops[name] = top;
+  }
+  if (
+    (gitTops.GIT_DIR || gitTops.GIT_WORK_TREE) &&
+    !gitEnvConfined(gitTops.GIT_DIR, gitTops.GIT_WORK_TREE, cwd)
+  )
+    return human(request, "unknown", "Environment override requires human review");
   for (const redirect of command.redirects) {
     const refusal = redirectDecision(request, redirect, profile, cwd, fill);
     if (refusal) return refusal;
@@ -2060,7 +2073,12 @@ export function simpleDecision(
     // untracked script goes to the classifier.
     if (code === undefined && !args.includes("-m")) {
       const script = args.find((arg) => !arg.startsWith("-"));
-      if (script !== undefined && committedScript(cwd, script) === false)
+      if (
+        script !== undefined &&
+        (committedScript(cwd, script) === false ||
+          // Checked before anything runs: an earlier command in the script may change it.
+          (committedScript(cwd, script) === true && (fill?.script.wrote || fill?.script.tainted)))
+      )
         return human(
           request,
           "unknown",

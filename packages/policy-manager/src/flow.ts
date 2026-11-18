@@ -4,7 +4,8 @@ import { basename, isAbsolute, join, posix, resolve } from "node:path";
 import {
   canonical,
   type Fill,
-  featureGitEnv,
+  featureGitTop,
+  gitEnvConfined,
   noteLinkRisk,
   resolveWord,
   UNKNOWN_CWD,
@@ -12,6 +13,7 @@ import {
 import { BANNED_ENV, human, redirectDecision, simpleDecision, unwrap } from "./permissive.js";
 import { result } from "./policy.js";
 import type { Profile } from "./profile.js";
+import { readOnly } from "./reads.js";
 import {
   applyParamOp,
   type Command,
@@ -58,6 +60,8 @@ const FUNCTION_MARK = "()";
 
 interface State {
   cwds: string[];
+  /** Exported `GIT_DIR`/`GIT_WORK_TREE`, as the verified feature worktree tops they name. */
+  gitEnv?: { GIT_DIR?: string; GIT_WORK_TREE?: string; unknown?: boolean };
   /**
    * Set by `cd`: the directories the shell is still in if that `cd` failed. A following `&&` only
    * runs after it succeeded, so it drops these; anything else may run after a failure, so it
@@ -111,6 +115,7 @@ const copy = (state: State): State => ({
   ...(state.sure ? { sure: true } : {}),
   vars: new Map(state.vars),
   funcs: new Map(state.funcs),
+  ...(state.gitEnv ? { gitEnv: { ...state.gitEnv } } : {}),
 });
 
 /** The last `cd` may have failed: every directory it could have left the shell in is possible. */
@@ -142,7 +147,14 @@ function merge(a: State, b: State): State {
     const left = a.funcs.get(name);
     funcs.set(name, left && left === b.funcs.get(name) ? left : null);
   }
-  return { cwds: [...new Set(cwds)], vars, funcs };
+  // Exported git variables that differ between the paths are unknown afterwards.
+  const gitEnv =
+    a.gitEnv || b.gitEnv
+      ? JSON.stringify(a.gitEnv ?? {}) === JSON.stringify(b.gitEnv ?? {})
+        ? a.gitEnv
+        : { unknown: true }
+      : undefined;
+  return { cwds: [...new Set(cwds)], vars, funcs, ...(gitEnv ? { gitEnv } : {}) };
 }
 
 function replace(target: State, source: State): void {
@@ -153,6 +165,8 @@ function replace(target: State, source: State): void {
   else delete target.sure;
   target.vars = source.vars;
   target.funcs = source.funcs;
+  if (source.gitEnv) target.gitEnv = source.gitEnv;
+  else delete target.gitEnv;
 }
 
 // --- words ------------------------------------------------------------------------------------
@@ -325,17 +339,18 @@ function instantiate(
 }
 
 /**
- * `GIT_DIR`/`GIT_WORK_TREE` set to a literal path that only points git at a verified feature
- * worktree (`featureGitEnv`), from every directory the shell may be in.
+ * The feature worktree top that `GIT_DIR`/`GIT_WORK_TREE` names (`featureGitTop`), the same from
+ * every directory the shell may be in, or undefined.
  */
-function gitEnvAllowed(name: string, value: string | undefined, state: State): boolean {
-  return (
-    value !== undefined &&
-    state.cwds.length > 0 &&
-    !state.cwds.includes(UNKNOWN_CWD) &&
-    state.cwds.every((cwd) => featureGitEnv(name, value, cwd))
-  );
+function gitEnvTop(name: string, value: string | undefined, state: State): string | undefined {
+  if (value === undefined || !state.cwds.length || state.cwds.includes(UNKNOWN_CWD))
+    return undefined;
+  const tops = new Set(state.cwds.map((cwd) => featureGitTop(name, value, cwd)));
+  const [top] = tops;
+  return tops.size === 1 ? top : undefined;
 }
+const gitEnvAllowed = (name: string, value: string | undefined, state: State) =>
+  gitEnvTop(name, value, state) !== undefined;
 
 function plainText(word: Word | undefined): string | undefined {
   if (!word) return undefined;
@@ -611,6 +626,26 @@ function runSimple(
   piped: boolean,
 ): Decision | undefined {
   const { request, profile } = ctx;
+  // Exported `GIT_DIR`/`GIT_WORK_TREE` (with this command's own prefix, which wins) must confine
+  // git to one feature worktree from every directory the command may run in.
+  if (state.gitEnv && node.argv.length) {
+    const prefix = (name: string) => {
+      const a = node.assigns.find((x) => x.name === name);
+      return a ? gitEnvTop(name, plainText(a.value), state) : undefined;
+    };
+    const dir = node.assigns.some((a) => a.name === "GIT_DIR")
+      ? prefix("GIT_DIR")
+      : state.gitEnv.GIT_DIR;
+    const tree = node.assigns.some((a) => a.name === "GIT_WORK_TREE")
+      ? prefix("GIT_WORK_TREE")
+      : state.gitEnv.GIT_WORK_TREE;
+    if (
+      state.gitEnv.unknown ||
+      state.cwds.includes(UNKNOWN_CWD) ||
+      !state.cwds.every((cwd) => gitEnvConfined(dir, tree, cwd))
+    )
+      return human(request, "unknown", "Environment override requires human review");
+  }
   const refusal = runSubs(
     ctx,
     [
@@ -791,6 +826,8 @@ function runSimple(
         ctx.box.helpers ??= new Set();
         for (const helper of decision.credentialHelpers) ctx.box.helpers.add(helper);
       }
+      // Anything but a plain reader may have changed a file a later script run reads.
+      if (!readOnly(unwrap(command.argv).argv)) ctx.box.script.wrote = true;
       // A listed credential helper only reads a secret and talks to its service.
       if (
         !decision.credentialHelpers?.length &&
@@ -1134,14 +1171,18 @@ function exportVariables(
       return human(request, "unknown", "export with options requires human review");
     const assignment = splitAssignment(arg);
     if (!assignment) {
+      if (text !== undefined && BANNED_ENV.test(text))
+        return human(request, "unknown", "Environment override requires human review");
       if (text !== undefined && NAME.test(text)) continue; // exports an existing variable
       return human(request, "unknown", "export of a computed name requires human review");
     }
-    if (
-      BANNED_ENV.test(assignment.name) &&
-      !gitEnvAllowed(assignment.name, plainText(assignment.value), state)
-    )
-      return human(request, "unknown", "Environment override requires human review");
+    if (BANNED_ENV.test(assignment.name)) {
+      const top = /^GIT_(?:DIR|WORK_TREE)$/.test(assignment.name)
+        ? gitEnvTop(assignment.name, plainText(assignment.value), state)
+        : undefined;
+      if (!top) return human(request, "unknown", "Environment override requires human review");
+      state.gitEnv = { ...state.gitEnv, [assignment.name]: top };
+    }
     const texts = envs.map((env) => instantiate(assignment.value, known, env, state).text);
     if (texts.length && texts.every((t) => SIMPLE_VALUE.test(t)))
       state.vars.set(assignment.name, [...new Set(texts)]);

@@ -435,6 +435,8 @@ export interface Fill {
     approved: boolean;
     /** Background jobs started so far; one may outlive the loop or pipeline that started it. */
     jobs: number;
+    /** An earlier command may have written or changed a file (anything but a plain reader). */
+    wrote?: boolean;
   };
   /** In a loop, a pipeline or a background job a later command can run first. */
   reorder: boolean;
@@ -604,27 +606,47 @@ export function branchEvidence(cwd: string, branch: string): string {
 }
 
 /**
- * Whether `GIT_DIR=<value>` or `GIT_WORK_TREE=<value>` only points git at a verified linked
- * feature worktree: GIT_WORK_TREE is that worktree's top level, GIT_DIR its own git directory
- * (`.git/worktrees/<name>` of the main repository, or the `.git` it names). The value must be a
- * literal path. A main checkout, another repository, or anything unsure is no.
+ * The top level of the verified linked feature worktree that `GIT_DIR=<value>` (its own git
+ * directory, `.git/worktrees/<name>`, or the `.git` file it has) or `GIT_WORK_TREE=<value>` (its
+ * top level) names, as a literal path. A main checkout, another repository, or anything unsure
+ * is undefined.
  */
-export function featureGitEnv(name: string, value: string, cwd: string): boolean {
-  if (!value || /[$`*?[{~]/.test(value)) return false;
+export function featureGitTop(name: string, value: string, cwd: string): string | undefined {
+  if (!value || /[$`*?[{~]/.test(value)) return undefined;
   try {
     const path = canonical(resolve(cwd, value));
-    if (name === "GIT_WORK_TREE") return featureCheckout(path) === path;
-    if (name !== "GIT_DIR") return false;
-    // The worktree's own `.git` file.
+    if (name === "GIT_WORK_TREE") return featureCheckout(path) === path ? path : undefined;
+    if (name !== "GIT_DIR") return undefined;
     if (basename(path) === ".git" && statSync(path).isFile()) {
       const top = dirname(path);
-      return featureCheckout(top) === top;
+      return featureCheckout(top) === top ? top : undefined;
     }
     // A linked worktree's git directory names its worktree in `gitdir` (`<worktree>/.git`).
     const pointer = readFileSync(join(path, "gitdir"), "utf8").trim();
     const top = canonical(dirname(resolve(path, pointer)));
-    if (featureCheckout(top) !== top) return false;
-    return canonical(git(top, ["rev-parse", "--absolute-git-dir"])) === path;
+    if (featureCheckout(top) !== top) return undefined;
+    return canonical(git(top, ["rev-parse", "--absolute-git-dir"])) === path ? top : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether git, run in `cwd` with these `GIT_DIR`/`GIT_WORK_TREE` tops, reads and writes only the
+ * one verified feature worktree: both set to the same worktree, or one set and `cwd` inside that
+ * worktree (git takes the other from `cwd`). With only `GIT_DIR`, git uses `cwd` as the work
+ * tree, so from the main checkout it would write the main checkout.
+ */
+export function gitEnvConfined(
+  dir: string | undefined,
+  workTree: string | undefined,
+  cwd: string,
+): boolean {
+  if (dir && workTree) return dir === workTree;
+  const top = dir ?? workTree;
+  if (!top) return true;
+  try {
+    return inside(top, canonical(cwd));
   } catch {
     return false;
   }

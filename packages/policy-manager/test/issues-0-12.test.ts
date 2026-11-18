@@ -127,6 +127,10 @@ describe.skipIf(process.platform === "win32")("#48 scripts run in a worktree", (
   test("an edited, untracked or not yet written script goes to the classifier", async () => {
     writeFileSync(join(wt, "new.mjs"), "console.log(1)\n");
     expect(await decide(bash("node new.mjs"))).not.toBe("eng");
+    // An untracked code file the committed script may import makes it untrusted too.
+    expect(await decide(bash("node tool.mjs"))).not.toBe("eng");
+    rmSync(join(wt, "new.mjs"));
+    expect(await decide(bash("node tool.mjs"))).toBe("eng");
     writeFileSync(join(wt, "tool.mjs"), "console.log('changed')\n");
     try {
       expect(await decide(bash("node tool.mjs"))).not.toBe("eng");
@@ -134,6 +138,15 @@ describe.skipIf(process.platform === "win32")("#48 scripts run in a worktree", (
       git(wt, "checkout", "--", "tool.mjs");
     }
     expect(await decide(bash("python3 later.py"))).not.toBe("eng");
+  });
+  test.each([
+    "echo 'console.log(2)' > tool.mjs && node tool.mjs",
+    "sed -i.bak 's/ok/x/' tool.mjs && node tool.mjs",
+    "cp /tmp/x.mjs tool.mjs && node tool.mjs",
+    "printf x >> tool.mjs; node tool.mjs",
+    "git pull && node tool.mjs",
+  ])("a script changed earlier in the same command is not trusted: %s", async (command) => {
+    expect(await decide(bash(command))).not.toBe("eng");
   });
 });
 
@@ -166,6 +179,13 @@ describe("#53 interpreter code that hides a call", () => {
 
 describe("review nits", () => {
   test.each([
+    "git remote set-head origin feat/x",
+    "git remote set-url origin https://example.com/x.git",
+    "git remote add other https://example.com/x.git",
+  ])("changing a remote is protected: %s", (command) =>
+    expect([...scriptRules(command, wt)]).toContain("protected"),
+  );
+  test.each([
     "echo 'proxy = http://x' >> ~/.curlrc",
     "echo x > ~/.config/curl/curlrc",
     "echo x >> ~/.gitconfig",
@@ -177,7 +197,13 @@ describe("review nits", () => {
     expect(await decide(bash(command))).not.toBe("AI");
   });
   test("printing remote URLs is a credential read only when a URL carries one", async () => {
-    const cases = ["git remote -v", "git config --get remote.origin.url", "git config -l"];
+    const cases = [
+      "git remote -v",
+      "git config --get remote.origin.url",
+      "git config -l",
+      "git remote show -n origin",
+      "git var -l",
+    ];
     for (const command of cases) expect(await decide(bash(command))).not.toBe("credential-read");
     git(
       repo,
@@ -219,6 +245,24 @@ describe("review nits", () => {
         await decide(bash(`export GIT_DIR=${gitDir}\nexport GIT_WORK_TREE=${wt}\ngit status`)),
       ).toBe("eng");
       expect(await decide(bash(`GIT_DIR=${join(repo, ".git")} git status`))).not.toBe("eng");
+      // From the main checkout, GIT_DIR alone makes git write the main checkout: not approved.
+      for (const command of [
+        `GIT_DIR=${gitDir} git reset --hard`,
+        `GIT_DIR=${gitDir} git checkout -- tool.mjs`,
+        `GIT_DIR=${gitDir} git restore tool.mjs`,
+        `GIT_DIR=${gitDir} git stash`,
+        `GIT_DIR=${gitDir} git status`,
+        `export GIT_DIR=${gitDir}\ngit reset --hard`,
+        `export GIT_DIR=${gitDir}\nexport GIT_WORK_TREE=${wt}\ncd ${repo}\nexport GIT_WORK_TREE=${repo}\ngit status`,
+        `if true; then export GIT_DIR=${gitDir}; fi\ngit status`,
+        `export GIT_DIR=${gitDir}\nunset GIT_WORK_TREE\ngit status`,
+      ])
+        expect(await decide(bash(command, repo)), command).not.toBe("eng");
+      // With GIT_WORK_TREE naming the same worktree, the cwd does not matter.
+      expect(
+        await decide(bash(`GIT_DIR=${gitDir} GIT_WORK_TREE=${wt} git status --short`, repo)),
+      ).toBe("eng");
+      expect(await decide(bash(`GIT_DIR=${gitDir} git status --short`, wt))).toBe("eng");
       expect(await decide(bash("export GIT_DIR=/tmp/elsewhere\ngit status"))).not.toBe("eng");
     },
   );

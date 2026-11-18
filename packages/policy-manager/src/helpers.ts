@@ -410,7 +410,17 @@ export function committedScript(cwd: string, script: string): boolean | "outside
     if (!ref) return false;
     const oid = exact(top, ["rev-parse", "--verify", "--quiet", `${ref}:${path}`]);
     if (!/^[0-9a-f]{40,64}$/.test(oid)) return false;
-    return sameContent(readFileSync(real), blobBytes(top, oid));
+    if (!sameContent(readFileSync(real), blobBytes(top, oid))) return false;
+    // What the script imports from the checkout must be committed too: no modified or untracked
+    // code file outside ignored directories (so `node_modules` does not count).
+    const status = git(top, ["status", "--porcelain", "--untracked-files=all"]);
+    return !status
+      .split("\n")
+      .some((line) =>
+        /\.(?:py|pyw|pyi|js|mjs|cjs|ts|mts|cts|jsx|tsx|json|rb|pl|pm|php|sh|bash|zsh|ps1|lua|wasm|node|so|dylib)"?$/i.test(
+          line.trim(),
+        ),
+      );
   } catch {
     return false;
   }

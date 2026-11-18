@@ -279,6 +279,11 @@ function gitRules(sub: string, rest: string[], rules: Set<HardRule>): void {
       rules.add("remove-worktree-force");
   } else if (sub === "clean") {
     if (!has((f) => long(f, "--dry-run") || short(f, /n/))) rules.add("git-clean");
+  } else if (sub === "remote") {
+    // What a remote is and which branch is its default decide what counts as merged and as
+    // committed: changing them is protected.
+    if (/^(?:set-head|set-url|add|rename|remove|rm|set-branches)$/.test(positional[0] ?? ""))
+      rules.add("protected");
   }
 }
 
@@ -784,7 +789,13 @@ function printsRemote(args: string[]): boolean {
       rest.some((arg) => /(?:^|\.)(?:url|pushurl|extraheader|insteadof)$/i.test(arg))
     );
   if (sub === "remote")
-    return rest.includes("-v") || rest.includes("--verbose") || rest[0] === "get-url";
+    return (
+      rest.includes("-v") ||
+      rest.includes("--verbose") ||
+      rest[0] === "get-url" ||
+      rest[0] === "show"
+    );
+  if (sub === "var") return rest.includes("-l");
   if (sub === "ls-remote") return rest.includes("--get-url");
   return false;
 }
