@@ -206,17 +206,20 @@ describe("review nits", () => {
       "credential-read",
     );
   });
-  test("GIT_DIR and GIT_WORK_TREE naming the verified feature worktree are approved", async () => {
-    const gitDir = execFileSync("git", ["-C", wt, "rev-parse", "--absolute-git-dir"], {
-      encoding: "utf8",
-    }).trim();
-    expect(await decide(bash(`GIT_DIR=${gitDir} GIT_WORK_TREE=${wt} git status --short`))).toBe(
-      "eng",
-    );
-    expect(
-      await decide(bash(`export GIT_DIR=${gitDir}\nexport GIT_WORK_TREE=${wt}\ngit status`)),
-    ).toBe("eng");
-    expect(await decide(bash(`GIT_DIR=${join(repo, ".git")} git status`))).not.toBe("eng");
-    expect(await decide(bash("export GIT_DIR=/tmp/elsewhere\ngit status"))).not.toBe("eng");
-  });
+  test.skipIf(process.platform === "win32")(
+    "GIT_DIR and GIT_WORK_TREE naming the verified feature worktree are approved",
+    async () => {
+      const gitDir = execFileSync("git", ["-C", wt, "rev-parse", "--absolute-git-dir"], {
+        encoding: "utf8",
+      }).trim();
+      expect(await decide(bash(`GIT_DIR=${gitDir} GIT_WORK_TREE=${wt} git status --short`))).toBe(
+        "eng",
+      );
+      expect(
+        await decide(bash(`export GIT_DIR=${gitDir}\nexport GIT_WORK_TREE=${wt}\ngit status`)),
+      ).toBe("eng");
+      expect(await decide(bash(`GIT_DIR=${join(repo, ".git")} git status`))).not.toBe("eng");
+      expect(await decide(bash("export GIT_DIR=/tmp/elsewhere\ngit status"))).not.toBe("eng");
+    },
+  );
 });
