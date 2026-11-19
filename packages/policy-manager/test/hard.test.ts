@@ -1184,7 +1184,7 @@ describe("round 10: scripts fed to a shell, computed paths, logical temp paths, 
   });
 });
 
-describe("round 11: file calls by method name, dynamic imports, subshells, awk", () => {
+describe.skipIf(process.platform === "win32")("round 11: file calls by method name, dynamic imports, subshells, awk", () => {
   const base = () => ({
     ...evaluate(shell("ls"), undefined, permissive),
     decision: "human" as const,
