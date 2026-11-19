@@ -713,6 +713,16 @@ const PLAIN_NAMES = new Set(
     " ",
   ),
 );
+/**
+ * Every name Python and Node give a script without an import (`dir(builtins)` and
+ * `Object.getOwnPropertyNames(globalThis)`). Binding one of them in the code (a dummy
+ * `def _(globals): pass`) never makes it plain: only the names in PLAIN_NAMES are.
+ */
+const RESERVED_NAMES = new Set(
+  "ArithmeticError AssertionError AttributeError BaseException BaseExceptionGroup BlockingIOError BrokenPipeError BufferError BytesWarning ChildProcessError ConnectionAbortedError ConnectionError ConnectionRefusedError ConnectionResetError DeprecationWarning EOFError Ellipsis EncodingWarning EnvironmentError Exception ExceptionGroup False FileExistsError FileNotFoundError FloatingPointError FutureWarning GeneratorExit IOError ImportError ImportWarning IndentationError IndexError InterruptedError IsADirectoryError KeyError KeyboardInterrupt LookupError MemoryError ModuleNotFoundError NameError None NotADirectoryError NotImplemented NotImplementedError OSError OverflowError PendingDeprecationWarning PermissionError ProcessLookupError RecursionError ReferenceError ResourceWarning RuntimeError RuntimeWarning StopAsyncIteration StopIteration SyntaxError SyntaxWarning SystemError SystemExit TabError TimeoutError True TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError UnicodeError UnicodeTranslateError UnicodeWarning UserWarning ValueError Warning ZeroDivisionError __build_class__ __debug__ __import__ abs aiter all anext any ascii bin bool breakpoint bytearray bytes callable chr classmethod compile complex copyright credits delattr dict dir divmod enumerate eval exec exit filter float format frozenset getattr globals hasattr hash help hex id input int isinstance issubclass iter len license list locals map max memoryview min next object oct open ord pow print property quit range repr reversed round set setattr slice sorted staticmethod str sum super tuple type vars zip AbortController AbortSignal AggregateError Array ArrayBuffer AsyncDisposableStack Atomics BigInt BigInt64Array BigUint64Array Blob Boolean BroadcastChannel Buffer ByteLengthQueuingStrategy CloseEvent CompressionStream CountQueuingStrategy Crypto CryptoKey CustomEvent DOMException DataView Date DecompressionStream DisposableStack Error EvalError Event EventTarget File FinalizationRegistry Float16Array Float32Array Float64Array FormData Function Headers Infinity Int16Array Int32Array Int8Array Intl Iterator JSON Map Math MessageChannel MessageEvent MessagePort NaN Navigator Number Object Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceObserver PerformanceObserverEntryList PerformanceResourceTiming Promise Proxy RangeError ReadableByteStreamController ReadableStream ReadableStreamBYOBReader ReadableStreamBYOBRequest ReadableStreamDefaultController ReadableStreamDefaultReader ReferenceError Reflect RegExp Request Response Set SharedArrayBuffer String SubtleCrypto SuppressedError Symbol SyntaxError TextDecoder TextDecoderStream TextEncoder TextEncoderStream TransformStream TransformStreamDefaultController TypeError URIError URL URLPattern URLSearchParams Uint16Array Uint32Array Uint8Array Uint8ClampedArray WeakMap WeakRef WeakSet WebAssembly WebSocket WritableStream WritableStreamDefaultController WritableStreamDefaultWriter __dirname __filename assert async_hooks atob btoa buffer child_process clearImmediate clearInterval clearTimeout cluster console constants crypto decodeURI decodeURIComponent dgram diagnostics_channel dns domain encodeURI encodeURIComponent escape eval events exports fetch fs global globalThis http http2 https inspector isFinite isNaN module navigator net os parseFloat parseInt path perf_hooks performance process punycode querystring queueMicrotask readline repl require setImmediate setInterval setTimeout stream string_decoder structuredClone sys timers tls trace_events tty undefined unescape url util v8 vm wasi worker_threads zlib".split(
+    " ",
+  ),
+);
 const PLAIN_MODULES = new Set(["re", "os", "shutil", "pathlib", "json", "io", "sys"]);
 const PLAIN_MEMBERS = new Set(
   "read write replace index rindex find rfind count split splitlines join strip lstrip rstrip startswith endswith format lower upper sub subn match search escape read_text write_text readFileSync writeFileSync existsSync exists isfile isdir getcwd cwd resolve parent name suffix stem mkdir makedirs open remove unlink rmtree rmdir rename move copy copy2 copyfile rm rmSync unlinkSync renameSync mkdirSync cpSync appendFileSync appendFile append extend get keys values items sort sorted argv environ exit encoding newline mode utf8 path length slice push map filter forEach includes indexOf lastIndexOf trim toString stringify parse load dump".split(
@@ -747,7 +757,12 @@ function plainShape(source: string, interpreter: string): boolean {
     const name = m[2] as string;
     // One letter, or a run of regular-expression flags (`/x/gi`), cannot name a module or a route.
     if (!m[1] && (name.length === 1 || /^[gimsuyd]+$/.test(name))) continue;
-    if (m[1] ? PLAIN_MEMBERS.has(name) : PLAIN_NAMES.has(name) || bound.has(name)) continue;
+    if (
+      m[1]
+        ? PLAIN_MEMBERS.has(name)
+        : PLAIN_NAMES.has(name) || (bound.has(name) && !RESERVED_NAMES.has(name))
+    )
+      continue;
     return false;
   }
   return true;

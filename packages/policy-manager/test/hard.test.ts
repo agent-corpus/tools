@@ -1233,6 +1233,10 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "import gc, shutil\ndef _(gc, get_objects, type, __name__): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\n[f for f in gc.get_objects() if f.__name__ == 'edit'][0](P)"`,
     `python3 -c "import pkgutil, shutil\ndef _(pkgutil, resolve_name): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
     `python3 -c "import sys, shutil\ndef _(setprofile, f_back, f_locals): pass\nb='/Users/x/'\ndef h(fr, ev, arg): fr.f_back.f_locals['b'] = P\nsys.setprofile(h)\nshutil.rmtree(b+'a')"`,
+    // A built-in or global named as a parameter or alias does not become plain by being bound.
+    `python3 -c "import shutil\ndef _(globals): pass\nb='/Users/x/'\ng=globals\ng()['b']=P\nshutil.rmtree(b+'a')"`,
+    `python3 -c "import shutil\ndef _(exec): pass\nb='/Users/x/'\ne=exec\ne('b = P')\nshutil.rmtree(b+'a')"`,
+    `node -e "const fs=require('fs');function _(eval){}\nlet b='/Users/x/';const e=eval;e('b=P');fs.rmSync(b+'a')"`,
     `python3 -c "import shutil\ndef _(__globals__): pass\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nedit.__globals__['b'] = P\nshutil.rmtree(b+'a')"`,
     // A path from a function parameter, a join or an f-string is not followed: it fails closed.
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit(q)"`,
