@@ -655,6 +655,11 @@ function resolveParameters(
     const fn = def[1] ?? "";
     const params = (def[2] ?? "").split(",").map((raw) => raw.split(/[:=]/)[0]?.trim() ?? "");
     const at = def.index ?? 0;
+    // A decorator receives the function and may call it with any argument.
+    if (/@[\w.()]*[ \t]*\n[ \t]*$/.test(masked.slice(Math.max(0, at - 200), at + 1))) {
+      for (const name of params) failed.add(name);
+      continue;
+    }
     const calls = [...masked.matchAll(new RegExp(`(?<![\\w.])${fn}\\s*\\(`, "g"))].filter(
       (call) => (call.index ?? 0) > at + (def[0]?.length ?? 0) || (call.index ?? 0) < at,
     );
@@ -695,6 +700,10 @@ function resolveParameters(
   }
   for (const [param, values] of resolved) if (!failed.has(param)) found.set(param, values);
 }
+
+/** Ways to bind or call a name without writing it as code. */
+const DYNAMIC_NAMES =
+  /\b(?:exec|eval|compile|globals|vars|locals|setattr|getattr|delattr|__import__|importlib)\s*\(|__dict__|__builtins__|sys\s*\.\s*modules|\bglobalThis\b|\bwindow\b|\bglobal\s*\[|\bFunction\s*\(|\bvm\s*\./;
 
 /** The top-level `+` operands of an expression, or undefined when it has other operators or calls. */
 function splitPlus(expr: string): string[] | undefined {
@@ -739,7 +748,12 @@ function callsReachState(
     )
   )
     argv = [];
-  const vars = literalVariables(code, argv, interpreter);
+  // Code that reaches names or calls through a string or a table (`exec`, `globals()`, `getattr`,
+  // `__dict__`, `globalThis[...]`) can rebind a name or call a function behind the visible code:
+  // resolve nothing, so every path in a file call that is not itself a literal fails closed.
+  const vars = DYNAMIC_NAMES.test(code)
+    ? new Map<string, string[] | undefined>()
+    : literalVariables(code, argv, interpreter);
   const aliases = moduleAliases(code);
   const single = (arg: string): string[] | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];

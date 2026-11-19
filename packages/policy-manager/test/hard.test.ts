@@ -1216,6 +1216,11 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "import os; x='/'; os.remove(x+y)"`,
     `node -e "const r='/'; require('fs').rmSync(r+q,{recursive:true})"`,
     `python3 -c "import os\np='a.ts'\nif 1: p=q\nos.remove(p)"`,
+    // Names reached through a string or a table, and decorated functions, are not followed.
+    `python3 -c "import shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\nglobals()['edit'](P)"`,
+    `python3 -c "import shutil\nb='/Users/x/'\nexec('b = P')\nshutil.rmtree(b+'a')"`,
+    `python3 -c "import shutil\ndef deco(f):\n    f(P)\n    return f\n@deco\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')"`,
+    `node -e "const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');globalThis['edit'](P)"`,
     // A path from a function parameter, a join or an f-string is not followed: it fails closed.
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit(q)"`,
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit('a.ts')\nlist(map(edit, q))"`,
