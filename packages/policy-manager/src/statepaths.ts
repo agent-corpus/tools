@@ -702,6 +702,49 @@ function resolveParameters(
   for (const [param, values] of resolved) if (!failed.has(param)) found.set(param, values);
 }
 
+/**
+ * Names an edit script may use; code that calls anything else gets no name resolved. This is a
+ * list of what is known to be plain, not of what is dangerous, so a route to the namespace nobody
+ * thought of (gc.get_objects(), pkgutil.resolve_name, sys.setprofile, require("vm"), an alias of
+ * global) is not on it. A script that needs more is judged strictly.
+ */
+const PLAIN_NAMES = new Set(
+  "def return if else elif for while in not and or is None True False null undefined true false assert pass break continue import from as with try except finally raise class new const let var function print len range str int bool list dict tuple set open re os path shutil pathlib Path json io fs sys process console require module exports await async of typeof encoding newline mode errors f r b u rb br fr rf".split(
+    " ",
+  ),
+);
+const PLAIN_MEMBERS = new Set(
+  "read write replace index rindex find rfind count split splitlines join strip lstrip rstrip startswith endswith format lower upper sub subn match search escape read_text write_text readFileSync writeFileSync existsSync exists isfile isdir getcwd cwd resolve parent name suffix stem mkdir makedirs open remove unlink rmtree rmdir rename move copy copy2 copyfile rm rmSync unlinkSync renameSync mkdirSync cpSync appendFileSync appendFile append extend get keys values items sort sorted argv environ exit encoding newline mode utf8 path length slice push map filter forEach includes indexOf lastIndexOf trim toString stringify parse load dump".split(
+    " ",
+  ),
+);
+/** Whether the code (strings masked) uses only plain names, members and names it binds itself. */
+function plainShape(source: string, interpreter: string): boolean {
+  // Python comments are prose, not code.
+  // Python comments are prose, and its `global a, b` statement names variables: neither is code that
+  // reaches the namespace. A bare `global` in JavaScript is the global object, and is not plain.
+  const masked = /^python/i.test(interpreter)
+    ? source.replace(/#[^\n]*/g, "").replace(/^[ \t]*global[ \t]+[\w \t,]+$/gm, "")
+    : source;
+  const bound = new Set<string>();
+  for (const m of masked.matchAll(
+    /(?:^|[\n;,(])\s*(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*(?:[-+*/%|&^]|\/\/|\*\*)?=(?!=)|\b(?:def|function|class)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)|\bfor\s+\(?\s*(?:const|let|var)?\s*([A-Za-z_][\w\s,]*?)\s+(?:in|of)\b|\bas\s+([A-Za-z_]\w*)|\b(?:const|let|var)\s+([A-Za-z_]\w*)/g,
+  ))
+    for (const group of m.slice(1))
+      if (group) for (const name of group.split(/[^A-Za-z_0-9]+/)) if (name) bound.add(name);
+  for (const m of masked.matchAll(/(\.\s*)?([A-Za-z_]\w*)/g)) {
+    const name = m[2] as string;
+    // One letter, or a run of regular-expression flags (`/x/gi`), cannot name a module or a route.
+    if (!m[1] && (name.length === 1 || /^[gimsuyd]+$/.test(name))) continue;
+    if (
+      m[1] ? PLAIN_MEMBERS.has(name) || bound.has(name) : PLAIN_NAMES.has(name) || bound.has(name)
+    )
+      continue;
+    return false;
+  }
+  return true;
+}
+
 /** Ways to bind or call a name without writing it as code. */
 const DYNAMIC_NAMES =
   /\b(?:exec|eval|compile|globals|vars|locals|setattr|getattr|delattr|__import__|importlib)\s*\(|__dict__|__builtins__|sys\s*\.\s*modules|\bglobalThis\b|\bthis\s*\[|\bwindow\b|\bf_globals\b|\b_getframe\b|\bcurrentframe\b|__getattribute__|__getattr__|\b__main__\b|\binspect\b|\bsys\s*\.\s*_|\bglobal\s*\[|\bFunction\s*\(|\bvm\s*\./;
@@ -752,9 +795,10 @@ function callsReachState(
   // Code that reaches names or calls through a string or a table (`exec`, `globals()`, `getattr`,
   // `__dict__`, `globalThis[...]`) can rebind a name or call a function behind the visible code:
   // resolve nothing, so every path in a file call that is not itself a literal fails closed.
-  const vars = DYNAMIC_NAMES.test(code)
-    ? new Map<string, string[] | undefined>()
-    : literalVariables(code, argv, interpreter);
+  const vars =
+    DYNAMIC_NAMES.test(code) || !plainShape(maskStrings(code, interpreter), interpreter)
+      ? new Map<string, string[] | undefined>()
+      : literalVariables(code, argv, interpreter);
   const aliases = moduleAliases(code);
   const single = (arg: string): string[] | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];

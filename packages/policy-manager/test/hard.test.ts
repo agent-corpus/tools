@@ -1224,6 +1224,11 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "import sys, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\nsys._getframe().f_globals['edit'](P)"`,
     `python3 -c "import shutil\ndef deco(f): return f\ndef edit(path): shutil.rmtree(path)\n\n# comment\n@deco\n\ndef edit2(path): shutil.rmtree(path)\nedit2('a.ts')"`,
     `node -e "const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');this['edit'](P)"`,
+    // Names resolve only in code that uses plain names; a route to the namespace nobody listed does not.
+    `python3 -c "import gc, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\n[f for f in gc.get_objects() if getattr(f, '__name__', '') == 'edit'][0](P)"`,
+    `python3 -c "import pkgutil, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
+    `node -e "const vm=require('node:vm');const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');vm.runInThisContext('edit(P)')"`,
+    `python3 -c "import shutil\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nf=edit\ng=globals\nedit(b+'a')\ng()['b']=P"`,
     // A path from a function parameter, a join or an f-string is not followed: it fails closed.
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit(q)"`,
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit('a.ts')\nlist(map(edit, q))"`,
