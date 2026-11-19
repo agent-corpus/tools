@@ -1184,117 +1184,120 @@ describe("round 10: scripts fed to a shell, computed paths, logical temp paths, 
   });
 });
 
-describe.skipIf(process.platform === "win32")("round 11: file calls by method name, dynamic imports, subshells, awk", () => {
-  const base = () => ({
-    ...evaluate(shell("ls"), undefined, permissive),
-    decision: "human" as const,
-  });
-  const rulesIn = (command: string) => hardRules(shell(command, worktree), base());
-  const saved = process.env.TMPDIR;
-  beforeAll(() => {
-    process.env.TMPDIR = "/tmp";
-  });
-  afterAll(() => {
-    if (saved === undefined) delete process.env.TMPDIR;
-    else process.env.TMPDIR = saved;
-  });
-  test.each([
-    `node -e "require('fs').readdirSync('/'+'tmp').forEach(f=>require('fs').rmSync('/'+'tmp/'+f,{recursive:true}))"`,
-    `node -e "const p='/'+'tmp/x';require('fs').rmSync(p,{recursive:true})"`,
-    `node -e "require('fs/promises').rm('/'+'tmp',{recursive:true})"`,
-    `node -e "require('fs').rm('/'+'tmp',{recursive:true},()=>{})"`,
-    `node -p "require('fs').rmSync('/'+'tmp',{recursive:true})"`,
-    `node -e "const p=process.env.X;require('fs').promises.unlink(p)"`,
-    `python3 -c "import sys; p=sys.argv[1]; __import__('os').remove(p)"`,
-    `python3 -c "import os as o; o.remove(input())"`,
-    `python3 -c "import shutil as s, glob; [s.rmtree(d) for d in glob.glob('/v*/*')]"`,
-    `python3 -c "import os; getattr(os, 'rem'+'ove')('/'+'tmp/x')"`,
-    // An unreadable path with no visible starting directory, or one that starts at `/`, fails closed
-    // however its fragments are ordered.
-    `python3 -c "import shutil as s; s.rmtree(d)"`,
-    `python3 -c "import os; a='mp'; b='/t'; c='/'; d='p-501-0123456789abcdef01234567'; e='ac'; os.rmdir(b+a+c+e+d)"`,
-    `python3 -c "import os; x='/'; os.remove(x+y)"`,
-    `node -e "const r='/'; require('fs').rmSync(r+q,{recursive:true})"`,
-    `python3 -c "import os\np='a.ts'\nif 1: p=q\nos.remove(p)"`,
-    `node -e "const fs=require('fs');function _(runInThisContext){}\nmodule?.['constructor']?.['_load']('vm')?.['runInThisContext']('b=P');fs.rmSync('/tmp')"`,
-    `node -e "const fs=require('fs');const r=require;function _(runInThisContext){}\nconst {runInThisContext: q}=r('vm');q('b=P');fs.rmSync('/tmp')"`,
-    // Node code resolves no names: a destructuring chain to the module loader, or a plain binding.
-    `node -e "const fs=require('fs');function _(constructor,_load,runInThisContext){}\nconst {constructor: C}=module;const {_load: L}=C;const {runInThisContext: q}=L('vm');q('b=P');fs.rmSync('/tmp')"`,
-    `node -e "const fs=require('fs');let f='src/a.ts';fs.writeFileSync(f,'')"`,
-    // A path from a function parameter or a concatenation is not followed: it asks, as on 0.12.0.
-    `python3 -c "b='/Users/x/repo/'\ndef edit(path, x): open(b+path,'w').write(x)\nedit('a.ts', 1)\nedit('src/b.ts', 2)"`,
-    `python3 -c "b='/Users/x/repo/'\nopen(b+'a.ts','w').write('')"`,
-    `node -e "const fs=require('fs');module['constructor']['_load']('vm')['runInThisContext']('b=P');fs.rmSync('/tmp')"`,
-    // Names reached through a string or a table, and decorated functions, are not followed.
-    `python3 -c "import shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\nglobals()['edit'](P)"`,
-    `python3 -c "import shutil\nb='/Users/x/'\nexec('b = P')\nshutil.rmtree(b+'a')"`,
-    `python3 -c "import shutil\ndef deco(f):\n    f(P)\n    return f\n@deco\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')"`,
-    `node -e "const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');globalThis['edit'](P)"`,
-    `python3 -c "import sys, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\nsys._getframe().f_globals['edit'](P)"`,
-    `python3 -c "import shutil\ndef deco(f): return f\ndef edit(path): shutil.rmtree(path)\n\n# comment\n@deco\n\ndef edit2(path): shutil.rmtree(path)\nedit2('a.ts')"`,
-    `node -e "const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');this['edit'](P)"`,
-    // Names resolve only in code that uses plain names; a route to the namespace nobody listed does not.
-    `python3 -c "import gc, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\n[f for f in gc.get_objects() if getattr(f, '__name__', '') == 'edit'][0](P)"`,
-    `python3 -c "import pkgutil, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
-    `node -e "const vm=require('node:vm');const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');vm.runInThisContext('edit(P)')"`,
-    `python3 -c "import shutil\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nf=edit\ng=globals\nedit(b+'a')\ng()['b']=P"`,
-    // A dummy function whose parameters are named like the dangerous names does not make them plain.
-    `python3 -c "import gc, shutil\ndef _(gc, get_objects, type, __name__): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\n[f for f in gc.get_objects() if f.__name__ == 'edit'][0](P)"`,
-    `python3 -c "import pkgutil, shutil\ndef _(pkgutil, resolve_name): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
-    `python3 -c "import sys, shutil\ndef _(setprofile, f_back, f_locals): pass\nb='/Users/x/'\ndef h(fr, ev, arg): fr.f_back.f_locals['b'] = P\nsys.setprofile(h)\nshutil.rmtree(b+'a')"`,
-    // A built-in or global named as a parameter or alias does not become plain by being bound.
-    `python3 -c "import shutil\ndef _(globals): pass\nb='/Users/x/'\ng=globals\ng()['b']=P\nshutil.rmtree(b+'a')"`,
-    `python3 -c "import shutil\ndef _(exec): pass\nb='/Users/x/'\ne=exec\ne('b = P')\nshutil.rmtree(b+'a')"`,
-    `node -e "const fs=require('fs');function _(eval){}\nlet b='/Users/x/';const e=eval;e('b=P');fs.rmSync(b+'a')"`,
-    `python3 -c "import shutil\ndef _(__globals__): pass\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nedit.__globals__['b'] = P\nshutil.rmtree(b+'a')"`,
-    // A path from a function parameter, a join or an f-string is not followed: it fails closed.
-    `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit(q)"`,
-    `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit('a.ts')\nlist(map(edit, q))"`,
-    `python3 -c "def edit(path):\n    path = q\n    open(path,'w')\nedit('a.ts')"`,
-    `python3 -c "b='/'\ndef edit(path): open(b+path,'w')\nedit('a.ts')\nedit(x)"`,
-    `python3 -c "import os; os.remove(os.path.join('/Users/x', '/' + P))"`,
-    `python3 -c "import shutil; shutil.rmtree(f'{P}')"`,
-    `python3 -c "import os; os.remove('src/' + (os.pardir + '/') * 6 + P)"`,
-    `node -e "const m='f'+'s'; require(m)['rm'+'Sync']('/'+'tmp/x')"`,
-    `ruby -e "require 'fileutils'; FileUtils.send(:rm_rf, '/'+'tmp')"`,
-  ])("policy-state: %s", (command) => {
-    expect(rulesIn(command)).toContain("policy-state");
-  });
-  test.each([
-    `python3 -c "print(open('/etc/hosts').read().strip().replace('a','b'))"`,
-    `node -e "console.log('a-b'.replace('-','+'))"`,
-    // Paths bound to literals (also several in turn) outside the text being written are read.
-    `python3 - <<'EOF'\np="/Users/x/repo/Header.tsx"\ns=open(p,encoding="utf-8").read()\ndef rep(a,b):\n    global s\n    s=s.replace(a,b,1)\nrep("x","y")\nopen(p,"w",encoding="utf-8").write(s)\nEOF`,
-    `python3 -I - <<'EOF'\np='src/steps/settings.ts'\ns=open(p).read()\nnew='''  await api.put(\`/api/\${facilityId}/plans/\${id}\`)'''\ns=s.replace('x',new)\nopen(p,'w').write(s)\nEOF`,
-    `python3 -c "p='a.ts'\nopen(p,'w').write('')\np='b.ts'\nopen(p,'w').write('')"`,
-    `python3 -c "import os as o; print(o.getcwd())"`,
-    `node -e "require('fs').writeFileSync('/tmp/pm-x/out.json','{}')"`,
-  ])("not policy-state: %s", (command) => {
-    expect(rulesIn(command)).not.toContain("policy-state");
-  });
-  test.each([
-    ["publish", "echo 'npm publish' | (sh)"],
-    ["publish", "echo 'npm publish' | { sh; }"],
-    ["publish", "echo 'npm publish' | ( bash -s )"],
-    ["cloud-write", `awk 'BEGIN{system("az group delete -n x --yes")}'`],
-    ["publish", `awk 'BEGIN{print "x" | "npm publish"}'`],
-    ["repo-delete", `awk 'BEGIN{"gh repo delete o/r --yes" | getline}'`],
-    ["opaque-script", `awk '{system("rm -rf " $1)}' f`],
-    ["opaque-script", `awk '{print | cmd}' f`],
-    ["opaque-script", `awk '{print | "sh"}' f`],
-    ["opaque-script", `awk '{cmd | getline x}' f`],
-  ])("%s: %s", (rule, command) => {
-    expect(rulesIn(command)).toContain(rule);
-  });
-  test.each([
-    `awk '/foo|bar/ {print $1}' f`,
-    `awk '{printf "%s\\n", $1}' f`,
-    `awk -F, '{print $2 || "none"}' f`,
-    `awk 'BEGIN{system("ls -la")}'`,
-  ])("no hard rule: %s", (command) => {
-    expect(rulesIn(command)).toEqual([]);
-  });
-});
+describe.skipIf(process.platform === "win32")(
+  "round 11: file calls by method name, dynamic imports, subshells, awk",
+  () => {
+    const base = () => ({
+      ...evaluate(shell("ls"), undefined, permissive),
+      decision: "human" as const,
+    });
+    const rulesIn = (command: string) => hardRules(shell(command, worktree), base());
+    const saved = process.env.TMPDIR;
+    beforeAll(() => {
+      process.env.TMPDIR = "/tmp";
+    });
+    afterAll(() => {
+      if (saved === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = saved;
+    });
+    test.each([
+      `node -e "require('fs').readdirSync('/'+'tmp').forEach(f=>require('fs').rmSync('/'+'tmp/'+f,{recursive:true}))"`,
+      `node -e "const p='/'+'tmp/x';require('fs').rmSync(p,{recursive:true})"`,
+      `node -e "require('fs/promises').rm('/'+'tmp',{recursive:true})"`,
+      `node -e "require('fs').rm('/'+'tmp',{recursive:true},()=>{})"`,
+      `node -p "require('fs').rmSync('/'+'tmp',{recursive:true})"`,
+      `node -e "const p=process.env.X;require('fs').promises.unlink(p)"`,
+      `python3 -c "import sys; p=sys.argv[1]; __import__('os').remove(p)"`,
+      `python3 -c "import os as o; o.remove(input())"`,
+      `python3 -c "import shutil as s, glob; [s.rmtree(d) for d in glob.glob('/v*/*')]"`,
+      `python3 -c "import os; getattr(os, 'rem'+'ove')('/'+'tmp/x')"`,
+      // An unreadable path with no visible starting directory, or one that starts at `/`, fails closed
+      // however its fragments are ordered.
+      `python3 -c "import shutil as s; s.rmtree(d)"`,
+      `python3 -c "import os; a='mp'; b='/t'; c='/'; d='p-501-0123456789abcdef01234567'; e='ac'; os.rmdir(b+a+c+e+d)"`,
+      `python3 -c "import os; x='/'; os.remove(x+y)"`,
+      `node -e "const r='/'; require('fs').rmSync(r+q,{recursive:true})"`,
+      `python3 -c "import os\np='a.ts'\nif 1: p=q\nos.remove(p)"`,
+      `node -e "const fs=require('fs');function _(runInThisContext){}\nmodule?.['constructor']?.['_load']('vm')?.['runInThisContext']('b=P');fs.rmSync('/tmp')"`,
+      `node -e "const fs=require('fs');const r=require;function _(runInThisContext){}\nconst {runInThisContext: q}=r('vm');q('b=P');fs.rmSync('/tmp')"`,
+      // Node code resolves no names: a destructuring chain to the module loader, or a plain binding.
+      `node -e "const fs=require('fs');function _(constructor,_load,runInThisContext){}\nconst {constructor: C}=module;const {_load: L}=C;const {runInThisContext: q}=L('vm');q('b=P');fs.rmSync('/tmp')"`,
+      `node -e "const fs=require('fs');let f='src/a.ts';fs.writeFileSync(f,'')"`,
+      // A path from a function parameter or a concatenation is not followed: it asks, as on 0.12.0.
+      `python3 -c "b='/Users/x/repo/'\ndef edit(path, x): open(b+path,'w').write(x)\nedit('a.ts', 1)\nedit('src/b.ts', 2)"`,
+      `python3 -c "b='/Users/x/repo/'\nopen(b+'a.ts','w').write('')"`,
+      `node -e "const fs=require('fs');module['constructor']['_load']('vm')['runInThisContext']('b=P');fs.rmSync('/tmp')"`,
+      // Names reached through a string or a table, and decorated functions, are not followed.
+      `python3 -c "import shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\nglobals()['edit'](P)"`,
+      `python3 -c "import shutil\nb='/Users/x/'\nexec('b = P')\nshutil.rmtree(b+'a')"`,
+      `python3 -c "import shutil\ndef deco(f):\n    f(P)\n    return f\n@deco\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')"`,
+      `node -e "const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');globalThis['edit'](P)"`,
+      `python3 -c "import sys, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\nsys._getframe().f_globals['edit'](P)"`,
+      `python3 -c "import shutil\ndef deco(f): return f\ndef edit(path): shutil.rmtree(path)\n\n# comment\n@deco\n\ndef edit2(path): shutil.rmtree(path)\nedit2('a.ts')"`,
+      `node -e "const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');this['edit'](P)"`,
+      // Names resolve only in code that uses plain names; a route to the namespace nobody listed does not.
+      `python3 -c "import gc, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\n[f for f in gc.get_objects() if getattr(f, '__name__', '') == 'edit'][0](P)"`,
+      `python3 -c "import pkgutil, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
+      `node -e "const vm=require('node:vm');const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');vm.runInThisContext('edit(P)')"`,
+      `python3 -c "import shutil\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nf=edit\ng=globals\nedit(b+'a')\ng()['b']=P"`,
+      // A dummy function whose parameters are named like the dangerous names does not make them plain.
+      `python3 -c "import gc, shutil\ndef _(gc, get_objects, type, __name__): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\n[f for f in gc.get_objects() if f.__name__ == 'edit'][0](P)"`,
+      `python3 -c "import pkgutil, shutil\ndef _(pkgutil, resolve_name): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
+      `python3 -c "import sys, shutil\ndef _(setprofile, f_back, f_locals): pass\nb='/Users/x/'\ndef h(fr, ev, arg): fr.f_back.f_locals['b'] = P\nsys.setprofile(h)\nshutil.rmtree(b+'a')"`,
+      // A built-in or global named as a parameter or alias does not become plain by being bound.
+      `python3 -c "import shutil\ndef _(globals): pass\nb='/Users/x/'\ng=globals\ng()['b']=P\nshutil.rmtree(b+'a')"`,
+      `python3 -c "import shutil\ndef _(exec): pass\nb='/Users/x/'\ne=exec\ne('b = P')\nshutil.rmtree(b+'a')"`,
+      `node -e "const fs=require('fs');function _(eval){}\nlet b='/Users/x/';const e=eval;e('b=P');fs.rmSync(b+'a')"`,
+      `python3 -c "import shutil\ndef _(__globals__): pass\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nedit.__globals__['b'] = P\nshutil.rmtree(b+'a')"`,
+      // A path from a function parameter, a join or an f-string is not followed: it fails closed.
+      `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit(q)"`,
+      `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit('a.ts')\nlist(map(edit, q))"`,
+      `python3 -c "def edit(path):\n    path = q\n    open(path,'w')\nedit('a.ts')"`,
+      `python3 -c "b='/'\ndef edit(path): open(b+path,'w')\nedit('a.ts')\nedit(x)"`,
+      `python3 -c "import os; os.remove(os.path.join('/Users/x', '/' + P))"`,
+      `python3 -c "import shutil; shutil.rmtree(f'{P}')"`,
+      `python3 -c "import os; os.remove('src/' + (os.pardir + '/') * 6 + P)"`,
+      `node -e "const m='f'+'s'; require(m)['rm'+'Sync']('/'+'tmp/x')"`,
+      `ruby -e "require 'fileutils'; FileUtils.send(:rm_rf, '/'+'tmp')"`,
+    ])("policy-state: %s", (command) => {
+      expect(rulesIn(command)).toContain("policy-state");
+    });
+    test.each([
+      `python3 -c "print(open('/etc/hosts').read().strip().replace('a','b'))"`,
+      `node -e "console.log('a-b'.replace('-','+'))"`,
+      // Paths bound to literals (also several in turn) outside the text being written are read.
+      `python3 - <<'EOF'\np="/Users/x/repo/Header.tsx"\ns=open(p,encoding="utf-8").read()\ndef rep(a,b):\n    global s\n    s=s.replace(a,b,1)\nrep("x","y")\nopen(p,"w",encoding="utf-8").write(s)\nEOF`,
+      `python3 -I - <<'EOF'\np='src/steps/settings.ts'\ns=open(p).read()\nnew='''  await api.put(\`/api/\${facilityId}/plans/\${id}\`)'''\ns=s.replace('x',new)\nopen(p,'w').write(s)\nEOF`,
+      `python3 -c "p='a.ts'\nopen(p,'w').write('')\np='b.ts'\nopen(p,'w').write('')"`,
+      `python3 -c "import os as o; print(o.getcwd())"`,
+      `node -e "require('fs').writeFileSync('/tmp/pm-x/out.json','{}')"`,
+    ])("not policy-state: %s", (command) => {
+      expect(rulesIn(command)).not.toContain("policy-state");
+    });
+    test.each([
+      ["publish", "echo 'npm publish' | (sh)"],
+      ["publish", "echo 'npm publish' | { sh; }"],
+      ["publish", "echo 'npm publish' | ( bash -s )"],
+      ["cloud-write", `awk 'BEGIN{system("az group delete -n x --yes")}'`],
+      ["publish", `awk 'BEGIN{print "x" | "npm publish"}'`],
+      ["repo-delete", `awk 'BEGIN{"gh repo delete o/r --yes" | getline}'`],
+      ["opaque-script", `awk '{system("rm -rf " $1)}' f`],
+      ["opaque-script", `awk '{print | cmd}' f`],
+      ["opaque-script", `awk '{print | "sh"}' f`],
+      ["opaque-script", `awk '{cmd | getline x}' f`],
+    ])("%s: %s", (rule, command) => {
+      expect(rulesIn(command)).toContain(rule);
+    });
+    test.each([
+      `awk '/foo|bar/ {print $1}' f`,
+      `awk '{printf "%s\\n", $1}' f`,
+      `awk -F, '{print $2 || "none"}' f`,
+      `awk 'BEGIN{system("ls -la")}'`,
+    ])("no hard rule: %s", (command) => {
+      expect(rulesIn(command)).toEqual([]);
+    });
+  },
+);
 
 describe("round 12: piped stages, other shells, writes inside programs, cost", () => {
   const base = () => ({
