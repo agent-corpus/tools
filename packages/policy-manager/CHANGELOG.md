@@ -4,7 +4,7 @@
 
 ### Patch Changes
 
-- Inline interpreter code that edits files resolves its paths more often, so ordinary edit scripts no longer ask a person as possible policy-state changes: bindings are read outside string literals (source text being written is data), a name bound only to literals keeps every value, keyword arguments (`open(p, encoding=...)`) are not read as tuple assignments, methods on what `open(...)` returns are judged by that `open` call, a concatenation of literals and literal-bound names is read as its values, and a function parameter that every plain call passes a literal (`def edit(path): open(b + path, "w")` with `edit("src/a.ts")`) holds those values. A path still unreadable after that fails closed as before.
+- Inline interpreter code that edits files through a variable no longer asks a person as a possible policy-state change when every name it uses is plain: bindings are read outside string literals (source text being written is data), keyword arguments (`open(p, encoding=...)`) are not tuple assignments, and a name bound to literals keeps those values. Names resolve only in code that uses a short list of plain names, members and modules; code that reaches anything else (a built-in or global rebound by a decoy, `gc`, `pkgutil`, frame globals, `require("vm")`, a bracket access by string or by a computed index) resolves nothing, so its non-literal paths fail closed as before. A path built from a concatenation or a function parameter is not followed and asks, as on 0.12.0.
 
 ## 0.12.0
 

@@ -622,84 +622,7 @@ function literalVariables(
     /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|(?:^|[\n;])\s*(\w+(?:\s*,\s*\w+)+)\s*,?\s*=(?!=)/g,
   ))
     for (const group of match.slice(1)) if (group) bound(group);
-  resolveParameters(code, masked, found, sites, plain, argv);
   return found;
-}
-
-/**
- * A function parameter called only with literal paths: `def edit(path): open(b + path, "w")` with
- * every call `edit("src/a.ts", …)`. The parameter then holds one of those values. It counts only
- * when the function is used nowhere but in plain calls, the parameter is bound nowhere else and
- * never reassigned, and every call passes it as a literal or a name bound only to literals.
- */
-function resolveParameters(
-  code: string,
-  masked: string,
-  found: Map<string, string[] | undefined>,
-  sites: Map<string, number>,
-  plain: Map<string, number>,
-  argv: Array<string | undefined>,
-): void {
-  const resolved = new Map<string, string[]>();
-  const failed = new Set<string>();
-  const defs = [
-    ...masked.matchAll(/(?:^|\n)[ \t]*(?:def|function)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/g),
-  ];
-  const perName = new Map<string, number>();
-  for (const def of defs)
-    for (const raw of (def[2] ?? "").split(",")) {
-      const name = raw.split(/[:=]/)[0]?.trim() ?? "";
-      if (/^[A-Za-z_]\w*$/.test(name)) perName.set(name, (perName.get(name) ?? 0) + 1);
-    }
-  for (const def of defs) {
-    const fn = def[1] ?? "";
-    const params = (def[2] ?? "").split(",").map((raw) => raw.split(/[:=]/)[0]?.trim() ?? "");
-    const at = def.index ?? 0;
-    // A decorator receives the function and may call it with any argument: with any decorator
-    // line in the code, no parameter is resolved.
-    if (/^[ \t]*@/m.test(masked)) {
-      for (const name of params) failed.add(name);
-      continue;
-    }
-    const calls = [...masked.matchAll(new RegExp(`(?<![\\w.])${fn}\\s*\\(`, "g"))].filter(
-      (call) => (call.index ?? 0) > at + (def[0]?.length ?? 0) || (call.index ?? 0) < at,
-    );
-    const uses = masked.match(new RegExp(`\\b${fn}\\b`, "g"))?.length ?? 0;
-    const callArgsList = calls.map((call) =>
-      callArgs(code, (call.index ?? 0) + call[0].length, true),
-    );
-    params.forEach((param, i) => {
-      if (!/^[A-Za-z_]\w*$/.test(param) || failed.has(param)) return;
-      const ok =
-        calls.length > 0 &&
-        uses === calls.length + 1 &&
-        sites.get(param) === perName.get(param) &&
-        !plain.has(param) &&
-        !new RegExp(`\\b${param}\\s*(?:[-+*/%&|^@:]|\\*\\*|//|<<|>>)?=(?!=)`).test(masked);
-      const values: string[] = [];
-      if (ok)
-        for (const args of callArgsList) {
-          const arg = args?.[i]?.trim();
-          const name = arg && /^[A-Za-z_]\w*$/.test(arg) ? arg : undefined;
-          const known = name
-            ? found.get(name)
-            : arg
-              ? (literalPath(arg, argv) ?? plainLiteral(arg))
-              : undefined;
-          if (known === undefined) {
-            failed.add(param);
-            return;
-          }
-          values.push(...(Array.isArray(known) ? known : [known]));
-        }
-      if (!ok) {
-        failed.add(param);
-        return;
-      }
-      resolved.set(param, [...(resolved.get(param) ?? []), ...values]);
-    });
-  }
-  for (const [param, values] of resolved) if (!failed.has(param)) found.set(param, values);
 }
 
 /**
@@ -723,6 +646,16 @@ const RESERVED_NAMES = new Set(
     " ",
   ),
 );
+const PLAIN_JS_MODULES = new Set([
+  "fs",
+  "path",
+  "node:fs",
+  "node:path",
+  "fs/promises",
+  "node:fs/promises",
+  "os",
+  "node:os",
+]);
 const PLAIN_MODULES = new Set(["re", "os", "shutil", "pathlib", "json", "io", "sys"]);
 const PLAIN_MEMBERS = new Set(
   "read write replace index rindex find rfind count split splitlines join strip lstrip rstrip startswith endswith format lower upper sub subn match search escape read_text write_text readFileSync writeFileSync existsSync exists isfile isdir getcwd cwd resolve parent name suffix stem mkdir makedirs open remove unlink rmtree rmdir rename move copy copy2 copyfile rm rmSync unlinkSync renameSync mkdirSync cpSync appendFileSync appendFile append extend get keys values items sort sorted argv environ exit encoding newline mode utf8 path length slice push map filter forEach includes indexOf lastIndexOf trim toString stringify parse load dump".split(
@@ -730,7 +663,7 @@ const PLAIN_MEMBERS = new Set(
   ),
 );
 /** Whether the code (strings masked) uses only plain names, members and names it binds itself. */
-function plainShape(source: string, interpreter: string): boolean {
+function plainShape(source: string, interpreter: string, raw: string): boolean {
   // Python comments are prose, not code.
   // Python comments are prose, and its `global a, b` statement names variables: neither is code that
   // reaches the namespace. A bare `global` in JavaScript is the global object, and is not plain.
@@ -744,6 +677,18 @@ function plainShape(source: string, interpreter: string): boolean {
     for (const group of m.slice(1))
       if (group) for (const name of group.split(/[^A-Za-z_0-9]+/)) if (name) bound.add(name);
   // Only a few modules are plain: importing anything else (`gc`, `pkgutil`, `inspect`) is not.
+  // Square brackets read a member by name: with a string (`require["x"]`, `module["constructor"]`)
+  // or a name as the index, the member is not visible here. Only a number or a slice is plain.
+  for (const m of masked.matchAll(/[\w)\]]\s*\[([^\]\n]*)\]/g)) {
+    const index = (m[1] ?? "").trim();
+    if (!/^(?:-?\d+|[\w\s]*:[\w\s:]*)$/.test(index)) return false;
+  }
+  // A module is loaded by a literal name from a short list; anything else reaches code unseen.
+  for (const m of raw.matchAll(/\b(?:require|import)\s*\(\s*([^)]*)\)/g)) {
+    const arg = (m[1] ?? "").trim();
+    const name = /^(["'`])([^"'`]*)\1$/.exec(arg)?.[2];
+    if (name === undefined || !PLAIN_JS_MODULES.has(name)) return false;
+  }
   const modules = [
     ...[...masked.matchAll(/^[ \t]*import[ \t]+([\w., \t]+)/gm)].flatMap((m) =>
       (m[1] ?? "").split(",").map((part) => part.trim().split(/[\s.]/)[0] ?? ""),
@@ -772,29 +717,6 @@ function plainShape(source: string, interpreter: string): boolean {
 const DYNAMIC_NAMES =
   /\b(?:exec|eval|compile|globals|vars|locals|setattr|getattr|delattr|__import__|importlib)\s*\(|__dict__|__builtins__|sys\s*\.\s*modules|\bglobalThis\b|\bthis\s*\[|\bwindow\b|\bf_globals\b|\b_getframe\b|\bcurrentframe\b|__getattribute__|__getattr__|\b__main__\b|\binspect\b|\bsys\s*\.\s*_|\bglobal\s*\[|\bFunction\s*\(|\bvm\s*\./;
 
-/** The top-level `+` operands of an expression, or undefined when it has other operators or calls. */
-function splitPlus(expr: string): string[] | undefined {
-  const parts: string[] = [];
-  let quote = "";
-  let from = 0;
-  for (let i = 0; i < expr.length; i++) {
-    const c = expr[i] as string;
-    if (quote) {
-      if (c === "\\") i++;
-      else if (c === quote) quote = "";
-      continue;
-    }
-    if (c === "'" || c === '"') quote = c;
-    else if (c === "+") {
-      parts.push(expr.slice(from, i));
-      from = i + 1;
-    } else if (!/[\w\s]/.test(c)) return undefined;
-  }
-  if (quote) return undefined;
-  parts.push(expr.slice(from));
-  return parts;
-}
-
 /**
  * Whether a file call in the code deletes, moves, copies, writes or enters a path that could be
  * the state, or one this cannot read as a plain string literal (concatenation, `chr()`, `os.sep`,
@@ -819,7 +741,7 @@ function callsReachState(
   // `__dict__`, `globalThis[...]`) can rebind a name or call a function behind the visible code:
   // resolve nothing, so every path in a file call that is not itself a literal fails closed.
   const vars =
-    DYNAMIC_NAMES.test(code) || !plainShape(maskStrings(code, interpreter), interpreter)
+    DYNAMIC_NAMES.test(code) || !plainShape(maskStrings(code, interpreter), interpreter, code)
       ? new Map<string, string[] | undefined>()
       : literalVariables(code, argv, interpreter);
   const aliases = moduleAliases(code);
@@ -829,31 +751,9 @@ function callsReachState(
     const path = literalPath(arg, argv);
     return path === undefined ? undefined : [path];
   };
-  // A concatenation whose every part is a literal or a name bound only to literals: each
-  // combination of their values (`b + path` with `b = "/repo/"` and `path` from `edit("a.ts")`).
-  const values = (arg: string): string[] | undefined => {
-    const whole = single(arg);
-    if (whole !== undefined) return whole;
-    const parts = splitPlus(arg);
-    if (!parts || parts.length < 2) return undefined;
-    let out = [""];
-    for (const part of parts) {
-      const name = /^\s*([A-Za-z_]\w*)\s*$/.exec(part)?.[1];
-      const piece = name
-        ? vars.get(name)
-        : (() => {
-            const text = plainLiteral(part.trim());
-            return text === undefined ? undefined : [text];
-          })();
-      if (!piece?.length) return undefined;
-      out = out.flatMap((head) => piece.map((tail) => head + tail));
-      if (out.length > 64) return undefined;
-    }
-    return out;
-  };
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
-    const paths = values(arg);
+    const paths = single(arg);
     // A session directory by its name counts too, also one not created yet or another user's.
     if (paths === undefined) return true;
     return paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true));

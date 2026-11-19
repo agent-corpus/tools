@@ -1216,6 +1216,10 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "import os; x='/'; os.remove(x+y)"`,
     `node -e "const r='/'; require('fs').rmSync(r+q,{recursive:true})"`,
     `python3 -c "import os\np='a.ts'\nif 1: p=q\nos.remove(p)"`,
+    // A path from a function parameter or a concatenation is not followed: it asks, as on 0.12.0.
+    `python3 -c "b='/Users/x/repo/'\ndef edit(path, x): open(b+path,'w').write(x)\nedit('a.ts', 1)\nedit('src/b.ts', 2)"`,
+    `python3 -c "b='/Users/x/repo/'\nopen(b+'a.ts','w').write('')"`,
+    `node -e "const fs=require('fs');module['constructor']['_load']('vm')['runInThisContext']('b=P');fs.rmSync('/tmp')"`,
     // Names reached through a string or a table, and decorated functions, are not followed.
     `python3 -c "import shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\nglobals()['edit'](P)"`,
     `python3 -c "import shutil\nb='/Users/x/'\nexec('b = P')\nshutil.rmtree(b+'a')"`,
@@ -1255,7 +1259,6 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "print(open('/etc/hosts').read().strip().replace('a','b'))"`,
     `node -e "console.log('a-b'.replace('-','+'))"`,
     // Paths bound to literals (also several in turn) outside the text being written are read.
-    `python3 -c "b='/Users/x/repo/'\ndef edit(path, x): open(b+path,'w').write(x)\nedit('a.ts', 1)\nedit('src/b.ts', 2)"`,
     `python3 - <<'EOF'\np="/Users/x/repo/Header.tsx"\ns=open(p,encoding="utf-8").read()\ndef rep(a,b):\n    global s\n    s=s.replace(a,b,1)\nrep("x","y")\nopen(p,"w",encoding="utf-8").write(s)\nEOF`,
     `python3 -I - <<'EOF'\np='src/steps/settings.ts'\ns=open(p).read()\nnew='''  await api.put(\`/api/\${facilityId}/plans/\${id}\`)'''\ns=s.replace('x',new)\nopen(p,'w').write(s)\nEOF`,
     `python3 -c "p='a.ts'\nopen(p,'w').write('')\np='b.ts'\nopen(p,'w').write('')"`,
