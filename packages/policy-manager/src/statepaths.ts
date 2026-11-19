@@ -655,8 +655,9 @@ function resolveParameters(
     const fn = def[1] ?? "";
     const params = (def[2] ?? "").split(",").map((raw) => raw.split(/[:=]/)[0]?.trim() ?? "");
     const at = def.index ?? 0;
-    // A decorator receives the function and may call it with any argument.
-    if (/@[\w.()]*[ \t]*\n[ \t]*$/.test(masked.slice(Math.max(0, at - 200), at + 1))) {
+    // A decorator receives the function and may call it with any argument: with any decorator
+    // line in the code, no parameter is resolved.
+    if (/^[ \t]*@/m.test(masked)) {
       for (const name of params) failed.add(name);
       continue;
     }
@@ -703,7 +704,7 @@ function resolveParameters(
 
 /** Ways to bind or call a name without writing it as code. */
 const DYNAMIC_NAMES =
-  /\b(?:exec|eval|compile|globals|vars|locals|setattr|getattr|delattr|__import__|importlib)\s*\(|__dict__|__builtins__|sys\s*\.\s*modules|\bglobalThis\b|\bwindow\b|\bglobal\s*\[|\bFunction\s*\(|\bvm\s*\./;
+  /\b(?:exec|eval|compile|globals|vars|locals|setattr|getattr|delattr|__import__|importlib)\s*\(|__dict__|__builtins__|sys\s*\.\s*modules|\bglobalThis\b|\bthis\s*\[|\bwindow\b|\bf_globals\b|\b_getframe\b|\bcurrentframe\b|__getattribute__|__getattr__|\b__main__\b|\binspect\b|\bsys\s*\.\s*_|\bglobal\s*\[|\bFunction\s*\(|\bvm\s*\./;
 
 /** The top-level `+` operands of an expression, or undefined when it has other operators or calls. */
 function splitPlus(expr: string): string[] | undefined {
