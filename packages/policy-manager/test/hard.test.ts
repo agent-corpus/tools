@@ -1229,6 +1229,11 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "import pkgutil, shutil\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
     `node -e "const vm=require('node:vm');const fs=require('fs');function edit(p){fs.rmSync(p)}\nedit('a.ts');vm.runInThisContext('edit(P)')"`,
     `python3 -c "import shutil\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nf=edit\ng=globals\nedit(b+'a')\ng()['b']=P"`,
+    // A dummy function whose parameters are named like the dangerous names does not make them plain.
+    `python3 -c "import gc, shutil\ndef _(gc, get_objects, type, __name__): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\n[f for f in gc.get_objects() if f.__name__ == 'edit'][0](P)"`,
+    `python3 -c "import pkgutil, shutil\ndef _(pkgutil, resolve_name): pass\ndef edit(path): shutil.rmtree(path)\nedit('a.ts')\npkgutil.resolve_name('__ma' + 'in__.edit')(P)"`,
+    `python3 -c "import sys, shutil\ndef _(setprofile, f_back, f_locals): pass\nb='/Users/x/'\ndef h(fr, ev, arg): fr.f_back.f_locals['b'] = P\nsys.setprofile(h)\nshutil.rmtree(b+'a')"`,
+    `python3 -c "import shutil\ndef _(__globals__): pass\nb='/Users/x/'\ndef edit(path): shutil.rmtree(path)\nedit.__globals__['b'] = P\nshutil.rmtree(b+'a')"`,
     // A path from a function parameter, a join or an f-string is not followed: it fails closed.
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit(q)"`,
     `python3 -c "b='/Users/x/repo/'\ndef edit(path): open(b+path,'w').write('')\nedit('a.ts')\nlist(map(edit, q))"`,

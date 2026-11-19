@@ -713,6 +713,7 @@ const PLAIN_NAMES = new Set(
     " ",
   ),
 );
+const PLAIN_MODULES = new Set(["re", "os", "shutil", "pathlib", "json", "io", "sys"]);
 const PLAIN_MEMBERS = new Set(
   "read write replace index rindex find rfind count split splitlines join strip lstrip rstrip startswith endswith format lower upper sub subn match search escape read_text write_text readFileSync writeFileSync existsSync exists isfile isdir getcwd cwd resolve parent name suffix stem mkdir makedirs open remove unlink rmtree rmdir rename move copy copy2 copyfile rm rmSync unlinkSync renameSync mkdirSync cpSync appendFileSync appendFile append extend get keys values items sort sorted argv environ exit encoding newline mode utf8 path length slice push map filter forEach includes indexOf lastIndexOf trim toString stringify parse load dump".split(
     " ",
@@ -728,18 +729,25 @@ function plainShape(source: string, interpreter: string): boolean {
     : source;
   const bound = new Set<string>();
   for (const m of masked.matchAll(
-    /(?:^|[\n;,(])\s*(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*(?:[-+*/%|&^]|\/\/|\*\*)?=(?!=)|\b(?:def|function|class)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)|\bfor\s+\(?\s*(?:const|let|var)?\s*([A-Za-z_][\w\s,]*?)\s+(?:in|of)\b|\bas\s+([A-Za-z_]\w*)|\b(?:const|let|var)\s+([A-Za-z_]\w*)/g,
+    /(?:^|[\n;,(])\s*(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*(?:[-+*/%|&^]|\/\/|\*\*)?=(?!=)|\b(?:def|function|class)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)|\bfor\s+\(?\s*(?:const|let|var)?\s*([A-Za-z_][\w\s,]*?)\s+(?:in|of)\b|\b(?:const|let|var)\s+([A-Za-z_]\w*)/g,
   ))
     for (const group of m.slice(1))
       if (group) for (const name of group.split(/[^A-Za-z_0-9]+/)) if (name) bound.add(name);
+  // Only a few modules are plain: importing anything else (`gc`, `pkgutil`, `inspect`) is not.
+  const modules = [
+    ...[...masked.matchAll(/^[ \t]*import[ \t]+([\w., \t]+)/gm)].flatMap((m) =>
+      (m[1] ?? "").split(",").map((part) => part.trim().split(/[\s.]/)[0] ?? ""),
+    ),
+    ...[...masked.matchAll(/^[ \t]*from[ \t]+([\w.]+)[ \t]+import/gm)].map(
+      (m) => (m[1] ?? "").split(".")[0] ?? "",
+    ),
+  ];
+  if (modules.some((name) => name && !PLAIN_MODULES.has(name))) return false;
   for (const m of masked.matchAll(/(\.\s*)?([A-Za-z_]\w*)/g)) {
     const name = m[2] as string;
     // One letter, or a run of regular-expression flags (`/x/gi`), cannot name a module or a route.
     if (!m[1] && (name.length === 1 || /^[gimsuyd]+$/.test(name))) continue;
-    if (
-      m[1] ? PLAIN_MEMBERS.has(name) || bound.has(name) : PLAIN_NAMES.has(name) || bound.has(name)
-    )
-      continue;
+    if (m[1] ? PLAIN_MEMBERS.has(name) : PLAIN_NAMES.has(name) || bound.has(name)) continue;
     return false;
   }
   return true;
