@@ -572,40 +572,155 @@ function literalPath(text: string, argv: Array<string | undefined> = []): string
 function literalVariables(
   code: string,
   argv: Array<string | undefined> = [],
+  interpreter = "",
 ): Map<string, string[] | undefined> {
   const found = new Map<string, string[] | undefined>();
-  for (const line of code.split(/[\n;]/)) {
-    const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)(.*)$/.exec(line);
+  // Bindings are read outside string literals: text being written (source code with its own
+  // `(p) =>` or `p = x`) is data. Values are read back from the code at the same positions.
+  const masked = maskStrings(code, interpreter);
+  const plain = new Map<string, number>();
+  for (const segment of masked.matchAll(/[^\n;]+/g)) {
+    const match = /^\s*(?:(?:const|let|var|my|our)\s+)?\$?([A-Za-z_]\w*)\s*=(?!=)/.exec(segment[0]);
     if (!match) continue;
-    const [, name = "", value = ""] = match;
+    const at = (segment.index ?? 0) + match[0].length;
+    const name = match[1] ?? "";
+    const value = code.slice(at, (segment.index ?? 0) + segment[0].length);
     const path = literalPath(value, argv);
-    found.set(name, found.has(name) || path === undefined ? undefined : [path]);
+    // Every statement-level binding of a name to a literal adds a value it may hold; one binding to
+    // anything else makes it unknown.
+    const known = found.get(name);
+    found.set(
+      name,
+      path === undefined || (found.has(name) && !known) ? undefined : [...(known ?? []), path],
+    );
+    plain.set(name, (plain.get(name) ?? 0) + 1);
   }
-  // Exactly one binding: any other assignment to the name, wherever it is (`if 1: p = x`, a
+  // Only those bindings: any other assignment to the name, wherever it is (`if 1: p = x`, a
   // walrus, `+=`, destructuring, `global`/`nonlocal`), makes its value unknown.
   for (const name of found.keys()) {
     const word = `\\b${name}\\b`;
-    const assignments = code.match(
+    const assignments = masked.match(
       new RegExp(`${word}\\s*(?:[-+*/%&|^@:]|\\*\\*|//|<<|>>|\\?\\?|\\|\\||&&)?=(?!=)`, "g"),
     );
     if (
-      (assignments?.length ?? 0) !== 1 ||
+      (assignments?.length ?? 0) !== plain.get(name) ||
       new RegExp(
         `\\b(?:global|nonlocal)\\b[^\\n;]*${word}|[[{(][^\\]})\\n]*${word}[^\\]})\\n]*[\\]})]\\s*=(?!=)`,
-      ).test(code)
+      ).test(masked)
     )
       found.set(name, undefined);
   }
+  const sites = new Map<string, number>();
   const bound = (list: string) => {
     for (const name of list.split(/[\s,()[\]{}*=:.]+/))
-      if (/^[A-Za-z_]\w*$/.test(name)) found.set(name, undefined);
+      if (/^[A-Za-z_]\w*$/.test(name)) {
+        found.set(name, undefined);
+        sites.set(name, (sites.get(name) ?? 0) + 1);
+      }
   };
-  for (const match of code.matchAll(
-    /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|\b(\w+)\s*,\s*\w+\s*=(?!=)|\b\w+\s*,\s*(\w+)\s*=(?!=)/g,
+  for (const match of masked.matchAll(
+    /\b(?:def|function)\s*\w*\s*\(([^)]*)\)|\(([^()]*)\)\s*=>|\b(\w+)\s*=>|\bfor\s*\(?\s*(?:const|let|var|my|our)?\s*([\w\s,$[\]{}]+?)\s+(?:in|of)\b|\bas\s+(\w+)|\bcatch\s*\((\w+)|(?:const|let|var)\s*([[{][^=]*)=|\blambda\b([^:]*):|\b(\w+)\s*(?:[-+*/%|&^]|\*\*|\/\/|<<|>>)=|\bglobal\s+([\w\s,]+)|(?:^|[\n;])\s*(\w+(?:\s*,\s*\w+)+)\s*,?\s*=(?!=)/g,
   ))
     for (const group of match.slice(1)) if (group) bound(group);
   return found;
 }
+
+/**
+ * Names an edit script may use; code that calls anything else gets no name resolved. This is a
+ * list of what is known to be plain, not of what is dangerous, so a route to the namespace nobody
+ * thought of (gc.get_objects(), pkgutil.resolve_name, sys.setprofile, require("vm"), an alias of
+ * global) is not on it. A script that needs more is judged strictly.
+ */
+const PLAIN_NAMES = new Set(
+  "def return if else elif for while in not and or is None True False null undefined true false assert pass break continue import from as with try except finally raise class new const let var function print len range str int bool list dict tuple set open re os path shutil pathlib Path json io fs sys process console require module exports await async of typeof encoding newline mode errors f r b u rb br fr rf".split(
+    " ",
+  ),
+);
+/**
+ * Every name Python and Node give a script without an import (`dir(builtins)` and
+ * `Object.getOwnPropertyNames(globalThis)`). Binding one of them in the code (a dummy
+ * `def _(globals): pass`) never makes it plain: only the names in PLAIN_NAMES are.
+ */
+const RESERVED_NAMES = new Set(
+  "ArithmeticError AssertionError AttributeError BaseException BaseExceptionGroup BlockingIOError BrokenPipeError BufferError BytesWarning ChildProcessError ConnectionAbortedError ConnectionError ConnectionRefusedError ConnectionResetError DeprecationWarning EOFError Ellipsis EncodingWarning EnvironmentError Exception ExceptionGroup False FileExistsError FileNotFoundError FloatingPointError FutureWarning GeneratorExit IOError ImportError ImportWarning IndentationError IndexError InterruptedError IsADirectoryError KeyError KeyboardInterrupt LookupError MemoryError ModuleNotFoundError NameError None NotADirectoryError NotImplemented NotImplementedError OSError OverflowError PendingDeprecationWarning PermissionError ProcessLookupError RecursionError ReferenceError ResourceWarning RuntimeError RuntimeWarning StopAsyncIteration StopIteration SyntaxError SyntaxWarning SystemError SystemExit TabError TimeoutError True TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError UnicodeError UnicodeTranslateError UnicodeWarning UserWarning ValueError Warning ZeroDivisionError __build_class__ __debug__ __import__ abs aiter all anext any ascii bin bool breakpoint bytearray bytes callable chr classmethod compile complex copyright credits delattr dict dir divmod enumerate eval exec exit filter float format frozenset getattr globals hasattr hash help hex id input int isinstance issubclass iter len license list locals map max memoryview min next object oct open ord pow print property quit range repr reversed round set setattr slice sorted staticmethod str sum super tuple type vars zip AbortController AbortSignal AggregateError Array ArrayBuffer AsyncDisposableStack Atomics BigInt BigInt64Array BigUint64Array Blob Boolean BroadcastChannel Buffer ByteLengthQueuingStrategy CloseEvent CompressionStream CountQueuingStrategy Crypto CryptoKey CustomEvent DOMException DataView Date DecompressionStream DisposableStack Error EvalError Event EventTarget File FinalizationRegistry Float16Array Float32Array Float64Array FormData Function Headers Infinity Int16Array Int32Array Int8Array Intl Iterator JSON Map Math MessageChannel MessageEvent MessagePort NaN Navigator Number Object Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceObserver PerformanceObserverEntryList PerformanceResourceTiming Promise Proxy RangeError ReadableByteStreamController ReadableStream ReadableStreamBYOBReader ReadableStreamBYOBRequest ReadableStreamDefaultController ReadableStreamDefaultReader ReferenceError Reflect RegExp Request Response Set SharedArrayBuffer String SubtleCrypto SuppressedError Symbol SyntaxError TextDecoder TextDecoderStream TextEncoder TextEncoderStream TransformStream TransformStreamDefaultController TypeError URIError URL URLPattern URLSearchParams Uint16Array Uint32Array Uint8Array Uint8ClampedArray WeakMap WeakRef WeakSet WebAssembly WebSocket WritableStream WritableStreamDefaultController WritableStreamDefaultWriter __dirname __filename assert async_hooks atob btoa buffer child_process clearImmediate clearInterval clearTimeout cluster console constants crypto decodeURI decodeURIComponent dgram diagnostics_channel dns domain encodeURI encodeURIComponent escape eval events exports fetch fs global globalThis http http2 https inspector isFinite isNaN module navigator net os parseFloat parseInt path perf_hooks performance process punycode querystring queueMicrotask readline repl require setImmediate setInterval setTimeout stream string_decoder structuredClone sys timers tls trace_events tty undefined unescape url util v8 vm wasi worker_threads zlib".split(
+    " ",
+  ),
+);
+const PLAIN_JS_MODULES = new Set([
+  "fs",
+  "path",
+  "node:fs",
+  "node:path",
+  "fs/promises",
+  "node:fs/promises",
+  "os",
+  "node:os",
+]);
+const PLAIN_MODULES = new Set(["re", "os", "shutil", "pathlib", "json", "io", "sys"]);
+const PLAIN_MEMBERS = new Set(
+  "read write replace index rindex find rfind count split splitlines join strip lstrip rstrip startswith endswith format lower upper sub subn match search escape read_text write_text readFileSync writeFileSync existsSync exists isfile isdir getcwd cwd resolve parent name suffix stem mkdir makedirs open remove unlink rmtree rmdir rename move copy copy2 copyfile rm rmSync unlinkSync renameSync mkdirSync cpSync appendFileSync appendFile append extend get keys values items sort sorted argv environ exit encoding newline mode utf8 path length slice push map filter forEach includes indexOf lastIndexOf trim toString stringify parse load dump".split(
+    " ",
+  ),
+);
+/** Whether the code (strings masked) uses only plain names, members and names it binds itself. */
+function plainShape(source: string, interpreter: string, raw: string): boolean {
+  // Only Python is read: JavaScript reaches modules and members through too many routes
+  // (destructuring chains, optional chaining, aliases) to list, so Node code resolves no names.
+  if (interpreter && !/^python/i.test(interpreter)) return false;
+  // Python comments are prose, not code.
+  // Python comments are prose, and its `global a, b` statement names variables: neither is code that
+  // reaches the namespace. A bare `global` in JavaScript is the global object, and is not plain.
+  const masked = /^python/i.test(interpreter)
+    ? source.replace(/#[^\n]*/g, "").replace(/^[ \t]*global[ \t]+[\w \t,]+$/gm, "")
+    : source;
+  const bound = new Set<string>();
+  for (const m of masked.matchAll(
+    /(?:^|[\n;,(])\s*(?:(?:const|let|var)\s+)?([A-Za-z_]\w*)\s*(?:[-+*/%|&^]|\/\/|\*\*)?=(?!=)|\b(?:def|function|class)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)|\bfor\s+\(?\s*(?:const|let|var)?\s*([A-Za-z_][\w\s,]*?)\s+(?:in|of)\b|\b(?:const|let|var)\s+([A-Za-z_]\w*)/g,
+  ))
+    for (const group of m.slice(1))
+      if (group) for (const name of group.split(/[^A-Za-z_0-9]+/)) if (name) bound.add(name);
+  // Only a few modules are plain: importing anything else (`gc`, `pkgutil`, `inspect`) is not.
+  // Square brackets read a member by name: with a string (`require["x"]`, `module["constructor"]`)
+  // or a name as the index, the member is not visible here. Only a number or a slice is plain.
+  for (const m of masked.matchAll(/(?:[\w)\]]|\?\.)\s*\[([^\]\n]*)\]/g)) {
+    const index = (m[1] ?? "").trim();
+    if (!/^(?:-?\d+|[\w\s]*:[\w\s:]*)$/.test(index)) return false;
+  }
+  // `require` and `import` are only called, never named: `const r = require` hides the module
+  // that `r("vm")` loads. A module is loaded by a literal name from a short list.
+  if (/\brequire\b(?!\s*\()|\bimport\b(?!\s*\()(?!\s*[\w{*])/.test(masked)) return false;
+  for (const m of raw.matchAll(/\b(?:require|import)\s*\(\s*([^)]*)\)/g)) {
+    const arg = (m[1] ?? "").trim();
+    const name = /^(["'`])([^"'`]*)\1$/.exec(arg)?.[2];
+    if (name === undefined || !PLAIN_JS_MODULES.has(name)) return false;
+  }
+  const modules = [
+    ...[...masked.matchAll(/^[ \t]*import[ \t]+([\w., \t]+)/gm)].flatMap((m) =>
+      (m[1] ?? "").split(",").map((part) => part.trim().split(/[\s.]/)[0] ?? ""),
+    ),
+    ...[...masked.matchAll(/^[ \t]*from[ \t]+([\w.]+)[ \t]+import/gm)].map(
+      (m) => (m[1] ?? "").split(".")[0] ?? "",
+    ),
+  ];
+  if (modules.some((name) => name && !PLAIN_MODULES.has(name))) return false;
+  for (const m of masked.matchAll(/(\.\s*)?([A-Za-z_]\w*)/g)) {
+    const name = m[2] as string;
+    // One letter, or a run of regular-expression flags (`/x/gi`), cannot name a module or a route.
+    if (!m[1] && (name.length === 1 || /^[gimsuyd]+$/.test(name))) continue;
+    if (
+      m[1]
+        ? PLAIN_MEMBERS.has(name)
+        : PLAIN_NAMES.has(name) || (bound.has(name) && !RESERVED_NAMES.has(name))
+    )
+      continue;
+    return false;
+  }
+  return true;
+}
+
+/** Ways to bind or call a name without writing it as code. */
+const DYNAMIC_NAMES =
+  /\b(?:exec|eval|compile|globals|vars|locals|setattr|getattr|delattr|__import__|importlib)\s*\(|__dict__|__builtins__|sys\s*\.\s*modules|\bglobalThis\b|\bthis\s*\[|\bwindow\b|\bf_globals\b|\b_getframe\b|\bcurrentframe\b|__getattribute__|__getattr__|\b__main__\b|\binspect\b|\bsys\s*\.\s*_|\bglobal\s*\[|\bFunction\s*\(|\bvm\s*\./;
 
 /**
  * Whether a file call in the code deletes, moves, copies, writes or enters a path that could be
@@ -627,9 +742,15 @@ function callsReachState(
     )
   )
     argv = [];
-  const vars = literalVariables(code, argv);
+  // Code that reaches names or calls through a string or a table (`exec`, `globals()`, `getattr`,
+  // `__dict__`, `globalThis[...]`) can rebind a name or call a function behind the visible code:
+  // resolve nothing, so every path in a file call that is not itself a literal fails closed.
+  const vars =
+    DYNAMIC_NAMES.test(code) || !plainShape(maskStrings(code, interpreter), interpreter, code)
+      ? new Map<string, string[] | undefined>()
+      : literalVariables(code, argv, interpreter);
   const aliases = moduleAliases(code);
-  const values = (arg: string): string[] | undefined => {
+  const single = (arg: string): string[] | undefined => {
     const name = /^\s*\$?([A-Za-z_]\w*)\s*$/.exec(arg)?.[1];
     if (name) return vars.get(name);
     const path = literalPath(arg, argv);
@@ -637,12 +758,10 @@ function callsReachState(
   };
   const reaches = (arg: string | undefined) => {
     if (arg === undefined) return true;
-    const paths = values(arg);
+    const paths = single(arg);
     // A session directory by its name counts too, also one not created yet or another user's.
-    return (
-      paths === undefined ||
-      paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true))
-    );
+    if (paths === undefined) return true;
+    return paths.some((path) => STATE_NAME.test(path) || namesState(path, cwds, true));
   };
   // Calls are found outside string literals (a message or source text being edited is data);
   // their arguments are read from the code itself.
@@ -662,6 +781,9 @@ function callsReachState(
     const before = code.slice(Math.max(0, index - MAX_TARGET), index);
     // A method on an expression: `Path('/x').unlink()`, `require('fs').rmSync(x)`.
     const dotted = !receiver && /\.\s*$/.test(before.slice(-8));
+    // A method on what `open(...)` returns (`open(p, encoding="utf-8").read()`) acts on the file
+    // that call opened, and the `open` call itself is judged on its own.
+    if (dotted && /(?:^|[^\w.])open\s*\((?:[^()]|\([^()]*\))*\)\s*\.\s*$/.test(before)) continue;
     // The path object a method is called on, when it is `Path(<literal>)`.
     const pathObject = () =>
       /Path\s*\(([^()]*)\)\s*\.?\s*$/.exec(before.replace(/\s*\.\s*$/, ""))?.[1];

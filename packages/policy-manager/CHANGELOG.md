@@ -1,5 +1,11 @@
 # @agent-corpus/policy-manager
 
+## 0.12.1
+
+### Patch Changes
+
+- Inline interpreter code that edits files through a variable no longer asks a person as a possible policy-state change when every name it uses is plain: bindings are read outside string literals (source text being written is data), keyword arguments (`open(p, encoding=...)`) are not tuple assignments, and a name bound to literals keeps those values. Names resolve only in Python code that uses a short list of plain names, members and modules (Node code resolves none); code that reaches anything else (a built-in or global rebound by a decoy, `gc`, `pkgutil`, frame globals, `require("vm")`, a bracket access by string or by a computed index) resolves nothing, so its non-literal paths fail closed as before. A path built from a concatenation or a function parameter is not followed and asks, as on 0.12.0.
+
 ## 0.12.0
 
 ### Minor Changes
