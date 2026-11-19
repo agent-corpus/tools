@@ -82,10 +82,10 @@ describe("policy-state needs a target that can reach the state", () => {
   test.each([
     // A transcript, by the first argument after the code.
     () =>
-      `node -e 'const fs=require("fs");const f=process.argv[1];fs.writeFileSync(f,fs.readFileSync(f,"utf8").replace(/x/g,"y"))' ${slash(homedir())}/.claude/projects/p/s.jsonl`,
+      `python3 -c 'import sys; f=sys.argv[1]; open(f,"w").write(open(f).read().replace("x","y"))' ${slash(homedir())}/.claude/projects/p/s.jsonl`,
     // Source text that mentions acp and comment openers, written to literal files.
     () =>
-      `node -e 'const fs=require("fs");let f="src/a.ts";let s=fs.readFileSync(f,"utf8");s=s.replace("/** a */","/** acp-501-x */");fs.writeFileSync(f,s);fs.writeFileSync("src/b.ts",s)'`,
+      `node -e 'const fs=require("fs");let s=fs.readFileSync("src/a.ts","utf8");s=s.replace("/** a */","/** acp-501-x */");fs.writeFileSync("src/a.ts",s);fs.writeFileSync("src/b.ts",s)'`,
     () =>
       "python3 - <<'EOF'\np='src/a.ts'; s=open(p).read()\ns=s.replace('/** old */', '''/** acp-<uid>-* and tmpdir() */''')\nopen(p,'w').write(s)\nEOF",
     // Scratchpad writes through a variable assigned a literal, after cd into the temp root.

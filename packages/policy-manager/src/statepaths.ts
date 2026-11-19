@@ -664,6 +664,9 @@ const PLAIN_MEMBERS = new Set(
 );
 /** Whether the code (strings masked) uses only plain names, members and names it binds itself. */
 function plainShape(source: string, interpreter: string, raw: string): boolean {
+  // Only Python is read: JavaScript reaches modules and members through too many routes
+  // (destructuring chains, optional chaining, aliases) to list, so Node code resolves no names.
+  if (interpreter && !/^python/i.test(interpreter)) return false;
   // Python comments are prose, not code.
   // Python comments are prose, and its `global a, b` statement names variables: neither is code that
   // reaches the namespace. A bare `global` in JavaScript is the global object, and is not plain.

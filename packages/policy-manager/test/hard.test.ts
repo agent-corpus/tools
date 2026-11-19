@@ -1218,6 +1218,9 @@ describe("round 11: file calls by method name, dynamic imports, subshells, awk",
     `python3 -c "import os\np='a.ts'\nif 1: p=q\nos.remove(p)"`,
     `node -e "const fs=require('fs');function _(runInThisContext){}\nmodule?.['constructor']?.['_load']('vm')?.['runInThisContext']('b=P');fs.rmSync('/tmp')"`,
     `node -e "const fs=require('fs');const r=require;function _(runInThisContext){}\nconst {runInThisContext: q}=r('vm');q('b=P');fs.rmSync('/tmp')"`,
+    // Node code resolves no names: a destructuring chain to the module loader, or a plain binding.
+    `node -e "const fs=require('fs');function _(constructor,_load,runInThisContext){}\nconst {constructor: C}=module;const {_load: L}=C;const {runInThisContext: q}=L('vm');q('b=P');fs.rmSync('/tmp')"`,
+    `node -e "const fs=require('fs');let f='src/a.ts';fs.writeFileSync(f,'')"`,
     // A path from a function parameter or a concatenation is not followed: it asks, as on 0.12.0.
     `python3 -c "b='/Users/x/repo/'\ndef edit(path, x): open(b+path,'w').write(x)\nedit('a.ts', 1)\nedit('src/b.ts', 2)"`,
     `python3 -c "b='/Users/x/repo/'\nopen(b+'a.ts','w').write('')"`,
