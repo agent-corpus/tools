@@ -679,11 +679,13 @@ function plainShape(source: string, interpreter: string, raw: string): boolean {
   // Only a few modules are plain: importing anything else (`gc`, `pkgutil`, `inspect`) is not.
   // Square brackets read a member by name: with a string (`require["x"]`, `module["constructor"]`)
   // or a name as the index, the member is not visible here. Only a number or a slice is plain.
-  for (const m of masked.matchAll(/[\w)\]]\s*\[([^\]\n]*)\]/g)) {
+  for (const m of masked.matchAll(/(?:[\w)\]]|\?\.)\s*\[([^\]\n]*)\]/g)) {
     const index = (m[1] ?? "").trim();
     if (!/^(?:-?\d+|[\w\s]*:[\w\s:]*)$/.test(index)) return false;
   }
-  // A module is loaded by a literal name from a short list; anything else reaches code unseen.
+  // `require` and `import` are only called, never named: `const r = require` hides the module
+  // that `r("vm")` loads. A module is loaded by a literal name from a short list.
+  if (/\brequire\b(?!\s*\()|\bimport\b(?!\s*\()(?!\s*[\w{*])/.test(masked)) return false;
   for (const m of raw.matchAll(/\b(?:require|import)\s*\(\s*([^)]*)\)/g)) {
     const arg = (m[1] ?? "").trim();
     const name = /^(["'`])([^"'`]*)\1$/.exec(arg)?.[2];
