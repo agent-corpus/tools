@@ -42,7 +42,7 @@ const python = (code: string): Request => ({
 });
 const preview = (file: string) => `from pathlib import Path
 p=Path('${file}')
-s=p.read_text().replace('resolve:{dedupe:', 'resolve:{alias:{"@":"'+str(Path.cwd()/'src/caredocs.client/src')+'"},dedupe:')
+s=p.read_text().replace('resolve:{dedupe:', 'resolve:{alias:{"@":"'+str(Path.cwd()/'src/app/src')+'"},dedupe:')
 p.write_text(s)
 `;
 

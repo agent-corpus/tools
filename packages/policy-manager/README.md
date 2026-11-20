@@ -10,7 +10,7 @@
 > - credential handling that separates using a login from seeing a secret (`credentialHelpers`, `credentialUses`).
 >
 > **What did not work well enough:**
-> - too many prompts for harmless commands in real sessions (about 40 to 60 percent of the asks in sampled EHR sessions): inline interpreter edit scripts, `cd /tmp` prefixes, `NODE_OPTIONS` memory flags, helper argument shapes and scratchpad paths;
+> - too many prompts for harmless commands in real sessions (about 40 to 60 percent of the asks in sampled real sessions): inline interpreter edit scripts, `cd /tmp` prefixes, `NODE_OPTIONS` memory flags, helper argument shapes and scratchpad paths;
 > - the rules that protect the policy manager's own state kept needing new cases, because code that builds paths at run time can always hide intent;
 > - concurrent hooks could start several services, and stale sockets could lock a session out until they were removed.
 >
