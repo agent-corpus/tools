@@ -1,5 +1,21 @@
 # @agent-corpus/policy-manager
 
+> **Status: halted and incomplete. Do not use.** Work stopped on 2026-11-19 and the npm package was unpublished. Progress, decisions and open problems are tracked in [agent-corpus/tools#21](https://github.com/agent-corpus/tools/issues/21). The text below describes the design as of 0.12.1.
+>
+> **What worked (0.9.0 to 0.12.1):**
+> - a deterministic engine that approves what it can prove safe, plus a floor of operations that always go to a person;
+> - the user's own allow, ask and deny rules honored across Claude Code, Codex and Copilot;
+> - an AI classification run by the hook through the harness CLI, approving only recoverable, non-sensitive requests;
+> - a remembered "yes" for the same kind of request, and Codex waiting for `pm approve --last`;
+> - credential handling that separates using a login from seeing a secret (`credentialHelpers`, `credentialUses`).
+>
+> **What did not work well enough:**
+> - too many prompts for harmless commands in real sessions (about 40 to 60 percent of the asks in sampled real sessions): inline interpreter edit scripts, `cd /tmp` prefixes, `NODE_OPTIONS` memory flags, helper argument shapes and scratchpad paths;
+> - the rules that protect the policy manager's own state kept needing new cases, because code that builds paths at run time can always hide intent;
+> - concurrent hooks could start several services, and stale sockets could lock a session out until they were removed.
+>
+> **If this is picked up again:** start from the open items in [agent-corpus/tools#21](https://github.com/agent-corpus/tools/issues/21), measure prompts against real session replays first (`replay <transcripts> --profile <policy.json>`), and prefer a small deterministic core over widening the state-path rules.
+
 A coding-agent-independent permission evaluator. It starts a private background service for each session, verifies ordinary code operations and cloud inspection commands, and records requests and decisions in a temporary audit log. Uses the shared `@agent-corpus/audit-log` package and calls no model API itself.
 
 Every request goes through three steps (see **How a request is decided**): a deterministic engine approves what it can prove safe; otherwise the hook asks an AI classifier, run through the user's own logged-in harness CLI, and approves what it judges recoverable; otherwise it asks the person and waits, and remembers a "yes" for the session.
