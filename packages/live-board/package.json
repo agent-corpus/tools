@@ -45,8 +45,8 @@
     "live-board": "dist/cli.js"
   },
   "devDependencies": {
-    "vite": "^8.3.7",
-    "@playwright/test": "^1.65.0"
+    "vite": "^8.3.8",
+    "@playwright/test": "^1.65.1"
   },
   "repository": {
     "type": "git",
